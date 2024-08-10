@@ -1,13 +1,12 @@
 use std::time::Duration;
 
-use bytesize::ByteSize;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::provider::{Provider, ProviderError};
-
-const DEFAULT_MEM_CACHE_SIZE: ByteSize = ByteSize::gb(2);
-const DEFAULT_DISK_CACHE_SIZE: ByteSize = ByteSize::gb(50);
+use crate::{
+    provider::{Provider, ProviderError},
+    query_cache::{CacheKey, QueryCacheError},
+};
 
 pub trait CacheableProvider: Provider {
     /// This is pretty unstable and may change.
@@ -22,55 +21,15 @@ type CacheableProviderResult<T> = Result<T, CacheableProviderError>;
 #[derive(Clone, Debug, Error)]
 pub enum CacheableProviderError {
     #[error(transparent)]
-    Cache(#[from] CacheError),
+    QueryCache(#[from] QueryCacheError),
 
     #[error(transparent)]
     Provider(#[from] ProviderError),
 }
 
-#[derive(Clone, Debug, Error)]
-pub enum CacheError {}
-
 /// A wrapper around a provider that always attempts to check the cache before the provider.
 ///
 /// The provider is generally going to be an upstream, but this is not guaranteed.
-#[derive(Debug)]
-pub struct CachedProviderBuilder<P: CacheableProvider + Provider> {
-    remote_p: P,
-    max_mem_cache_size: ByteSize,
-    max_disk_cache_size: ByteSize,
-}
-
-impl<T: CacheableProvider + Provider> CachedProviderBuilder<T> {
-    pub fn new(remote_p: T) -> Self {
-        Self {
-            remote_p,
-            max_disk_cache_size: DEFAULT_MEM_CACHE_SIZE,
-            max_mem_cache_size: DEFAULT_DISK_CACHE_SIZE,
-        }
-    }
-
-    pub fn max_mem_cache_size(mut self, max_mem_cache_size: ByteSize) -> Self {
-        self.max_mem_cache_size = max_mem_cache_size;
-        self
-    }
-
-    pub fn max_disk_cache_size(mut self, max_disk_cache_size: ByteSize) -> Self {
-        self.max_disk_cache_size = max_disk_cache_size;
-        self
-    }
-
-    pub fn build(self) -> CachedProvider<T> {
-        todo!()
-    }
-}
-
-impl<T: CacheableProvider + Provider> From<CachedProviderBuilder<T>> for CachedProvider<T> {
-    fn from(v: CachedProviderBuilder<T>) -> Self {
-        v.build()
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct CachedProvider<P> {
     remote_p: P,
@@ -86,11 +45,4 @@ impl<P: CacheableProvider + Provider> CachedProvider<P> {
     fn get<'a, V: Deserialize<'a>>(&'a self, k: P::Key) -> CacheableProviderResult<Option<V>> {
         todo!()
     }
-}
-
-// TODO: Remove the use of `String`s...
-#[derive(Clone, Debug)]
-pub struct CacheKey {
-    d_type: String,
-    id: String,
 }
