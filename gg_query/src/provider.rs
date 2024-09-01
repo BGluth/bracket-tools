@@ -1,7 +1,16 @@
 use provider::provider::Provider;
 use serde::Deserialize;
+use thiserror::Error;
 
-use crate::types::GGRestToken;
+use crate::{
+    gg_data_types::{GgTournament, PlayerId, TournamentId},
+    types::GGRestToken,
+};
+
+#[derive(Debug, Error)]
+pub enum GGProviderError {}
+
+pub type GGProviderResult<T> = Result<T, GGProviderError>;
 
 #[derive(Clone, Debug)]
 pub struct GGProvider<P: Provider> {
@@ -19,6 +28,20 @@ impl<P: Provider> Provider for GGProvider<P> {
     type Key = u64;
 
     fn get<'de, V: Deserialize<'de>>(&self, k: Self::Key) -> V {
+        todo!()
+    }
+}
+
+impl<P: Provider> GGProvider<P> {
+    pub fn get_player_id_for_name(p_name: &str) -> GGProviderResult<PlayerId> {
+        todo!()
+    }
+
+    pub fn get_tournament_id_for_name(t_name: &str) -> GGProviderResult<TournamentId> {
+        todo!()
+    }
+
+    pub fn get_tournaments_for_player(p_id: PlayerId) -> GGProviderResult<GgTournament> {
         todo!()
     }
 }

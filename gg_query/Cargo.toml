@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 hex = "0.4.3"
+normalized_data = { path = "../normalized_data" }
 provider = { path = "../provider" }
 thiserror = "1.0.63"
 serde = "1.0.209"
