@@ -32,17 +32,17 @@ impl Default for QueryCacheBuilder {
 }
 
 impl QueryCacheBuilder {
-    pub fn max_mem_cache_size(mut self, max_mem_cache_size: ByteSize) -> Self {
+    pub(crate) fn max_mem_cache_size(mut self, max_mem_cache_size: ByteSize) -> Self {
         self.max_mem_cache_size = max_mem_cache_size;
         self
     }
 
-    pub fn max_disk_cache_size(mut self, max_disk_cache_size: ByteSize) -> Self {
+    pub(crate) fn max_disk_cache_size(mut self, max_disk_cache_size: ByteSize) -> Self {
         self.max_disk_cache_size = max_disk_cache_size;
         self
     }
 
-    pub fn build(self) -> QueryCache {
+    pub(crate) fn build(self) -> QueryCache {
         todo!()
     }
 }

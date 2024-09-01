@@ -7,3 +7,4 @@ edition = "2021"
 hex = "0.4.3"
 provider = { path = "../provider" }
 thiserror = "1.0.63"
+serde = "1.0.209"

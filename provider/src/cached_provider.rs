@@ -38,11 +38,16 @@ pub struct CachedProvider<P> {
     stale_time: Duration,
 }
 
-impl<P: CacheableProvider + Provider> CachedProvider<P> {
-    /// Attempts to get/fetch a value for a key.
-    ///
-    /// Always checks the cache first, and otherwise fetches from the provider. Returns `None` if the values does not exist upstream.
-    fn get<'a, V: Deserialize<'a>>(&'a self, k: P::Key) -> CacheableProviderResult<Option<V>> {
+impl<P: Provider> From<P> for CachedProvider<P> {
+    fn from(v: P) -> Self {
+        todo!()
+    }
+}
+
+impl<P: Provider> Provider for CachedProvider<P> {
+    type Key = P::Key;
+
+    fn get<'de, V: Deserialize<'de>>(&self, k: Self::Key) -> V {
         todo!()
     }
 }
