@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     provider::{Provider, ProviderError},
-    query_cache::{CacheKey, QueryCacheError},
+    query_cache::{CacheKey, QueryCache, QueryCacheBuilder, QueryCacheError},
 };
 
 pub trait CacheableProvider: Provider {
@@ -27,11 +27,36 @@ pub enum CacheableProviderError {
     Provider(#[from] ProviderError),
 }
 
+#[derive(Debug)]
+pub struct CachedProviderCfg {
+    stale_time: Duration,
+    query_cache_builder: QueryCacheBuilder,
+}
+
+#[derive(Debug)]
+pub struct CachedProviderBuilder {
+    cfg: CachedProviderCfg,
+}
+
+impl From<CachedProviderCfg> for CachedProviderBuilder {
+    fn from(v: CachedProviderCfg) -> Self {
+        todo!()
+    }
+}
+
+impl CachedProviderBuilder {
+    pub fn build<P: Provider>(self, p: P) -> CachedProvider<P> {
+        todo!()
+    }
+}
+
 /// A wrapper around a provider that always attempts to check the cache before the provider.
 ///
 /// The provider is generally going to be an upstream, but this is not guaranteed.
 #[derive(Clone, Debug)]
 pub struct CachedProvider<P> {
+    cache: QueryCache,
+
     remote_p: P,
 
     /// The amount of time until a record is considered stale.
@@ -49,5 +74,11 @@ impl<P: Provider> Provider for CachedProvider<P> {
 
     fn get<'de, V: Deserialize<'de>>(&self, k: Self::Key) -> V {
         todo!()
+    }
+}
+
+impl<P: Provider> CachedProvider<P> {
+    pub fn from_provider(p: P, cfg: CachedProviderCfg) -> Self {
+        CachedProviderBuilder::from(cfg).build(p)
     }
 }

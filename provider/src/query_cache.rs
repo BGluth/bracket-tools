@@ -1,5 +1,6 @@
 use bytesize::ByteSize;
 use serde::{Deserialize, Serialize};
+use sled::Db;
 use thiserror::Error;
 
 const DEFAULT_MEM_CACHE_SIZE: ByteSize = ByteSize::gb(2);
@@ -50,8 +51,10 @@ impl QueryCacheBuilder {
 /// A generic cache that captures queries for a given provider.
 ///
 /// Cache is also serialized to disk.
-#[derive(Debug)]
-pub(crate) struct QueryCache {}
+#[derive(Clone, Debug)]
+pub(crate) struct QueryCache {
+    db: Db,
+}
 
 impl QueryCache {
     pub(crate) fn get<'de, K, V>(&self, k: K) -> QueryCacheResult<V>
