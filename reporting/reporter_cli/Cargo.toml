@@ -7,7 +7,7 @@ edition = "2021"
 anyhow = "1.0.86"
 clap = { version = "4.5.4", features = ["derive"] }
 crossterm = "0.27.0"
-gg_query = { version = "0.1.0", path = "../../gg_query" }
+gg_query_core = { version = "0.1.0", path = "../../gg_query/gg_query_core" }
 ratatui = { version = "0.26.2", features = ["unstable-widget-ref"] }
 reporter_state = { path = "../reporter_state" }
 tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread", "time"] }

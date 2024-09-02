@@ -1,4 +1,4 @@
-use gg_query::types::GGRestToken;
+use gg_query_core::types::GGRestToken;
 use thiserror::Error;
 
 use crate::types::Provider;
