@@ -49,13 +49,13 @@ pub trait DataOrigin {}
 /// A wrapper type that is needed to be able to implicitly hydrate to the inner enum without the user being aware.
 pub struct HydratableType<D, H>(Rc<UnsafeCell<HydratableTypeInner<D, H>>>)
 where
-    D: Clone + Hydratable<Hydrated = H> + Hydratable,
+    D: Clone + Hydratable<Hydrated = H>,
     H: Dehydrateable;
 
 /// Fun deref behavior. Essentially the goal is to tr
 impl<D, H> Deref for HydratableType<D, H>
 where
-    D: Clone + Hydratable<Hydrated = H> + Hydratable,
+    D: Clone + Hydratable<Hydrated = H>,
     H: Dehydrateable,
 {
     type Target = H;

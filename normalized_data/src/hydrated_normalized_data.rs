@@ -7,9 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     data_types::{Dehydrateable, HydratableType, NormalizedOrigin},
-    dehydrated_data_types::{
-        DehydratedBracket, DehydratedGame, DehydratedPlayer, DehydratedPlayerGameInfo, DehydratedSet, DehydratedTournament,
-    },
     dehydrated_normalized_data::{
         DehydratedNormalizedBracket, DehydratedNormalizedGame, DehydratedNormalizedPlayer, DehydratedNormalizedPlayerGameInfo,
         DehydratedNormalizedSet, DehydratedNormalizedTournament,
@@ -18,12 +15,12 @@ use crate::{
 
 pub type NormalizedId = u64;
 
-pub type NormalizedTournament = HydratableType<DehydratedTournament<NormalizedId>, HydratedNormalizedTournament>;
-pub type NormalizedBracket = HydratableType<DehydratedBracket<NormalizedId>, HydratedNormalizedBracket>;
-pub type NormalizedSet = HydratableType<DehydratedSet<NormalizedId>, HydratedNormalizedSet>;
-pub type NormalizedGame = HydratableType<DehydratedGame<NormalizedId>, HydratedNormalizedGame>;
-pub type NormalizedPlayerGameInfo = HydratableType<DehydratedPlayerGameInfo<NormalizedId>, HydratedNormalizedPlayerGameInfo>;
-pub type NormalizedPlayer = HydratableType<DehydratedPlayer<NormalizedId>, HydratedNormalizedPlayer>;
+pub type NormalizedTournament = HydratableType<DehydratedNormalizedTournament, HydratedNormalizedTournament>;
+pub type NormalizedBracket = HydratableType<DehydratedNormalizedBracket, HydratedNormalizedBracket>;
+pub type NormalizedSet = HydratableType<DehydratedNormalizedSet, HydratedNormalizedSet>;
+pub type NormalizedGame = HydratableType<DehydratedNormalizedGame, HydratedNormalizedGame>;
+pub type NormalizedPlayerGameInfo = HydratableType<DehydratedNormalizedPlayerGameInfo, HydratedNormalizedPlayerGameInfo>;
+pub type NormalizedPlayer = HydratableType<DehydratedNormalizedPlayer, HydratedNormalizedPlayer>;
 
 // TODO: No idea how to represent this data. This needs to be game agnostic, so
 // this might be a bit tricky...

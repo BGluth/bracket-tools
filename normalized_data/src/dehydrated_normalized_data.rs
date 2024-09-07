@@ -1,20 +1,30 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{
     data_types::{Hydratable, NormalizedOrigin},
-    dehydrated_data_types::{
-        DehydratedBracket, DehydratedGame, DehydratedPlayer, DehydratedPlayerGameInfo, DehydratedSet, DehydratedTournament,
-    },
     hydrated_normalized_data::{
         HydratedNormalizedBracket, HydratedNormalizedGame, HydratedNormalizedPlayer, HydratedNormalizedPlayerGameInfo,
         HydratedNormalizedSet, HydratedNormalizedTournament, NormalizedId,
     },
 };
 
-pub type DehydratedNormalizedTournament = DehydratedTournament<NormalizedId>;
-pub type DehydratedNormalizedBracket = DehydratedBracket<NormalizedId>;
-pub type DehydratedNormalizedSet = DehydratedSet<NormalizedId>;
-pub type DehydratedNormalizedGame = DehydratedGame<NormalizedId>;
-pub type DehydratedNormalizedPlayerGameInfo = DehydratedPlayerGameInfo<NormalizedId>;
-pub type DehydratedNormalizedPlayer = DehydratedPlayer<NormalizedId>;
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DehydratedNormalizedTournament(NormalizedId);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DehydratedNormalizedBracket(NormalizedId);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DehydratedNormalizedSet(NormalizedId);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DehydratedNormalizedGame(NormalizedId);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DehydratedNormalizedPlayerGameInfo(NormalizedId);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DehydratedNormalizedPlayer(NormalizedId);
 
 impl Hydratable for DehydratedNormalizedTournament {
     type Origin = NormalizedOrigin;
