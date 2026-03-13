@@ -397,8 +397,8 @@ dependencies = [
 name = "bracket-tools-core"
 version = "0.1.0"
 dependencies = [
- "paste",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

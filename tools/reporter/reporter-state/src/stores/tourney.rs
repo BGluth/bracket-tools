@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bracket_tools_core::hydrated_normalized_data::{NormalizedBracket, NormalizedPlayer};
+use bracket_tools_core::types::{Bracket, Player};
 
 use super::{stats::TourneyStoreAction, store_utils::Store};
 
@@ -11,8 +11,8 @@ pub type LocalPlayerId = usize;
 #[derive(Clone, Debug)]
 pub struct TourneyStore {
     tourney_name: String,
-    brackets: HashMap<EventKey, NormalizedBracket>,
-    registered_players: HashMap<LocalPlayerId, NormalizedPlayer>,
+    brackets: HashMap<EventKey, Bracket>,
+    registered_players: HashMap<LocalPlayerId, Player>,
 }
 
 impl Default for TourneyStore {

@@ -1,5 +1,6 @@
 use futures::{Future, Stream};
-use bracket_tools_core::dehydrated_normalized_data::DehydratedNormalizedTournament;
+
+use bracket_tools_core::types::TournamentId;
 
 pub struct ScraperService {
     name: String,
@@ -26,7 +27,7 @@ pub trait CoreQuery {
 trait NormalizedCoreQuery {
     #[allow(unused_variables)]
     // TODO: Probably don't want to be using `Normalized` here...
-    fn get_tournament<I>(&self, id: I) -> impl Future<Output = DehydratedNormalizedTournament> {
+    fn get_tournament<I>(&self, id: I) -> impl Future<Output = TournamentId> {
         futures::future::pending()
     }
 }
