@@ -1,0 +1,13 @@
+query GetNumberOfSetOfPlayerAfterDate($player_slug: String!, $updated_after: Timestamp!) {
+	user(slug: $player_slug) {
+    player {
+      sets(page: 1, filters: {
+        updatedAfter: $updated_after
+      }) {
+        pageInfo {
+          total
+        }
+      }
+    }
+  }
+}

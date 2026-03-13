@@ -1,12 +1,24 @@
-# Scraper GG Tooling
+# bracket-tools
 
-## Overview
+Rust mono-repo for esports tournament tooling, primarily targeting [start.gg](https://www.start.gg/).
 
-This repo contains a collection of tools to scrape and process data from different Esports data sources, currently with a primary focus on [start.gg](https://www.start.gg/). The planned tools are (which will likely grow in the future):
+## Crates
 
-- A Daemon that will continuously run and maintain up to date data from multiple upstream data sources (eg. `start.gg`).
-- Multiple libs for querying individual sites and parsing them into a common format.
-- A CLI for interacting with the Daemon.
+| Crate | Path | Description |
+|---|---|---|
+| `bracket-tools-core` | `crates/bracket-tools-core` | Normalized data types and traits |
+| `bracket-tools-cache` | `crates/bracket-tools-cache` | Generic sled-based caching layer |
+| `bracket-tools-query` | `crates/bracket-tools-query` | Abstract query interface (multi-platform) |
+| `bracket-tools-startgg-schema` | `crates/bracket-tools-startgg-schema` | cynic codegen types from start.gg GraphQL schema |
+| `bracket-tools-startgg` | `crates/bracket-tools-startgg` | Main SDK: caching, rate-limited start.gg client |
+
+## Tools
+
+| Tool | Path | Description |
+|---|---|---|
+| `reporter-cli` | `tools/reporter/reporter-cli` | ratatui TUI for live set reporting |
+| `reporter-state` | `tools/reporter/reporter-state` | Reporter state management |
+| `bracket-tools-daemon` | `tools/daemon` | Background scraper daemon |
 
 ## License
 

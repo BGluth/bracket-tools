@@ -1,8 +1,0 @@
-[package]
-name = "normalized_data"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-paste = "1.0.14"
-serde = { version = "1.0.195", features = ["derive"] }

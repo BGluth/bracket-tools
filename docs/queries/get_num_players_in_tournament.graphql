@@ -1,0 +1,9 @@
+query get_num_players_in_tournament($t_id: ID!) {
+    tournament(id: $t_id) {
+        participants(query: {}) {
+          pageInfo {
+           	total
+          }
+    	}
+	}
+}

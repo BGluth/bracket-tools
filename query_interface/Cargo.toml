@@ -1,9 +1,0 @@
-[package]
-name = "query_interface"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-normalized_data = { path = "../normalized_data" }
-
-futures = "0.3.30"

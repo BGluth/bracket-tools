@@ -1,0 +1,16 @@
+query get_sets_of_player_after_datetime($p_id: ID!, $updated_after: Timestamp!, $results_per_page: Int!, $page_num: Int!) {
+	player(id: $p_id) {
+    sets(page: $page_num, perPage: $results_per_page, filters: {
+      updatedAfter: $updated_after
+    }) {
+      nodes {
+          id
+          completedAt
+          round
+          event {
+            id
+          }
+      }
+    }
+  }
+}

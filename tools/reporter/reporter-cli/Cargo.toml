@@ -1,0 +1,14 @@
+[package]
+name = "reporter-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bracket-tools-startgg = { path = "../../../crates/bracket-tools-startgg" }
+clap = { workspace = true }
+crossterm = "0.27"
+ratatui = { version = "0.26", features = ["unstable-widget-ref"] }
+reporter-state = { path = "../reporter-state" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

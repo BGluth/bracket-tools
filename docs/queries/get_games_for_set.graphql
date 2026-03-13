@@ -1,0 +1,28 @@
+query get_games_of_set($s_id: ID!) {
+  set(id: $s_id) {
+    games {
+      winnerId
+      selections {
+        character {
+          id
+        }
+      }
+    }
+    slots(includeByes: true) {
+      standing {
+        entrant {
+          participants {
+            player {
+              id
+            }
+          }
+        }
+        stats {
+          score {
+            value
+          }
+        }
+      }
+    }
+  }
+}

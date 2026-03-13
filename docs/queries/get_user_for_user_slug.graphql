@@ -1,0 +1,10 @@
+query get_user_for_user_slug($u_slug: String!) {
+  user(slug: $u_slug) {
+    id
+    name
+    player {
+      id
+    }
+  }
+}
+

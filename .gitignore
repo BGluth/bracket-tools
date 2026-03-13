@@ -1,2 +1,3 @@
 /target
-.Cargo.lock
+scraper_gg/target
+web/edmonton-smash/target

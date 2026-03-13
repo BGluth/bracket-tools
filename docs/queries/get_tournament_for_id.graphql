@@ -1,0 +1,15 @@
+query get_tournament_for_id($t_id: ID!, $num_per_page: Int!, $page_num: Int!) {
+    tournament(id: $t_id) {
+        name
+        participants(query: {
+          page: $page_num
+          perPage: $num_per_page
+        }) {
+            nodes {
+                player {
+                    id
+                }
+            }
+        }
+    }
+}
