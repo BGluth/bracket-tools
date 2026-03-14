@@ -6,11 +6,11 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 
 | Crate | Directory | Status | Purpose |
 |---|---|---|---|
-| bracket-tools-core | crates/bracket-tools-core | ~40% | Normalized data types and traits |
+| bracket-tools-core | crates/bracket-tools-core | ~60% | Normalized data types and traits |
 | bracket-tools-cache | crates/bracket-tools-cache | ~30% | Generic sled-based caching + Provider trait |
 | bracket-tools-query | crates/bracket-tools-query | ~5% | Abstract query interface (multi-platform) |
 | bracket-tools-startgg-schema | crates/bracket-tools-startgg-schema | ~80% | cynic codegen types from start.gg schema |
-| bracket-tools-startgg | crates/bracket-tools-startgg | ~25% | Main SDK: caching, rate-limited start.gg client |
+| bracket-tools-startgg | crates/bracket-tools-startgg | ~40% | Main SDK: caching, rate-limited start.gg client |
 | reporter-cli | tools/reporter/reporter-cli | ~20% | ratatui TUI for set reporting |
 | reporter-state | tools/reporter/reporter-state | ~25% | Reporter state management (store pattern) |
 | bracket-tools-daemon | tools/daemon | ~5% | Background scraper daemon |
@@ -18,7 +18,9 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 
 ## Current Phase
 
-Phase 1 -- Foundation. Session 1 (workspace bootstrap) is complete. Next up is Session 2: simplify core types, verify schema codegen.
+Phase 1 -- Foundation. Sessions 1-3 complete. Next up is Session 4: async HTTP client on GGProvider.
+
+**Housekeeping:** At the end of each session, update the crate status percentages in the table above and the `progress.md` memory file to reflect work done.
 
 ## Key Technical Decisions
 

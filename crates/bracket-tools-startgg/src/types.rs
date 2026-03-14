@@ -44,6 +44,11 @@ impl FromStr for GGRestToken {
 }
 
 impl GGRestToken {
+    /// Returns the token as a `"Bearer <hex>"` string for use in HTTP Authorization headers.
+    pub fn as_bearer_value(&self) -> String {
+        format!("Bearer {}", hex::encode(self.0))
+    }
+
     fn get_bytes_or_byte_str(n_bytes: usize) -> &'static str {
         match n_bytes {
             1 => "byte",
@@ -82,5 +87,14 @@ mod tests {
 
     fn parse_to_token(s: &str) -> Result<GGRestToken, GGRestTokenParseError> {
         GGRestToken::from_str(s)
+    }
+
+    #[test]
+    fn bearer_value_round_trips() {
+        let token = GGRestToken::from_str("0x11223344556677889900aabbccddeeffbbeeeeff").unwrap();
+        assert_eq!(
+            token.as_bearer_value(),
+            "Bearer 11223344556677889900aabbccddeeffbbeeeeff"
+        );
     }
 }
