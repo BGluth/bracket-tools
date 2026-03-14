@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 bracket-tools-core = { path = "../bracket-tools-core" }
 bracket-tools-cache = { path = "../bracket-tools-cache" }
+bracket-tools-startgg-schema = { path = "../bracket-tools-startgg-schema" }
 cynic = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }

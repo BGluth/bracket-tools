@@ -423,6 +423,7 @@ version = "0.1.0"
 dependencies = [
  "bracket-tools-cache",
  "bracket-tools-core",
+ "bracket-tools-startgg-schema",
  "cynic",
  "hex",
  "serde",
