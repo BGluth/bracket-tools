@@ -1,11 +1,15 @@
+use std::future::Future;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bracket_tools_cache::null_storage::NullStorage;
-use bracket_tools_cache::storage::Storage;
+use bracket_tools_cache::storage::{Storage, StorageError};
 use cynic::http::ReqwestExt;
 use cynic::{GraphQlResponse, Operation, QueryBuilder};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 use thiserror::Error;
 
 use bracket_tools_startgg_schema::{
@@ -41,6 +45,12 @@ pub enum GGProviderError {
 
     #[error("start.gg returned an empty response")]
     EmptyResponse,
+
+    #[error("cache error: {0}")]
+    Storage(#[from] StorageError),
+
+    #[error("cache deserialization error: {0}")]
+    CacheDeserialization(String),
 }
 
 fn format_graphql_errors(errors: &[cynic::GraphQlError]) -> String {
@@ -102,8 +112,73 @@ impl<S: Storage> GGProvider<S> {
         response.data.ok_or(GGProviderError::EmptyResponse)
     }
 
+    /// Checks the cache for a stored value, falling back to `fetch` on miss.
+    /// On a successful fetch, the result is serialized and stored before returning.
+    async fn cached_fetch<T, F, Fut>(
+        &self,
+        entity: &str,
+        id: StartGgId,
+        fetch: F,
+    ) -> Result<T, GGProviderError>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, GGProviderError>>,
+    {
+        let key = cache_key(entity, id);
+
+        if let Some((_timestamp, bytes)) = self.storage.get(&key).await? {
+            let value: T = bincode::deserialize(&bytes)
+                .map_err(|e| GGProviderError::CacheDeserialization(e.to_string()))?;
+            return Ok(value);
+        }
+
+        let value = fetch().await?;
+
+        let bytes = bincode::serialize(&value)
+            .map_err(|e| GGProviderError::CacheDeserialization(e.to_string()))?;
+        self.storage.put(&key, SystemTime::now(), &bytes).await?;
+
+        Ok(value)
+    }
+
     /// Fetches a tournament by its start.gg numeric ID.
+    ///
+    /// Returns a cached result if available, otherwise queries the API and
+    /// stores the response.
     pub async fn get_tournament(
+        &self,
+        id: StartGgId,
+    ) -> Result<HydratedGgTournament, GGProviderError> {
+        self.cached_fetch("tournament", id, || self.fetch_tournament(id))
+            .await
+    }
+
+    /// Fetches a player by their start.gg numeric ID.
+    ///
+    /// Returns a cached result if available, otherwise queries the API and
+    /// stores the response.
+    pub async fn get_player(
+        &self,
+        id: StartGgId,
+    ) -> Result<HydratedGgPlayer, GGProviderError> {
+        self.cached_fetch("player", id, || self.fetch_player(id))
+            .await
+    }
+
+    /// Fetches a set and its games by the set's start.gg numeric ID.
+    ///
+    /// Returns a cached result if available, otherwise queries the API and
+    /// stores the response.
+    pub async fn get_set_games(
+        &self,
+        id: StartGgId,
+    ) -> Result<HydratedGgSet, GGProviderError> {
+        self.cached_fetch("set", id, || self.fetch_set_games(id))
+            .await
+    }
+
+    async fn fetch_tournament(
         &self,
         id: StartGgId,
     ) -> Result<HydratedGgTournament, GGProviderError> {
@@ -119,8 +194,7 @@ impl<S: Storage> GGProvider<S> {
             .map_err(GGProviderError::from)
     }
 
-    /// Fetches a player by their start.gg numeric ID.
-    pub async fn get_player(
+    async fn fetch_player(
         &self,
         id: StartGgId,
     ) -> Result<HydratedGgPlayer, GGProviderError> {
@@ -133,8 +207,7 @@ impl<S: Storage> GGProvider<S> {
             .map_err(GGProviderError::from)
     }
 
-    /// Fetches a set and its games by the set's start.gg numeric ID.
-    pub async fn get_set_games(
+    async fn fetch_set_games(
         &self,
         id: StartGgId,
     ) -> Result<HydratedGgSet, GGProviderError> {
@@ -210,10 +283,16 @@ impl<S: Storage> GGProviderBuilder<S> {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::time::SystemTime;
 
     use bracket_tools_cache::null_storage::NullStorage;
+    use bracket_tools_cache::sled_storage::SledStorage;
+    use bracket_tools_cache::storage::Storage;
 
     use super::{GGProvider, DEFAULT_PAGE_SIZE, DEFAULT_REQUESTS_PER_MINUTE};
+    use crate::gg_data_types::{
+        HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData,
+    };
     use crate::types::GGRestToken;
 
     fn test_token() -> GGRestToken {
@@ -246,5 +325,89 @@ mod tests {
     fn builder_with_storage() {
         let provider = GGProvider::builder_with_storage(test_token(), NullStorage).build();
         assert!(provider.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_player_returns_cached_value() {
+        let storage = SledStorage::builder().build().unwrap();
+        let expected = HydratedGgPlayer {
+            id: 99999,
+            gamer_tag: "CachedPlayer".to_string(),
+            prefix: Some("TST".to_string()),
+        };
+
+        let bytes = bincode::serialize(&expected).unwrap();
+        storage
+            .put("player:99999", SystemTime::now(), &bytes)
+            .await
+            .unwrap();
+
+        // Provider has a dummy token — if the cache misses, the HTTP request
+        // would fail. A successful return proves the hit path worked.
+        let provider = GGProvider::builder_with_storage(test_token(), storage)
+            .build()
+            .unwrap();
+
+        let result = provider.get_player(99999).await.unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn get_tournament_returns_cached_value() {
+        let storage = SledStorage::builder().build().unwrap();
+        let expected = HydratedGgTournament {
+            id: 88888,
+            name: "Cached Tournament".to_string(),
+            participant_ids: vec![1, 2, 3],
+        };
+
+        let bytes = bincode::serialize(&expected).unwrap();
+        storage
+            .put("tournament:88888", SystemTime::now(), &bytes)
+            .await
+            .unwrap();
+
+        let provider = GGProvider::builder_with_storage(test_token(), storage)
+            .build()
+            .unwrap();
+
+        let result = provider.get_tournament(88888).await.unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn get_set_games_returns_cached_value() {
+        let storage = SledStorage::builder().build().unwrap();
+        let expected = HydratedGgSet {
+            id: 77777,
+            completed_at: Some("1700000000".to_string()),
+            round: Some(1),
+            matchup: Some(Matchup::Singles {
+                left: SlotData {
+                    entrant_id: 10,
+                    player_id: 20,
+                    score: Some(3.0),
+                },
+                right: SlotData {
+                    entrant_id: 30,
+                    player_id: 40,
+                    score: Some(1.0),
+                },
+            }),
+            games: vec![],
+        };
+
+        let bytes = bincode::serialize(&expected).unwrap();
+        storage
+            .put("set:77777", SystemTime::now(), &bytes)
+            .await
+            .unwrap();
+
+        let provider = GGProvider::builder_with_storage(test_token(), storage)
+            .build()
+            .unwrap();
+
+        let result = provider.get_set_games(77777).await.unwrap();
+        assert_eq!(result, expected);
     }
 }

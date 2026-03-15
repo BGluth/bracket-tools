@@ -7,10 +7,10 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 | Crate | Directory | Status | Purpose |
 |---|---|---|---|
 | bracket-tools-core | crates/bracket-tools-core | ~60% | Normalized data types and traits |
-| bracket-tools-cache | crates/bracket-tools-cache | ~30% | Generic sled-based caching + Provider trait |
+| bracket-tools-cache | crates/bracket-tools-cache | ~50% | Async Storage trait + NullStorage + SledStorage |
 | bracket-tools-query | crates/bracket-tools-query | ~5% | Abstract query interface (multi-platform) |
 | bracket-tools-startgg-schema | crates/bracket-tools-startgg-schema | ~80% | cynic codegen types from start.gg schema |
-| bracket-tools-startgg | crates/bracket-tools-startgg | ~50% | Main SDK: caching, rate-limited start.gg client |
+| bracket-tools-startgg | crates/bracket-tools-startgg | ~60% | Main SDK: caching, rate-limited start.gg client |
 | reporter-cli | tools/reporter/reporter-cli | ~20% | ratatui TUI for set reporting |
 | reporter-state | tools/reporter/reporter-state | ~25% | Reporter state management (store pattern) |
 | bracket-tools-daemon | tools/daemon | ~5% | Background scraper daemon |
@@ -18,9 +18,14 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 
 ## Current Phase
 
-Phase 1 -- Foundation. Sessions 1-4 complete. Next up is Session 5: caching layer integration or smoke testing with real API.
+Phase 1 -- Foundation. Sessions 1-6 complete. Completed: Entrant.id fix + Matchup enum, fixture tests, GGRestToken refactor, cache layer integration (Storage trait + GGProvider<S>). Remaining: cache-hit path, pagination.
 
 **Housekeeping:** At the end of each session, update the crate status percentages in the table above, the `progress.md` memory file to reflect work done, and refresh the codebase map (`.claude/rules/codebase_map.md`) — only update sections that changed.
+
+## Session Workflow
+
+- **Session start:** Read the `progress.md` memory file. Summarize what was completed last session, list the candidate tasks, and ask the user what they'd like to work on.
+- **Task completion:** After committing and pushing, ask the user if they want to pick up another task or wrap the session.
 
 ## Key Technical Decisions
 
@@ -28,7 +33,7 @@ Detailed rationale lives in `docs/decisions/`. Summary:
 
 - **Sled for caching** (002) -- embedded, zero-config, good enough for local tooling.
 - **Lazy hydration at SDK layer, not core** (003) -- core types stay plain; the SDK handles cache-miss fetches.
-- **Reqwest over surf** (004) -- reqwest is now wired into GGProvider; surf remains in bracket-tools-cache scaffolding.
+- **Reqwest over surf** (004) -- reqwest is wired into GGProvider; surf fully removed.
 - **Multi-platform query abstraction maintained** (005) -- query layer is not start.gg-specific.
 - **Nightly Rust** is acceptable for this project.
 
