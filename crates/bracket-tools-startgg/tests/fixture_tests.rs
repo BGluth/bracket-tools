@@ -8,6 +8,7 @@ use bracket_tools_startgg_schema::{
     get_games_for_set::GetGamesOfSet, get_player_for_player_id::GetPlayerForPlayerId,
     get_tournament_for_id::GetTournamentForId,
 };
+use serde::{Serialize, de::DeserializeOwned};
 
 fn load_set_fixture(json: &str, set_id: u64) -> HydratedGgSet {
     let response: cynic::GraphQlResponse<GetGamesOfSet> =
@@ -293,4 +294,41 @@ fn player_craiglerok() {
 
     let normalized = player.normalize();
     assert_eq!(normalized.name, "CraigleRok");
+}
+
+/// Verifies a type survives bincode serialize → deserialize without data loss.
+fn assert_bincode_roundtrip<T>(value: &T)
+where
+    T: Serialize + DeserializeOwned + std::fmt::Debug + PartialEq,
+{
+    let bytes = bincode::serialize(value).expect("serialize should succeed");
+    let recovered: T = bincode::deserialize(&bytes).expect("deserialize should succeed");
+    assert_eq!(&recovered, value);
+}
+
+#[test]
+fn serde_roundtrip_set() {
+    let set = load_set_fixture(
+        include_str!("fixtures/set_89833288_aceeagle_v_dog.json"),
+        89833288,
+    );
+    assert_bincode_roundtrip(&set);
+}
+
+#[test]
+fn serde_roundtrip_tournament() {
+    let tournament = load_tournament_fixture(
+        include_str!("fixtures/tournament_733586_bread_basket_2025.json"),
+        733586,
+    );
+    assert_bincode_roundtrip(&tournament);
+}
+
+#[test]
+fn serde_roundtrip_player() {
+    let player = load_player_fixture(
+        include_str!("fixtures/player_4665060_cronos.json"),
+        4665060,
+    );
+    assert_bincode_roundtrip(&player);
 }

@@ -29,20 +29,20 @@ pub struct DehydratedGgPlayer(pub StartGgId);
 
 // Hydrated types (full data from API responses)
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HydratedGgTournament {
     pub id: StartGgId,
     pub name: String,
     pub participant_ids: Vec<StartGgId>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HydratedGgBracket {
     pub id: StartGgId,
 }
 
 /// Per-slot data extracted from a start.gg set response.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SlotData {
     pub entrant_id: StartGgId,
     pub player_id: StartGgId,
@@ -50,12 +50,12 @@ pub struct SlotData {
 }
 
 /// The format of a set, encoding the number of players per side.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Matchup {
     Singles { left: SlotData, right: SlotData },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HydratedGgSet {
     pub id: StartGgId,
     pub completed_at: Option<String>,
@@ -64,21 +64,21 @@ pub struct HydratedGgSet {
     pub games: Vec<HydratedGgGame>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HydratedGgGame {
     pub id: Option<StartGgId>,
     pub winner_id: Option<StartGgId>,
     pub selections: Vec<GgCharacterSelection>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HydratedGgPlayer {
     pub id: StartGgId,
     pub gamer_tag: String,
     pub prefix: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GgCharacterSelection {
     pub character_id: Option<StartGgId>,
 }

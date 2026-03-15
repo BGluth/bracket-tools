@@ -1,6 +1,8 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use bracket_tools_cache::null_storage::NullStorage;
+use bracket_tools_cache::storage::Storage;
 use cynic::http::ReqwestExt;
 use cynic::{GraphQlResponse, Operation, QueryBuilder};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
@@ -49,16 +51,29 @@ fn format_graphql_errors(errors: &[cynic::GraphQlError]) -> String {
         .join("; ")
 }
 
-/// Async client for the start.gg GraphQL API with built-in rate limiting.
-pub struct GGProvider {
+/// Async client for the start.gg GraphQL API with built-in rate limiting and
+/// pluggable storage.
+///
+/// Use [`NullStorage`] for an uncached provider, or [`SledStorage`](bracket_tools_cache::sled_storage::SledStorage)
+/// for persistent caching.
+pub struct GGProvider<S: Storage> {
     client: reqwest::Client,
     rate_limiter: Arc<DefaultDirectRateLimiter>,
     page_size: i32,
+    storage: S,
 }
 
-impl GGProvider {
-    pub fn builder(token: GGRestToken) -> GGProviderBuilder {
-        GGProviderBuilder::new(token)
+impl GGProvider<NullStorage> {
+    /// Creates a builder with no caching (uses [`NullStorage`]).
+    pub fn builder(token: GGRestToken) -> GGProviderBuilder<NullStorage> {
+        GGProviderBuilder::new(token, NullStorage)
+    }
+}
+
+impl<S: Storage> GGProvider<S> {
+    /// Creates a builder with the given storage backend.
+    pub fn builder_with_storage(token: GGRestToken, storage: S) -> GGProviderBuilder<S> {
+        GGProviderBuilder::new(token, storage)
     }
 
     /// Waits for rate limit clearance, then executes a cynic GraphQL operation.
@@ -132,19 +147,26 @@ impl GGProvider {
     }
 }
 
+/// Constructs a cache key for a given entity type and start.gg ID.
+pub fn cache_key(entity: &str, id: StartGgId) -> String {
+    format!("{entity}:{id}")
+}
+
 /// Builder for configuring and constructing a [`GGProvider`].
-pub struct GGProviderBuilder {
+pub struct GGProviderBuilder<S: Storage> {
     token: GGRestToken,
     requests_per_minute: u32,
     page_size: i32,
+    storage: S,
 }
 
-impl GGProviderBuilder {
-    fn new(token: GGRestToken) -> Self {
+impl<S: Storage> GGProviderBuilder<S> {
+    fn new(token: GGRestToken, storage: S) -> Self {
         Self {
             token,
             requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
             page_size: DEFAULT_PAGE_SIZE,
+            storage,
         }
     }
 
@@ -158,7 +180,7 @@ impl GGProviderBuilder {
         self
     }
 
-    pub fn build(self) -> Result<GGProvider, reqwest::Error> {
+    pub fn build(self) -> Result<GGProvider<S>, reqwest::Error> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::AUTHORIZATION,
@@ -180,6 +202,7 @@ impl GGProviderBuilder {
             client,
             rate_limiter,
             page_size: self.page_size,
+            storage: self.storage,
         })
     }
 }
@@ -187,6 +210,8 @@ impl GGProviderBuilder {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+
+    use bracket_tools_cache::null_storage::NullStorage;
 
     use super::{GGProvider, DEFAULT_PAGE_SIZE, DEFAULT_REQUESTS_PER_MINUTE};
     use crate::types::GGRestToken;
@@ -214,6 +239,12 @@ mod tests {
     #[test]
     fn builder_produces_provider() {
         let provider = GGProvider::builder(test_token()).build();
+        assert!(provider.is_ok());
+    }
+
+    #[test]
+    fn builder_with_storage() {
+        let provider = GGProvider::builder_with_storage(test_token(), NullStorage).build();
         assert!(provider.is_ok());
     }
 }
