@@ -192,7 +192,7 @@ mod tests {
     use crate::types::GGRestToken;
 
     fn test_token() -> GGRestToken {
-        GGRestToken::from_str("0x11223344556677889900aabbccddeeffbbeeeeff").unwrap()
+        GGRestToken::from_str("91b0c4b4aeae0a040d5b2c0e4d8861c2").unwrap()
     }
 
     #[test]
