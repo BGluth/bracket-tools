@@ -53,6 +53,7 @@ pub struct GameSelection {
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct Entrant {
+    pub id: Option<cynic::Id>,
     pub participants: Option<Vec<Option<Participant>>>,
 }
 

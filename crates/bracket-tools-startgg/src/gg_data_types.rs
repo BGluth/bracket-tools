@@ -41,15 +41,26 @@ pub struct HydratedGgBracket {
     pub id: StartGgId,
 }
 
+/// Per-slot data extracted from a start.gg set response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SlotData {
+    pub entrant_id: StartGgId,
+    pub player_id: StartGgId,
+    pub score: Option<f64>,
+}
+
+/// The format of a set, encoding the number of players per side.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Matchup {
+    Singles { left: SlotData, right: SlotData },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HydratedGgSet {
     pub id: StartGgId,
     pub completed_at: Option<String>,
     pub round: Option<i32>,
-    /// Player IDs from each slot, preserving slot ordering (index 0 = left, 1 = right).
-    /// Used to map game `winner_id` to a side.
-    pub slot_entrant_ids: Vec<StartGgId>,
-    pub scores: Vec<Option<f64>>,
+    pub matchup: Option<Matchup>,
     pub games: Vec<HydratedGgGame>,
 }
 

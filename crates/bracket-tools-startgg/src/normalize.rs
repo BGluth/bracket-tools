@@ -7,13 +7,14 @@ use bracket_tools_core::{
 };
 
 use crate::gg_data_types::{
-    HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId,
+    HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData,
+    StartGgId,
 };
 
-/// Pairs a game with slot context needed to resolve `winner_id` → Left/Right.
+/// Pairs a game with slot context needed to resolve `winner_id` to a side.
 pub struct GgGameWithContext<'a> {
     pub game: &'a HydratedGgGame,
-    pub slot_entrant_ids: &'a [StartGgId],
+    pub matchup: &'a Matchup,
 }
 
 impl Normalizable for HydratedGgPlayer {
@@ -34,32 +35,37 @@ impl<'a> Normalizable for GgGameWithContext<'a> {
     fn normalize(&self) -> Option<Game> {
         let winner_id = self.game.winner_id?;
 
-        let winning_side = determine_winning_side(winner_id, self.slot_entrant_ids)?;
+        match self.matchup {
+            Matchup::Singles { left, right } => {
+                let winning_side = determine_winning_side(winner_id, left, right)?;
 
-        let left_id = PlayerId(self.slot_entrant_ids.first().copied().unwrap_or(0));
-        let right_id = PlayerId(self.slot_entrant_ids.get(1).copied().unwrap_or(0));
-
-        Some(Game {
-            g_id: GameId(self.game.id.unwrap_or(0)),
-            g_type: GameType::OneVOne(
-                PlayerGameInfo {
-                    p_id: left_id,
-                    meta: 0,
-                },
-                PlayerGameInfo {
-                    p_id: right_id,
-                    meta: 0,
-                },
-            ),
-            winning_side,
-        })
+                Some(Game {
+                    g_id: GameId(self.game.id.unwrap_or(0)),
+                    g_type: GameType::OneVOne(
+                        PlayerGameInfo {
+                            p_id: PlayerId(left.player_id),
+                            meta: 0,
+                        },
+                        PlayerGameInfo {
+                            p_id: PlayerId(right.player_id),
+                            meta: 0,
+                        },
+                    ),
+                    winning_side,
+                })
+            }
+        }
     }
 }
 
-fn determine_winning_side(winner_id: StartGgId, slots: &[StartGgId]) -> Option<GameWinningSide> {
-    if slots.first() == Some(&winner_id) {
+fn determine_winning_side(
+    winner_id: StartGgId,
+    left: &SlotData,
+    right: &SlotData,
+) -> Option<GameWinningSide> {
+    if left.entrant_id == winner_id {
         Some(GameWinningSide::Left)
-    } else if slots.get(1) == Some(&winner_id) {
+    } else if right.entrant_id == winner_id {
         Some(GameWinningSide::Right)
     } else {
         None
@@ -70,17 +76,16 @@ impl Normalizable for HydratedGgSet {
     type NormalizedData = Set;
 
     fn normalize(&self) -> Set {
-        let games = self
-            .games
-            .iter()
-            .filter_map(|game| {
-                GgGameWithContext {
-                    game,
-                    slot_entrant_ids: &self.slot_entrant_ids,
-                }
-                .normalize()
-            })
-            .collect();
+        let games = match &self.matchup {
+            Some(matchup) => self
+                .games
+                .iter()
+                .filter_map(|game| {
+                    GgGameWithContext { game, matchup }.normalize()
+                })
+                .collect(),
+            None => vec![],
+        };
 
         Set {
             s_id: SetId(self.id),
@@ -105,8 +110,30 @@ impl Normalizable for HydratedGgTournament {
 #[cfg(test)]
 mod tests {
     use super::{GgGameWithContext, Normalizable};
-    use crate::gg_data_types::{HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament};
-    use bracket_tools_core::types::{GameWinningSide, PlayerId, SetId, TournamentId};
+    use crate::gg_data_types::{
+        HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData,
+    };
+    use bracket_tools_core::types::{GameType, GameWinningSide, PlayerId, SetId, TournamentId};
+
+    fn singles_matchup(
+        left_entrant: u64,
+        left_player: u64,
+        right_entrant: u64,
+        right_player: u64,
+    ) -> Matchup {
+        Matchup::Singles {
+            left: SlotData {
+                entrant_id: left_entrant,
+                player_id: left_player,
+                score: None,
+            },
+            right: SlotData {
+                entrant_id: right_entrant,
+                player_id: right_player,
+                score: None,
+            },
+        }
+    }
 
     #[test]
     fn player_normalizes_with_prefix() {
@@ -136,31 +163,35 @@ mod tests {
 
     #[test]
     fn game_winner_left() {
+        let matchup = singles_matchup(100, 10, 200, 20);
         let game = HydratedGgGame {
-            id: Some(100),
-            winner_id: Some(10),
+            id: Some(1),
+            winner_id: Some(100),
             selections: vec![],
         };
-        let ctx = GgGameWithContext {
-            game: &game,
-            slot_entrant_ids: &[10, 20],
-        };
+        let ctx = GgGameWithContext { game: &game, matchup: &matchup };
 
         let normalized = ctx.normalize().unwrap();
         assert!(matches!(normalized.winning_side, GameWinningSide::Left));
+        // Player IDs (not entrant IDs) should populate PlayerId
+        match &normalized.g_type {
+            GameType::OneVOne(left, right) => {
+                assert_eq!(left.p_id, PlayerId(10));
+                assert_eq!(right.p_id, PlayerId(20));
+            }
+            _ => panic!("expected OneVOne"),
+        }
     }
 
     #[test]
     fn game_winner_right() {
+        let matchup = singles_matchup(100, 10, 200, 20);
         let game = HydratedGgGame {
-            id: Some(100),
-            winner_id: Some(20),
+            id: Some(1),
+            winner_id: Some(200),
             selections: vec![],
         };
-        let ctx = GgGameWithContext {
-            game: &game,
-            slot_entrant_ids: &[10, 20],
-        };
+        let ctx = GgGameWithContext { game: &game, matchup: &matchup };
 
         let normalized = ctx.normalize().unwrap();
         assert!(matches!(normalized.winning_side, GameWinningSide::Right));
@@ -168,30 +199,26 @@ mod tests {
 
     #[test]
     fn game_unknown_winner_returns_none() {
+        let matchup = singles_matchup(100, 10, 200, 20);
         let game = HydratedGgGame {
-            id: Some(100),
+            id: Some(1),
             winner_id: Some(999),
             selections: vec![],
         };
-        let ctx = GgGameWithContext {
-            game: &game,
-            slot_entrant_ids: &[10, 20],
-        };
+        let ctx = GgGameWithContext { game: &game, matchup: &matchup };
 
         assert!(ctx.normalize().is_none());
     }
 
     #[test]
     fn game_no_winner_returns_none() {
+        let matchup = singles_matchup(100, 10, 200, 20);
         let game = HydratedGgGame {
-            id: Some(100),
+            id: Some(1),
             winner_id: None,
             selections: vec![],
         };
-        let ctx = GgGameWithContext {
-            game: &game,
-            slot_entrant_ids: &[10, 20],
-        };
+        let ctx = GgGameWithContext { game: &game, matchup: &matchup };
 
         assert!(ctx.normalize().is_none());
     }
@@ -202,12 +229,11 @@ mod tests {
             id: 50,
             completed_at: None,
             round: Some(1),
-            slot_entrant_ids: vec![10, 20],
-            scores: vec![Some(3.0), Some(1.0)],
+            matchup: Some(singles_matchup(100, 10, 200, 20)),
             games: vec![
                 HydratedGgGame {
                     id: Some(1),
-                    winner_id: Some(10),
+                    winner_id: Some(100),
                     selections: vec![],
                 },
                 HydratedGgGame {
@@ -217,7 +243,7 @@ mod tests {
                 },
                 HydratedGgGame {
                     id: Some(3),
-                    winner_id: Some(20),
+                    winner_id: Some(200),
                     selections: vec![],
                 },
             ],

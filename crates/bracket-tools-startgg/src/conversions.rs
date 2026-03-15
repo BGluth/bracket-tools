@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::gg_data_types::{
     GgCharacterSelection, HydratedGgGame, HydratedGgPlayer, HydratedGgSet,
-    HydratedGgTournament, StartGgId,
+    HydratedGgTournament, Matchup, SlotData, StartGgId,
 };
 
 #[derive(Debug, Error)]
@@ -118,14 +118,13 @@ impl TryFrom<SetQueryResult> for HydratedGgSet {
             .map(convert_game)
             .collect();
 
-        let (slot_entrant_ids, scores) = extract_slot_data(set.slots);
+        let matchup = extract_matchup(set.slots);
 
         Ok(HydratedGgSet {
             id: result.id,
             completed_at: None,
             round: None,
-            slot_entrant_ids,
-            scores,
+            matchup,
             games,
         })
     }
@@ -152,21 +151,37 @@ fn convert_game(game: get_games_for_set::Game) -> HydratedGgGame {
     }
 }
 
-/// Extracts player IDs and scores from slots in a single pass, preserving slot order.
-fn extract_slot_data(
+/// Tries to build a `Matchup::Singles` from two slots. Returns `None` if
+/// fewer than two slots have valid entrant + player data.
+fn extract_matchup(
     slots: Option<Vec<Option<get_games_for_set::SetSlot>>>,
-) -> (Vec<StartGgId>, Vec<Option<f64>>) {
+) -> Option<Matchup> {
     let slots = slots.unwrap_or_default();
-    let player_ids = slots.iter().flatten().filter_map(slot_player_id).collect();
-    let scores = slots.iter().flatten().map(slot_score).collect();
-    (player_ids, scores)
+    let mut slot_iter = slots.iter().flatten();
+
+    let left = extract_slot(slot_iter.next()?)?;
+    let right = extract_slot(slot_iter.next()?)?;
+
+    Some(Matchup::Singles { left, right })
 }
 
-fn slot_player_id(slot: &get_games_for_set::SetSlot) -> Option<StartGgId> {
+fn extract_slot(slot: &get_games_for_set::SetSlot) -> Option<SlotData> {
     let standing = slot.standing.as_ref()?;
-    let player = standing
-        .entrant
-        .as_ref()?
+    let entrant = standing.entrant.as_ref()?;
+
+    let entrant_id = parse_gg_id(entrant.id.as_ref()?).ok()?;
+    let player_id = slot_player_id(entrant)?;
+    let score = slot_score(standing);
+
+    Some(SlotData {
+        entrant_id,
+        player_id,
+        score,
+    })
+}
+
+fn slot_player_id(entrant: &get_games_for_set::Entrant) -> Option<StartGgId> {
+    let player = entrant
         .participants
         .as_ref()?
         .iter()
@@ -177,14 +192,14 @@ fn slot_player_id(slot: &get_games_for_set::SetSlot) -> Option<StartGgId> {
     parse_gg_id(player.id.as_ref()?).ok()
 }
 
-fn slot_score(slot: &get_games_for_set::SetSlot) -> Option<f64> {
-    slot.standing.as_ref()?.stats.as_ref()?.score.as_ref()?.value
+fn slot_score(standing: &get_games_for_set::Standing) -> Option<f64> {
+    standing.stats.as_ref()?.score.as_ref()?.value
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        GgConversionError, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament,
+        GgConversionError, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup,
         PlayerQueryResult, SetQueryResult, TournamentQueryResult,
     };
     use bracket_tools_startgg_schema::{
@@ -310,7 +325,7 @@ mod tests {
         let response = gfs::GetGamesOfSet {
             set: Some(gfs::Set {
                 games: Some(vec![Some(gfs::Game {
-                    winner_id: Some(10),
+                    winner_id: Some(100),
                     selections: Some(vec![Some(gfs::GameSelection {
                         character: Some(gfs::Character {
                             id: Some(cynic::Id::new("500")),
@@ -318,8 +333,8 @@ mod tests {
                     })]),
                 })]),
                 slots: Some(vec![
-                    Some(make_slot("10", 3.0)),
-                    Some(make_slot("20", 1.0)),
+                    Some(make_slot("100", "10", 3.0)),
+                    Some(make_slot("200", "20", 1.0)),
                 ]),
             }),
         };
@@ -327,10 +342,15 @@ mod tests {
         let result = HydratedGgSet::try_from(SetQueryResult { id: 50, response }).unwrap();
 
         assert_eq!(result.id, 50);
-        assert_eq!(result.slot_entrant_ids, vec![10, 20]);
-        assert_eq!(result.scores, vec![Some(3.0), Some(1.0)]);
+        let Matchup::Singles { ref left, ref right } = result.matchup.expect("should have matchup");
+        assert_eq!(left.entrant_id, 100);
+        assert_eq!(left.player_id, 10);
+        assert_eq!(left.score, Some(3.0));
+        assert_eq!(right.entrant_id, 200);
+        assert_eq!(right.player_id, 20);
+        assert_eq!(right.score, Some(1.0));
         assert_eq!(result.games.len(), 1);
-        assert_eq!(result.games[0].winner_id, Some(10));
+        assert_eq!(result.games[0].winner_id, Some(100));
         assert_eq!(result.games[0].selections[0].character_id, Some(500));
         assert!(result.completed_at.is_none());
         assert!(result.round.is_none());
@@ -356,14 +376,14 @@ mod tests {
         let result = HydratedGgSet::try_from(SetQueryResult { id: 1, response }).unwrap();
 
         assert!(result.games.is_empty());
-        assert!(result.slot_entrant_ids.is_empty());
-        assert!(result.scores.is_empty());
+        assert!(result.matchup.is_none());
     }
 
-    fn make_slot(player_id: &str, score: f64) -> gfs::SetSlot {
+    fn make_slot(entrant_id: &str, player_id: &str, score: f64) -> gfs::SetSlot {
         gfs::SetSlot {
             standing: Some(gfs::Standing {
                 entrant: Some(gfs::Entrant {
+                    id: Some(cynic::Id::new(entrant_id)),
                     participants: Some(vec![Some(gfs::Participant {
                         player: Some(gfs::Player {
                             id: Some(cynic::Id::new(player_id)),
