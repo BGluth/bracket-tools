@@ -90,10 +90,7 @@ mod tests {
     #[test]
     fn bearer_round_trip() {
         let token = GGRestToken::from_str("91b0c4b4aeae0a040d5b2c0e4d8861c2").unwrap();
-        assert_eq!(
-            token.as_bearer_value(),
-            "Bearer 91b0c4b4aeae0a040d5b2c0e4d8861c2"
-        );
+        assert_eq!(token.as_bearer_value(), "Bearer 91b0c4b4aeae0a040d5b2c0e4d8861c2");
     }
 
     #[test]

@@ -1,15 +1,9 @@
 use bracket_tools_core::{
     data_types::Normalizable,
-    types::{
-        Game, GameId, GameType, GameWinningSide, Player, PlayerId, PlayerGameInfo, Set, SetId,
-        Tournament, TournamentId,
-    },
+    types::{Game, GameId, GameType, GameWinningSide, Player, PlayerGameInfo, PlayerId, Set, SetId, Tournament, TournamentId},
 };
 
-use crate::gg_data_types::{
-    HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData,
-    StartGgId,
-};
+use crate::gg_data_types::{HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData, StartGgId};
 
 /// Pairs a game with slot context needed to resolve `winner_id` to a side.
 pub struct GgGameWithContext<'a> {
@@ -58,11 +52,7 @@ impl<'a> Normalizable for GgGameWithContext<'a> {
     }
 }
 
-fn determine_winning_side(
-    winner_id: StartGgId,
-    left: &SlotData,
-    right: &SlotData,
-) -> Option<GameWinningSide> {
+fn determine_winning_side(winner_id: StartGgId, left: &SlotData, right: &SlotData) -> Option<GameWinningSide> {
     if left.entrant_id == winner_id {
         Some(GameWinningSide::Left)
     } else if right.entrant_id == winner_id {
@@ -80,9 +70,7 @@ impl Normalizable for HydratedGgSet {
             Some(matchup) => self
                 .games
                 .iter()
-                .filter_map(|game| {
-                    GgGameWithContext { game, matchup }.normalize()
-                })
+                .filter_map(|game| GgGameWithContext { game, matchup }.normalize())
                 .collect(),
             None => vec![],
         };
@@ -109,18 +97,12 @@ impl Normalizable for HydratedGgTournament {
 
 #[cfg(test)]
 mod tests {
-    use super::{GgGameWithContext, Normalizable};
-    use crate::gg_data_types::{
-        HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData,
-    };
     use bracket_tools_core::types::{GameType, GameWinningSide, PlayerId, SetId, TournamentId};
 
-    fn singles_matchup(
-        left_entrant: u64,
-        left_player: u64,
-        right_entrant: u64,
-        right_player: u64,
-    ) -> Matchup {
+    use super::{GgGameWithContext, Normalizable};
+    use crate::gg_data_types::{HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData};
+
+    fn singles_matchup(left_entrant: u64, left_player: u64, right_entrant: u64, right_player: u64) -> Matchup {
         Matchup::Singles {
             left: SlotData {
                 entrant_id: left_entrant,
@@ -169,7 +151,10 @@ mod tests {
             winner_id: Some(100),
             selections: vec![],
         };
-        let ctx = GgGameWithContext { game: &game, matchup: &matchup };
+        let ctx = GgGameWithContext {
+            game: &game,
+            matchup: &matchup,
+        };
 
         let normalized = ctx.normalize().unwrap();
         assert!(matches!(normalized.winning_side, GameWinningSide::Left));
@@ -191,7 +176,10 @@ mod tests {
             winner_id: Some(200),
             selections: vec![],
         };
-        let ctx = GgGameWithContext { game: &game, matchup: &matchup };
+        let ctx = GgGameWithContext {
+            game: &game,
+            matchup: &matchup,
+        };
 
         let normalized = ctx.normalize().unwrap();
         assert!(matches!(normalized.winning_side, GameWinningSide::Right));
@@ -205,7 +193,10 @@ mod tests {
             winner_id: Some(999),
             selections: vec![],
         };
-        let ctx = GgGameWithContext { game: &game, matchup: &matchup };
+        let ctx = GgGameWithContext {
+            game: &game,
+            matchup: &matchup,
+        };
 
         assert!(ctx.normalize().is_none());
     }
@@ -218,7 +209,10 @@ mod tests {
             winner_id: None,
             selections: vec![],
         };
-        let ctx = GgGameWithContext { game: &game, matchup: &matchup };
+        let ctx = GgGameWithContext {
+            game: &game,
+            matchup: &matchup,
+        };
 
         assert!(ctx.normalize().is_none());
     }
@@ -252,14 +246,8 @@ mod tests {
 
         assert_eq!(normalized.s_id, SetId(50));
         assert_eq!(normalized.games.len(), 2);
-        assert!(matches!(
-            normalized.games[0].winning_side,
-            GameWinningSide::Left
-        ));
-        assert!(matches!(
-            normalized.games[1].winning_side,
-            GameWinningSide::Right
-        ));
+        assert!(matches!(normalized.games[0].winning_side, GameWinningSide::Left));
+        assert!(matches!(normalized.games[1].winning_side, GameWinningSide::Right));
     }
 
     #[test]

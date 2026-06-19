@@ -6,17 +6,13 @@ use bracket_tools_startgg_schema::{
 use thiserror::Error;
 
 use crate::gg_data_types::{
-    GgCharacterSelection, HydratedGgGame, HydratedGgPlayer, HydratedGgSet,
-    HydratedGgTournament, Matchup, SlotData, StartGgId,
+    GgCharacterSelection, HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData, StartGgId,
 };
 
 #[derive(Debug, Error)]
 pub enum GgConversionError {
     #[error("missing field `{field}` on `{entity}`")]
-    MissingField {
-        entity: &'static str,
-        field: &'static str,
-    },
+    MissingField { entity: &'static str, field: &'static str },
     #[error("invalid ID: {0}")]
     InvalidId(String),
 }
@@ -59,10 +55,7 @@ impl TryFrom<TournamentQueryResult> for HydratedGgTournament {
     type Error = GgConversionError;
 
     fn try_from(result: TournamentQueryResult) -> Result<Self, Self::Error> {
-        let tournament = result
-            .response
-            .tournament
-            .required("GetTournamentForId", "tournament")?;
+        let tournament = result.response.tournament.required("GetTournamentForId", "tournament")?;
 
         let name = tournament.name.required("Tournament", "name")?;
 
@@ -89,10 +82,7 @@ impl TryFrom<PlayerQueryResult> for HydratedGgPlayer {
     type Error = GgConversionError;
 
     fn try_from(result: PlayerQueryResult) -> Result<Self, Self::Error> {
-        let player = result
-            .response
-            .player
-            .required("GetPlayerForPlayerId", "player")?;
+        let player = result.response.player.required("GetPlayerForPlayerId", "player")?;
 
         let gamer_tag = player.gamer_tag.required("Player", "gamer_tag")?;
 
@@ -110,13 +100,7 @@ impl TryFrom<SetQueryResult> for HydratedGgSet {
     fn try_from(result: SetQueryResult) -> Result<Self, Self::Error> {
         let set = result.response.set.required("GetGamesOfSet", "set")?;
 
-        let games = set
-            .games
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .map(convert_game)
-            .collect();
+        let games = set.games.unwrap_or_default().into_iter().flatten().map(convert_game).collect();
 
         let matchup = extract_matchup(set.slots);
 
@@ -137,10 +121,7 @@ fn convert_game(game: get_games_for_set::Game) -> HydratedGgGame {
         .into_iter()
         .flatten()
         .map(|sel| GgCharacterSelection {
-            character_id: sel
-                .character
-                .and_then(|c| c.id)
-                .and_then(|id| parse_gg_id(&id).ok()),
+            character_id: sel.character.and_then(|c| c.id).and_then(|id| parse_gg_id(&id).ok()),
         })
         .collect();
 
@@ -153,9 +134,7 @@ fn convert_game(game: get_games_for_set::Game) -> HydratedGgGame {
 
 /// Tries to build a `Matchup::Singles` from two slots. Returns `None` if
 /// fewer than two slots have valid entrant + player data.
-fn extract_matchup(
-    slots: Option<Vec<Option<get_games_for_set::SetSlot>>>,
-) -> Option<Matchup> {
+fn extract_matchup(slots: Option<Vec<Option<get_games_for_set::SetSlot>>>) -> Option<Matchup> {
     let slots = slots.unwrap_or_default();
     let mut slot_iter = slots.iter().flatten();
 
@@ -181,14 +160,7 @@ fn extract_slot(slot: &get_games_for_set::SetSlot) -> Option<SlotData> {
 }
 
 fn slot_player_id(entrant: &get_games_for_set::Entrant) -> Option<StartGgId> {
-    let player = entrant
-        .participants
-        .as_ref()?
-        .iter()
-        .flatten()
-        .next()?
-        .player
-        .as_ref()?;
+    let player = entrant.participants.as_ref()?.iter().flatten().next()?.player.as_ref()?;
     parse_gg_id(player.id.as_ref()?).ok()
 }
 
@@ -198,12 +170,11 @@ fn slot_score(standing: &get_games_for_set::Standing) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use bracket_tools_startgg_schema::{get_games_for_set as gfs, get_player_for_player_id as gp, get_tournament_for_id as gt};
+
     use super::{
-        GgConversionError, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup,
-        PlayerQueryResult, SetQueryResult, TournamentQueryResult,
-    };
-    use bracket_tools_startgg_schema::{
-        get_games_for_set as gfs, get_player_for_player_id as gp, get_tournament_for_id as gt,
+        GgConversionError, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, PlayerQueryResult, SetQueryResult,
+        TournamentQueryResult,
     };
 
     #[test]
@@ -228,8 +199,7 @@ mod tests {
             }),
         };
 
-        let result =
-            HydratedGgTournament::try_from(TournamentQueryResult { id: 100, response }).unwrap();
+        let result = HydratedGgTournament::try_from(TournamentQueryResult { id: 100, response }).unwrap();
 
         assert_eq!(result.id, 100);
         assert_eq!(result.name, "Genesis 9");
@@ -239,8 +209,7 @@ mod tests {
     #[test]
     fn tournament_conversion_missing_tournament() {
         let response = gt::GetTournamentForId { tournament: None };
-        let err =
-            HydratedGgTournament::try_from(TournamentQueryResult { id: 100, response }).unwrap_err();
+        let err = HydratedGgTournament::try_from(TournamentQueryResult { id: 100, response }).unwrap_err();
 
         assert!(matches!(
             err,
@@ -273,8 +242,7 @@ mod tests {
             }),
         };
 
-        let result =
-            HydratedGgTournament::try_from(TournamentQueryResult { id: 1, response }).unwrap();
+        let result = HydratedGgTournament::try_from(TournamentQueryResult { id: 1, response }).unwrap();
 
         assert_eq!(result.participant_ids, vec![42]);
     }
@@ -288,8 +256,7 @@ mod tests {
             }),
         };
 
-        let result =
-            HydratedGgPlayer::try_from(PlayerQueryResult { id: 42, response }).unwrap();
+        let result = HydratedGgPlayer::try_from(PlayerQueryResult { id: 42, response }).unwrap();
 
         assert_eq!(result.id, 42);
         assert_eq!(result.gamer_tag, "Tweek");
@@ -305,8 +272,7 @@ mod tests {
             }),
         };
 
-        let result =
-            HydratedGgPlayer::try_from(PlayerQueryResult { id: 1, response }).unwrap();
+        let result = HydratedGgPlayer::try_from(PlayerQueryResult { id: 1, response }).unwrap();
 
         assert_eq!(result.gamer_tag, "MkLeo");
         assert!(result.prefix.is_none());
@@ -332,10 +298,7 @@ mod tests {
                         }),
                     })]),
                 })]),
-                slots: Some(vec![
-                    Some(make_slot("100", "10", 3.0)),
-                    Some(make_slot("200", "20", 1.0)),
-                ]),
+                slots: Some(vec![Some(make_slot("100", "10", 3.0)), Some(make_slot("200", "20", 1.0))]),
             }),
         };
 
@@ -367,10 +330,7 @@ mod tests {
     #[test]
     fn set_conversion_empty_games_and_slots() {
         let response = gfs::GetGamesOfSet {
-            set: Some(gfs::Set {
-                games: None,
-                slots: None,
-            }),
+            set: Some(gfs::Set { games: None, slots: None }),
         };
 
         let result = HydratedGgSet::try_from(SetQueryResult { id: 1, response }).unwrap();
@@ -391,9 +351,7 @@ mod tests {
                     })]),
                 }),
                 stats: Some(gfs::StandingStats {
-                    score: Some(gfs::Score {
-                        value: Some(score),
-                    }),
+                    score: Some(gfs::Score { value: Some(score) }),
                 }),
             }),
         }

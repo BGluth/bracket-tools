@@ -1,18 +1,18 @@
-use bracket_tools_core::data_types::Normalizable;
-use bracket_tools_core::types::{GameType, GameWinningSide, PlayerId};
-use bracket_tools_startgg::conversions::{PlayerQueryResult, SetQueryResult, TournamentQueryResult};
-use bracket_tools_startgg::gg_data_types::{
-    HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup,
+use bracket_tools_core::{
+    data_types::Normalizable,
+    types::{GameType, GameWinningSide, PlayerId},
+};
+use bracket_tools_startgg::{
+    conversions::{PlayerQueryResult, SetQueryResult, TournamentQueryResult},
+    gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup},
 };
 use bracket_tools_startgg_schema::{
-    get_games_for_set::GetGamesOfSet, get_player_for_player_id::GetPlayerForPlayerId,
-    get_tournament_for_id::GetTournamentForId,
+    get_games_for_set::GetGamesOfSet, get_player_for_player_id::GetPlayerForPlayerId, get_tournament_for_id::GetTournamentForId,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 
 fn load_set_fixture(json: &str, set_id: u64) -> HydratedGgSet {
-    let response: cynic::GraphQlResponse<GetGamesOfSet> =
-        serde_json::from_str(json).expect("fixture should deserialize");
+    let response: cynic::GraphQlResponse<GetGamesOfSet> = serde_json::from_str(json).expect("fixture should deserialize");
     let data = response.data.expect("fixture should have data");
     HydratedGgSet::try_from(SetQueryResult {
         id: set_id,
@@ -22,8 +22,7 @@ fn load_set_fixture(json: &str, set_id: u64) -> HydratedGgSet {
 }
 
 fn load_tournament_fixture(json: &str, tournament_id: u64) -> HydratedGgTournament {
-    let response: cynic::GraphQlResponse<GetTournamentForId> =
-        serde_json::from_str(json).expect("fixture should deserialize");
+    let response: cynic::GraphQlResponse<GetTournamentForId> = serde_json::from_str(json).expect("fixture should deserialize");
     let data = response.data.expect("fixture should have data");
     HydratedGgTournament::try_from(TournamentQueryResult {
         id: tournament_id,
@@ -33,8 +32,7 @@ fn load_tournament_fixture(json: &str, tournament_id: u64) -> HydratedGgTourname
 }
 
 fn load_player_fixture(json: &str, player_id: u64) -> HydratedGgPlayer {
-    let response: cynic::GraphQlResponse<GetPlayerForPlayerId> =
-        serde_json::from_str(json).expect("fixture should deserialize");
+    let response: cynic::GraphQlResponse<GetPlayerForPlayerId> = serde_json::from_str(json).expect("fixture should deserialize");
     let data = response.data.expect("fixture should have data");
     HydratedGgPlayer::try_from(PlayerQueryResult {
         id: player_id,
@@ -79,10 +77,7 @@ fn assert_normalized_uses_player_ids(set: &HydratedGgSet) {
 // Bread Basket 2025 — AceEagle 2-0 TC | dog
 #[test]
 fn set_aceeagle_v_dog() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_89833288_aceeagle_v_dog.json"),
-        89833288,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_89833288_aceeagle_v_dog.json"), 89833288);
 
     assert_eq!(set.games.len(), 2);
     assert_winner_ids_are_entrant_ids(&set);
@@ -102,10 +97,7 @@ fn set_aceeagle_v_dog() {
 // Bread Basket 2025 — Spitfire 2-0 Dest
 #[test]
 fn set_spitfire_v_dest() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_89840397_spitfire_v_dest.json"),
-        89840397,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_89840397_spitfire_v_dest.json"), 89840397);
 
     assert_eq!(set.games.len(), 2);
     assert_winner_ids_are_entrant_ids(&set);
@@ -115,10 +107,7 @@ fn set_spitfire_v_dest() {
 // Bread Basket 2025 — Devintheguy 2-1 Sancocho
 #[test]
 fn set_devintheguy_v_sancocho() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_89845364_devintheguy_v_sancocho.json"),
-        89845364,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_89845364_devintheguy_v_sancocho.json"), 89845364);
 
     assert_eq!(set.games.len(), 3);
     assert_winner_ids_are_entrant_ids(&set);
@@ -131,10 +120,7 @@ fn set_devintheguy_v_sancocho() {
 // Bread Basket 2025 — FeiFFer 2-0 YaBoiChips
 #[test]
 fn set_yaboichips_v_feiffer() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_89833281_yaboichips_v_feiffer.json"),
-        89833281,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_89833281_yaboichips_v_feiffer.json"), 89833281);
 
     assert_eq!(set.games.len(), 2);
     assert_winner_ids_are_entrant_ids(&set);
@@ -144,10 +130,7 @@ fn set_yaboichips_v_feiffer() {
 // Bread Basket 2025 — Bandage 1-2 nick
 #[test]
 fn set_bandage_v_nick() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_89833550_bandage_v_nick.json"),
-        89833550,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_89833550_bandage_v_nick.json"), 89833550);
 
     assert_eq!(set.games.len(), 3);
     assert_winner_ids_are_entrant_ids(&set);
@@ -157,10 +140,7 @@ fn set_bandage_v_nick() {
 // Bread Basket 2025 — ./rust_man 1-2 DaBeef
 #[test]
 fn set_rustman_v_dabeef() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_89833279_rustman_v_dabeef.json"),
-        89833279,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_89833279_rustman_v_dabeef.json"), 89833279);
 
     assert_eq!(set.games.len(), 3);
     assert_winner_ids_are_entrant_ids(&set);
@@ -170,10 +150,7 @@ fn set_rustman_v_dabeef() {
 // Colchester Clash #17 — CraigleRock 1-2 Eternity
 #[test]
 fn set_craiglerock_v_eternity() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_95304560_craiglerock_v_eternity.json"),
-        95304560,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_95304560_craiglerock_v_eternity.json"), 95304560);
 
     assert_eq!(set.games.len(), 3);
     assert_winner_ids_are_entrant_ids(&set);
@@ -193,10 +170,7 @@ fn set_craiglerock_v_eternity() {
 // Colchester Clash #17 — Soufflé 2-0 Soul Badguy
 #[test]
 fn set_soulbadguy_v_souffle() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_95304563_soulbadguy_v_souffle.json"),
-        95304563,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_95304563_soulbadguy_v_souffle.json"), 95304563);
 
     assert_eq!(set.games.len(), 2);
     assert_winner_ids_are_entrant_ids(&set);
@@ -206,10 +180,7 @@ fn set_soulbadguy_v_souffle() {
 // French Bread Rumble #86 — Utugboat 3-1 Cronos
 #[test]
 fn set_cronos_v_utugboat() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_100308057_cronos_v_utugboat.json"),
-        100308057,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_100308057_cronos_v_utugboat.json"), 100308057);
 
     assert_eq!(set.games.len(), 4);
     assert_winner_ids_are_entrant_ids(&set);
@@ -230,10 +201,7 @@ fn set_cronos_v_utugboat() {
 // Reals Arena #23 — Perendeshe 3-2 Spectra (Grand Finals)
 #[test]
 fn set_perendeshe_v_spectra_gf() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_98613766_perendeshe_spectra_gf.json"),
-        98613766,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_98613766_perendeshe_spectra_gf.json"), 98613766);
 
     assert_eq!(set.games.len(), 5);
     assert_winner_ids_are_entrant_ids(&set);
@@ -256,10 +224,7 @@ fn set_perendeshe_v_spectra_gf() {
 // Bread Basket 2025 tournament
 #[test]
 fn tournament_bread_basket_2025() {
-    let tournament = load_tournament_fixture(
-        include_str!("fixtures/tournament_733586_bread_basket_2025.json"),
-        733586,
-    );
+    let tournament = load_tournament_fixture(include_str!("fixtures/tournament_733586_bread_basket_2025.json"), 733586);
 
     assert_eq!(tournament.id, 733586);
     assert_eq!(tournament.name, "Bread Basket - 2025");
@@ -269,10 +234,7 @@ fn tournament_bread_basket_2025() {
 // Player: Cronos
 #[test]
 fn player_cronos() {
-    let player = load_player_fixture(
-        include_str!("fixtures/player_4665060_cronos.json"),
-        4665060,
-    );
+    let player = load_player_fixture(include_str!("fixtures/player_4665060_cronos.json"), 4665060);
 
     assert_eq!(player.id, 4665060);
     assert_eq!(player.gamer_tag, "Cronos");
@@ -284,10 +246,7 @@ fn player_cronos() {
 // Player: CraigleRok
 #[test]
 fn player_craiglerok() {
-    let player = load_player_fixture(
-        include_str!("fixtures/player_3551055_craiglerock.json"),
-        3551055,
-    );
+    let player = load_player_fixture(include_str!("fixtures/player_3551055_craiglerock.json"), 3551055);
 
     assert_eq!(player.id, 3551055);
     assert_eq!(player.gamer_tag, "CraigleRok");
@@ -308,27 +267,18 @@ where
 
 #[test]
 fn serde_roundtrip_set() {
-    let set = load_set_fixture(
-        include_str!("fixtures/set_89833288_aceeagle_v_dog.json"),
-        89833288,
-    );
+    let set = load_set_fixture(include_str!("fixtures/set_89833288_aceeagle_v_dog.json"), 89833288);
     assert_bincode_roundtrip(&set);
 }
 
 #[test]
 fn serde_roundtrip_tournament() {
-    let tournament = load_tournament_fixture(
-        include_str!("fixtures/tournament_733586_bread_basket_2025.json"),
-        733586,
-    );
+    let tournament = load_tournament_fixture(include_str!("fixtures/tournament_733586_bread_basket_2025.json"), 733586);
     assert_bincode_roundtrip(&tournament);
 }
 
 #[test]
 fn serde_roundtrip_player() {
-    let player = load_player_fixture(
-        include_str!("fixtures/player_4665060_cronos.json"),
-        4665060,
-    );
+    let player = load_player_fixture(include_str!("fixtures/player_4665060_cronos.json"), 4665060);
     assert_bincode_roundtrip(&player);
 }
