@@ -1,5 +1,11 @@
 pub mod conversions;
 pub mod gg_data_types;
+pub mod lazy;
 pub mod normalize;
 pub mod provider;
+pub mod session;
 pub mod types;
+
+pub use lazy::{LazyPlayer, LazySet, LazyTournament};
+pub use provider::{GGProvider, GGProviderError};
+pub use session::GgSession;

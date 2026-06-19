@@ -14,7 +14,8 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

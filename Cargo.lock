@@ -225,6 +225,7 @@ dependencies = [
  "bracket-tools-startgg-schema",
  "cynic",
  "governor",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
