@@ -10,7 +10,7 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 | bracket-tools-cache | crates/bracket-tools-cache | ~50% | Async Storage trait + NullStorage + SledStorage |
 | bracket-tools-query | crates/bracket-tools-query | ~5% | Abstract query interface (multi-platform) |
 | bracket-tools-startgg-schema | crates/bracket-tools-startgg-schema | ~80% | cynic codegen types from start.gg schema |
-| bracket-tools-startgg | crates/bracket-tools-startgg | ~60% | Main SDK: caching, rate-limited start.gg client |
+| bracket-tools-startgg | crates/bracket-tools-startgg | ~75% | Main SDK: caching, rate-limited start.gg client |
 | reporter-cli | tools/reporter/reporter-cli | ~20% | ratatui TUI for set reporting |
 | reporter-state | tools/reporter/reporter-state | ~25% | Reporter state management (store pattern) |
 | bracket-tools-daemon | tools/daemon | ~5% | Background scraper daemon |
@@ -18,14 +18,14 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 
 ## Current Phase
 
-Phase 1 -- Foundation. Sessions 1-6 complete. Completed: Entrant.id fix + Matchup enum, fixture tests, GGRestToken refactor, cache layer integration (Storage trait + GGProvider<S>). Remaining: cache-hit path, pagination.
+Phase 1 -- Foundation. Sessions 1-9 complete. Completed: Entrant.id fix + Matchup enum, fixture tests, GGRestToken refactor, cache layer integration (Storage trait + GGProvider<S>), cache-hit path, lazy-hydration session layer (GgSession + smart handles), pagination (generic `fetch_all_pages`). Remaining: MemoryStorage, staleness/TTL, request coalescing, doubles.
 
-**Housekeeping:** At the end of each session, update the crate status percentages in the table above, the `progress.md` memory file to reflect work done, and refresh the codebase map (`.claude/rules/codebase_map.md`) — only update sections that changed.
+**Housekeeping:** At the end of each session, update the crate status percentages in the table above, run `/handoff` to refresh the active task file in `memory/tasks/` (and `/epic update` for the Phase 1 epic), and refresh the codebase map (`.claude/rules/codebase_map.md`) — only update sections that changed.
 
 ## Session Workflow
 
-- **Session start:** Read the `progress.md` memory file. Summarize what was completed last session, list the candidate tasks, and ask the user what they'd like to work on.
-- **Task completion:** After committing and pushing, ask the user if they want to pick up another task or wrap the session.
+- **Session start:** Read the `MEMORY.md` Active Work section, then the linked Phase 1 epic (`memory/epics/phase_1_foundation.md`) and active task file(s) in `memory/tasks/`. Summarize what was completed last session, list the candidate tasks from the epic backlog, and ask the user what they'd like to work on.
+- **Task completion:** After committing and pushing, ask the user if they want to pick up another task or wrap the session. **This project does not use pull requests** — do not create or offer PRs; commit and push the branch directly.
 
 ## Key Technical Decisions
 
