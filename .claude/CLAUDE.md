@@ -10,7 +10,7 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 | bracket-tools-cache | crates/bracket-tools-cache | ~70% | Async Storage trait + NullStorage + SledStorage + MemoryStorage |
 | bracket-tools-query | crates/bracket-tools-query | ~5% | Abstract query interface (multi-platform) |
 | bracket-tools-startgg-schema | crates/bracket-tools-startgg-schema | ~80% | cynic codegen types from start.gg schema |
-| bracket-tools-startgg | crates/bracket-tools-startgg | ~75% | Main SDK: caching, rate-limited start.gg client |
+| bracket-tools-startgg | crates/bracket-tools-startgg | ~78% | Main SDK: caching, rate-limited start.gg client |
 | reporter-cli | tools/reporter/reporter-cli | ~20% | ratatui TUI for set reporting |
 | reporter-state | tools/reporter/reporter-state | ~25% | Reporter state management (store pattern) |
 | bracket-tools-daemon | tools/daemon | ~5% | Background scraper daemon |
@@ -18,7 +18,7 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 
 ## Current Phase
 
-Phase 1 -- Foundation. Sessions 1-10 complete. Completed: Entrant.id fix + Matchup enum, fixture tests, GGRestToken refactor, cache layer integration (Storage trait + GGProvider<S>), cache-hit path, lazy-hydration session layer (GgSession + smart handles), pagination (generic `fetch_all_pages`), MemoryStorage (HashMap-backed Storage backend). Remaining: staleness/TTL, request coalescing, doubles.
+Phase 1 -- Foundation. Sessions 1-11 complete. Completed: Entrant.id fix + Matchup enum, fixture tests, GGRestToken refactor, cache layer integration (Storage trait + GGProvider<S>), cache-hit path, lazy-hydration session layer (GgSession + smart handles), pagination (generic `fetch_all_pages`), MemoryStorage (HashMap-backed Storage backend), cache freshness (per-entity TTL + terminal-state immutability). Remaining: request coalescing, doubles.
 
 **Housekeeping:** At the end of each session, update the crate status percentages in the table above, run `/handoff` to refresh the active task file in `memory/tasks/` (and `/epic update` for the Phase 1 epic), and refresh the codebase map (`.claude/rules/codebase_map.md`) — only update sections that changed.
 
