@@ -1,4 +1,9 @@
-use std::{future::Future, num::NonZeroU32, sync::Arc, time::SystemTime};
+use std::{
+    future::Future,
+    num::NonZeroU32,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use bracket_tools_cache::{
     null_storage::NullStorage,
@@ -30,6 +35,87 @@ use crate::{
 const STARTGG_API_URL: &str = "https://api.start.gg/gql/alpha";
 const DEFAULT_REQUESTS_PER_MINUTE: u32 = 80;
 const DEFAULT_PAGE_SIZE: i32 = 25;
+
+/// The cached entity kinds. Each is its own cache-key namespace and TTL bucket.
+#[derive(Clone, Copy)]
+enum CacheEntity {
+    Tournament,
+    Player,
+    Set,
+}
+
+impl CacheEntity {
+    fn key_prefix(self) -> &'static str {
+        match self {
+            CacheEntity::Tournament => "tournament",
+            CacheEntity::Player => "player",
+            CacheEntity::Set => "set",
+        }
+    }
+}
+
+/// Per-entity cache TTLs. `None` means entries of that kind never expire by age.
+#[derive(Clone, Copy, Default)]
+struct EntityTtls {
+    tournament: Option<Duration>,
+    player: Option<Duration>,
+    set: Option<Duration>,
+}
+
+impl EntityTtls {
+    fn get(&self, entity: CacheEntity) -> Option<Duration> {
+        match entity {
+            CacheEntity::Tournament => self.tournament,
+            CacheEntity::Player => self.player,
+            CacheEntity::Set => self.set,
+        }
+    }
+}
+
+/// Whether a cached value has reached a state start.gg will no longer change,
+/// so it can be served from cache indefinitely regardless of TTL.
+///
+/// "Immutable" is a caching contract, not an absolute guarantee — a completed
+/// set can still change via a rare manual correction (DQ, score fix, bracket
+/// reset). Those are meant to be surfaced by an explicit purge/recheck rather
+/// than by periodically re-fetching data that almost never changes.
+trait CacheFreshness {
+    fn is_immutable(&self) -> bool;
+}
+
+impl CacheFreshness for HydratedGgSet {
+    fn is_immutable(&self) -> bool {
+        // A completed set is final; an in-progress one still changes.
+        self.completed_at.is_some()
+    }
+}
+
+impl CacheFreshness for HydratedGgPlayer {
+    fn is_immutable(&self) -> bool {
+        // Players have no terminal state — tag/prefix can change at any time
+        // (rarely), so freshness is governed by TTL alone.
+        false
+    }
+}
+
+impl CacheFreshness for HydratedGgTournament {
+    fn is_immutable(&self) -> bool {
+        // TODO: treat completed tournaments as immutable once `state`/`endAt`
+        // are added to the tournament query and `HydratedGgTournament`.
+        false
+    }
+}
+
+/// Whether a value stored at `stored_at` has exceeded its `ttl`.
+///
+/// A `None` TTL never expires. A timestamp in the future (clock skew) counts
+/// as stale, forcing a refresh.
+fn is_stale(ttl: Option<Duration>, stored_at: SystemTime) -> bool {
+    match ttl {
+        None => false,
+        Some(ttl) => stored_at.elapsed().map_or(true, |age| age >= ttl),
+    }
+}
 
 fn gg_id(id: StartGgId) -> cynic::Id {
     cynic::Id::new(id.to_string())
@@ -65,10 +151,15 @@ fn format_graphql_errors(errors: &[GraphQlError]) -> String {
 ///
 /// Use [`NullStorage`] for an uncached provider, or [`SledStorage`](bracket_tools_cache::sled_storage::SledStorage)
 /// for persistent caching.
+///
+/// Cache freshness is opt-in per entity via the builder's `*_ttl` methods.
+/// Independently, values in a terminal state (e.g. a completed set) are treated
+/// as immutable and served from cache regardless of TTL.
 pub struct GGProvider<S: Storage> {
     client: Client,
     rate_limiter: Arc<DefaultDirectRateLimiter>,
     page_size: i32,
+    ttls: EntityTtls,
     storage: S,
 }
 
@@ -133,19 +224,25 @@ impl<S: Storage> GGProvider<S> {
         Ok((items, first))
     }
 
-    /// Checks the cache for a stored value, falling back to `fetch` on miss.
-    /// On a successful fetch, the result is serialized and stored before returning.
-    async fn cached_fetch<T, F, Fut>(&self, entity: &str, id: StartGgId, fetch: F) -> Result<T, GGProviderError>
+    /// Returns a cached value when present and still fresh, otherwise fetches,
+    /// stores, and returns a new one.
+    ///
+    /// A cached value is served when it is immutable (terminal state) or within
+    /// its entity's TTL; otherwise it is treated as a miss and re-fetched, which
+    /// overwrites the stale entry with a fresh timestamp.
+    async fn cached_fetch<T, F, Fut>(&self, entity: CacheEntity, id: StartGgId, fetch: F) -> Result<T, GGProviderError>
     where
-        T: Serialize + DeserializeOwned,
+        T: Serialize + DeserializeOwned + CacheFreshness,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, GGProviderError>>,
     {
-        let key = cache_key(entity, id);
+        let key = cache_key(entity.key_prefix(), id);
 
-        if let Some((_timestamp, bytes)) = self.storage.get(&key).await? {
+        if let Some((stored_at, bytes)) = self.storage.get(&key).await? {
             let value: T = bincode::deserialize(&bytes).map_err(|e| GGProviderError::CacheDeserialization(e.to_string()))?;
-            return Ok(value);
+            if value.is_immutable() || !is_stale(self.ttls.get(entity), stored_at) {
+                return Ok(value);
+            }
         }
 
         let value = fetch().await?;
@@ -161,7 +258,7 @@ impl<S: Storage> GGProvider<S> {
     /// Returns a cached result if available, otherwise queries the API and
     /// stores the response.
     pub async fn get_tournament(&self, id: StartGgId) -> Result<HydratedGgTournament, GGProviderError> {
-        self.cached_fetch("tournament", id, || self.fetch_tournament(id)).await
+        self.cached_fetch(CacheEntity::Tournament, id, || self.fetch_tournament(id)).await
     }
 
     /// Fetches a player by their start.gg numeric ID.
@@ -169,7 +266,7 @@ impl<S: Storage> GGProvider<S> {
     /// Returns a cached result if available, otherwise queries the API and
     /// stores the response.
     pub async fn get_player(&self, id: StartGgId) -> Result<HydratedGgPlayer, GGProviderError> {
-        self.cached_fetch("player", id, || self.fetch_player(id)).await
+        self.cached_fetch(CacheEntity::Player, id, || self.fetch_player(id)).await
     }
 
     /// Fetches a set and its games by the set's start.gg numeric ID.
@@ -177,7 +274,7 @@ impl<S: Storage> GGProvider<S> {
     /// Returns a cached result if available, otherwise queries the API and
     /// stores the response.
     pub async fn get_set_games(&self, id: StartGgId) -> Result<HydratedGgSet, GGProviderError> {
-        self.cached_fetch("set", id, || self.fetch_set_games(id)).await
+        self.cached_fetch(CacheEntity::Set, id, || self.fetch_set_games(id)).await
     }
 
     async fn fetch_tournament(&self, id: StartGgId) -> Result<HydratedGgTournament, GGProviderError> {
@@ -229,6 +326,7 @@ pub struct GGProviderBuilder<S: Storage> {
     token: GGRestToken,
     requests_per_minute: u32,
     page_size: i32,
+    ttls: EntityTtls,
     storage: S,
 }
 
@@ -238,6 +336,7 @@ impl<S: Storage> GGProviderBuilder<S> {
             token,
             requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
             page_size: DEFAULT_PAGE_SIZE,
+            ttls: EntityTtls::default(),
             storage,
         }
     }
@@ -249,6 +348,28 @@ impl<S: Storage> GGProviderBuilder<S> {
 
     pub fn page_size(mut self, size: i32) -> Self {
         self.page_size = size;
+        self
+    }
+
+    /// Sets how long cached tournaments stay fresh; tournaments older than this
+    /// are re-fetched. Defaults to no expiry.
+    pub fn tournament_ttl(mut self, ttl: Duration) -> Self {
+        self.ttls.tournament = Some(ttl);
+        self
+    }
+
+    /// Sets how long cached players stay fresh; players older than this are
+    /// re-fetched. Defaults to no expiry.
+    pub fn player_ttl(mut self, ttl: Duration) -> Self {
+        self.ttls.player = Some(ttl);
+        self
+    }
+
+    /// Sets how long cached in-progress sets stay fresh; non-completed sets
+    /// older than this are re-fetched. Completed sets are immutable and ignore
+    /// this. Defaults to no expiry.
+    pub fn set_ttl(mut self, ttl: Duration) -> Self {
+        self.ttls.set = Some(ttl);
         self
     }
 
@@ -269,6 +390,7 @@ impl<S: Storage> GGProviderBuilder<S> {
             client,
             rate_limiter,
             page_size: self.page_size,
+            ttls: self.ttls,
             storage: self.storage,
         })
     }
@@ -276,18 +398,56 @@ impl<S: Storage> GGProviderBuilder<S> {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, time::SystemTime};
+    use std::{
+        str::FromStr,
+        time::{Duration, SystemTime},
+    };
 
     use bracket_tools_cache::{null_storage::NullStorage, sled_storage::SledStorage, storage::Storage};
+    use serde::Serialize;
 
-    use super::{GGProvider, DEFAULT_PAGE_SIZE, DEFAULT_REQUESTS_PER_MINUTE};
+    use super::{is_stale, CacheEntity, CacheFreshness, EntityTtls, GGProvider, DEFAULT_PAGE_SIZE, DEFAULT_REQUESTS_PER_MINUTE};
     use crate::{
-        gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData},
+        gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData, StartGgId},
         types::GGRestToken,
     };
 
     fn test_token() -> GGRestToken {
         GGRestToken::from_str("91b0c4b4aeae0a040d5b2c0e4d8861c2").unwrap()
+    }
+
+    fn player(id: StartGgId, gamer_tag: &str, prefix: Option<&str>) -> HydratedGgPlayer {
+        HydratedGgPlayer {
+            id,
+            gamer_tag: gamer_tag.to_string(),
+            prefix: prefix.map(str::to_string),
+        }
+    }
+
+    fn completed_set() -> HydratedGgSet {
+        HydratedGgSet {
+            id: 77777,
+            completed_at: Some("1700000000".to_string()),
+            round: Some(1),
+            matchup: Some(Matchup::Singles {
+                left: SlotData {
+                    entrant_id: 10,
+                    player_id: 20,
+                    score: Some(3.0),
+                },
+                right: SlotData {
+                    entrant_id: 30,
+                    player_id: 40,
+                    score: Some(1.0),
+                },
+            }),
+            games: vec![],
+        }
+    }
+
+    async fn seed_at(storage: &SledStorage, key: &str, stored_at: SystemTime, value: &impl Serialize) {
+        let bytes = bincode::serialize(value).unwrap();
+        storage.put(key, stored_at, &bytes).await.unwrap();
     }
 
     #[test]
@@ -305,6 +465,17 @@ mod tests {
     }
 
     #[test]
+    fn builder_sets_per_entity_ttls() {
+        let builder = GGProvider::builder(test_token())
+            .tournament_ttl(Duration::from_secs(300))
+            .player_ttl(Duration::from_secs(86400))
+            .set_ttl(Duration::from_secs(60));
+        assert_eq!(builder.ttls.tournament, Some(Duration::from_secs(300)));
+        assert_eq!(builder.ttls.player, Some(Duration::from_secs(86400)));
+        assert_eq!(builder.ttls.set, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
     fn builder_produces_provider() {
         let provider = GGProvider::builder(test_token()).build();
         assert!(provider.is_ok());
@@ -316,17 +487,69 @@ mod tests {
         assert!(provider.is_ok());
     }
 
+    #[test]
+    fn is_stale_without_ttl_is_never_stale() {
+        let a_year_ago = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 365);
+        assert!(!is_stale(None, a_year_ago));
+    }
+
+    #[test]
+    fn is_stale_within_ttl_is_fresh() {
+        let ten_secs_ago = SystemTime::now() - Duration::from_secs(10);
+        assert!(!is_stale(Some(Duration::from_secs(60)), ten_secs_ago));
+    }
+
+    #[test]
+    fn is_stale_past_ttl_is_stale() {
+        let two_mins_ago = SystemTime::now() - Duration::from_secs(120);
+        assert!(is_stale(Some(Duration::from_secs(60)), two_mins_ago));
+    }
+
+    #[test]
+    fn is_stale_future_timestamp_is_stale() {
+        let an_hour_ahead = SystemTime::now() + Duration::from_secs(3600);
+        assert!(is_stale(Some(Duration::from_secs(60)), an_hour_ahead));
+    }
+
+    #[test]
+    fn entity_ttls_select_per_entity() {
+        let ttls = EntityTtls {
+            set: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert_eq!(ttls.get(CacheEntity::Set), Some(Duration::from_secs(30)));
+        assert_eq!(ttls.get(CacheEntity::Player), None);
+        assert_eq!(ttls.get(CacheEntity::Tournament), None);
+    }
+
+    #[test]
+    fn completed_set_is_immutable() {
+        assert!(completed_set().is_immutable());
+    }
+
+    #[test]
+    fn in_progress_set_is_not_immutable() {
+        let mut set = completed_set();
+        set.completed_at = None;
+        assert!(!set.is_immutable());
+    }
+
+    #[test]
+    fn players_and_tournaments_are_never_immutable() {
+        let tournament = HydratedGgTournament {
+            id: 1,
+            name: "Genesis".to_string(),
+            participant_ids: vec![],
+        };
+        assert!(!player(1, "Mang0", None).is_immutable());
+        assert!(!tournament.is_immutable());
+    }
+
     #[tokio::test]
     async fn get_player_returns_cached_value() {
         let storage = SledStorage::builder().build().unwrap();
-        let expected = HydratedGgPlayer {
-            id: 99999,
-            gamer_tag: "CachedPlayer".to_string(),
-            prefix: Some("TST".to_string()),
-        };
-
-        let bytes = bincode::serialize(&expected).unwrap();
-        storage.put("player:99999", SystemTime::now(), &bytes).await.unwrap();
+        let expected = player(99999, "CachedPlayer", Some("TST"));
+        seed_at(&storage, "player:99999", SystemTime::now(), &expected).await;
 
         // Provider has a dummy token — if the cache misses, the HTTP request
         // would fail. A successful return proves the hit path worked.
@@ -344,9 +567,7 @@ mod tests {
             name: "Cached Tournament".to_string(),
             participant_ids: vec![1, 2, 3],
         };
-
-        let bytes = bincode::serialize(&expected).unwrap();
-        storage.put("tournament:88888", SystemTime::now(), &bytes).await.unwrap();
+        seed_at(&storage, "tournament:88888", SystemTime::now(), &expected).await;
 
         let provider = GGProvider::builder_with_storage(test_token(), storage).build().unwrap();
 
@@ -357,29 +578,57 @@ mod tests {
     #[tokio::test]
     async fn get_set_games_returns_cached_value() {
         let storage = SledStorage::builder().build().unwrap();
-        let expected = HydratedGgSet {
-            id: 77777,
-            completed_at: Some("1700000000".to_string()),
-            round: Some(1),
-            matchup: Some(Matchup::Singles {
-                left: SlotData {
-                    entrant_id: 10,
-                    player_id: 20,
-                    score: Some(3.0),
-                },
-                right: SlotData {
-                    entrant_id: 30,
-                    player_id: 40,
-                    score: Some(1.0),
-                },
-            }),
-            games: vec![],
-        };
-
-        let bytes = bincode::serialize(&expected).unwrap();
-        storage.put("set:77777", SystemTime::now(), &bytes).await.unwrap();
+        let expected = completed_set();
+        seed_at(&storage, "set:77777", SystemTime::now(), &expected).await;
 
         let provider = GGProvider::builder_with_storage(test_token(), storage).build().unwrap();
+
+        let result = provider.get_set_games(77777).await.unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn fresh_player_within_ttl_is_served() {
+        let storage = SledStorage::builder().build().unwrap();
+        let expected = player(99999, "Fresh", None);
+        seed_at(&storage, "player:99999", SystemTime::now(), &expected).await;
+
+        let provider = GGProvider::builder_with_storage(test_token(), storage)
+            .player_ttl(Duration::from_secs(3600))
+            .build()
+            .unwrap();
+
+        let result = provider.get_player(99999).await.unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn old_player_without_ttl_is_served() {
+        let storage = SledStorage::builder().build().unwrap();
+        let expected = player(99998, "Ancient", None);
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        seed_at(&storage, "player:99998", an_hour_ago, &expected).await;
+
+        let provider = GGProvider::builder_with_storage(test_token(), storage).build().unwrap();
+
+        let result = provider.get_player(99998).await.unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn completed_set_served_from_cache_despite_short_ttl() {
+        // A completed set is immutable, so it is served even when stored well
+        // before its TTL window — terminal data ignores staleness. A miss here
+        // would hit the network with a dummy token and fail.
+        let storage = SledStorage::builder().build().unwrap();
+        let expected = completed_set();
+        let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        seed_at(&storage, "set:77777", an_hour_ago, &expected).await;
+
+        let provider = GGProvider::builder_with_storage(test_token(), storage)
+            .set_ttl(Duration::from_secs(1))
+            .build()
+            .unwrap();
 
         let result = provider.get_set_games(77777).await.unwrap();
         assert_eq!(result, expected);
