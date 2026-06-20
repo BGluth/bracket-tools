@@ -1,8 +1,9 @@
 use std::time::SystemTime;
 
-use bracket_tools_cache::null_storage::NullStorage;
-use bracket_tools_cache::sled_storage::SledStorage;
-use bracket_tools_cache::storage::Storage;
+use bracket_tools_cache::{memory_storage::MemoryStorage, null_storage::NullStorage, sled_storage::SledStorage, storage::Storage};
+
+// NullStorage has its own semantics (it never persists), so it doesn't share
+// the behavioral helpers below.
 
 #[tokio::test]
 async fn null_storage_get_returns_none() {
@@ -20,9 +21,10 @@ async fn null_storage_put_succeeds() {
     assert!(storage.get("key").await.unwrap().is_none());
 }
 
-#[tokio::test]
-async fn sled_storage_roundtrip() {
-    let storage = SledStorage::builder().build().unwrap();
+// Behavioral helpers shared by every persisting backend. Each backend gets thin
+// `#[tokio::test]` wrappers below so a failure still names which backend broke.
+
+async fn check_roundtrip<S: Storage>(storage: S) {
     let now = SystemTime::now();
     let data = b"hello world";
 
@@ -33,16 +35,12 @@ async fn sled_storage_roundtrip() {
     assert_eq!(retrieved, data);
 }
 
-#[tokio::test]
-async fn sled_storage_get_missing_key() {
-    let storage = SledStorage::builder().build().unwrap();
+async fn check_get_missing_key<S: Storage>(storage: S) {
     let result = storage.get("nonexistent").await.unwrap();
     assert!(result.is_none());
 }
 
-#[tokio::test]
-async fn sled_storage_delete() {
-    let storage = SledStorage::builder().build().unwrap();
+async fn check_delete<S: Storage>(storage: S) {
     let now = SystemTime::now();
 
     storage.put("key", now, b"data").await.unwrap();
@@ -52,9 +50,7 @@ async fn sled_storage_delete() {
     assert!(storage.get("key").await.unwrap().is_none());
 }
 
-#[tokio::test]
-async fn sled_storage_clear() {
-    let mut storage = SledStorage::builder().build().unwrap();
+async fn check_clear<S: Storage>(mut storage: S) {
     let now = SystemTime::now();
 
     storage.put("a", now, b"1").await.unwrap();
@@ -66,9 +62,7 @@ async fn sled_storage_clear() {
     assert!(storage.get("b").await.unwrap().is_none());
 }
 
-#[tokio::test]
-async fn sled_storage_overwrite() {
-    let storage = SledStorage::builder().build().unwrap();
+async fn check_overwrite<S: Storage>(storage: S) {
     let t1 = SystemTime::now();
 
     storage.put("key", t1, b"first").await.unwrap();
@@ -76,4 +70,54 @@ async fn sled_storage_overwrite() {
 
     let (_, data) = storage.get("key").await.unwrap().expect("should exist");
     assert_eq!(data, b"second");
+}
+
+#[tokio::test]
+async fn sled_storage_roundtrip() {
+    check_roundtrip(SledStorage::builder().build().unwrap()).await;
+}
+
+#[tokio::test]
+async fn sled_storage_get_missing_key() {
+    check_get_missing_key(SledStorage::builder().build().unwrap()).await;
+}
+
+#[tokio::test]
+async fn sled_storage_delete() {
+    check_delete(SledStorage::builder().build().unwrap()).await;
+}
+
+#[tokio::test]
+async fn sled_storage_clear() {
+    check_clear(SledStorage::builder().build().unwrap()).await;
+}
+
+#[tokio::test]
+async fn sled_storage_overwrite() {
+    check_overwrite(SledStorage::builder().build().unwrap()).await;
+}
+
+#[tokio::test]
+async fn memory_storage_roundtrip() {
+    check_roundtrip(MemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn memory_storage_get_missing_key() {
+    check_get_missing_key(MemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn memory_storage_delete() {
+    check_delete(MemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn memory_storage_clear() {
+    check_clear(MemoryStorage::new()).await;
+}
+
+#[tokio::test]
+async fn memory_storage_overwrite() {
+    check_overwrite(MemoryStorage::new()).await;
 }
