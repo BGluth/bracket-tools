@@ -1,13 +1,11 @@
 use bracket_tools_startgg_schema::{
     get_games_for_set::{self, GetGamesOfSet},
     get_player_for_player_id::GetPlayerForPlayerId,
-    get_tournament_for_id::GetTournamentForId,
+    get_tournament_for_id::{self, GetTournamentForId},
 };
 use thiserror::Error;
 
-use crate::gg_data_types::{
-    GgCharacterSelection, HydratedGgGame, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData, StartGgId,
-};
+use crate::gg_data_types::{GgCharacterSelection, HydratedGgGame, HydratedGgPlayer, HydratedGgSet, Matchup, SlotData, StartGgId};
 
 #[derive(Debug, Error)]
 pub enum GgConversionError {
@@ -33,10 +31,12 @@ impl<T> Required<T> for Option<T> {
     }
 }
 
-/// Wraps a tournament query response with the known tournament ID (from query variables).
-pub struct TournamentQueryResult {
-    pub id: StartGgId,
-    pub response: GetTournamentForId,
+/// One page of a paginated connection: the items it yielded plus the total page
+/// count reported by the connection's `pageInfo` (used to drive the fetch loop).
+#[derive(Debug)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub total_pages: i32,
 }
 
 /// Wraps a player query response with the known player ID (from query variables).
@@ -51,31 +51,46 @@ pub struct SetQueryResult {
     pub response: GetGamesOfSet,
 }
 
-impl TryFrom<TournamentQueryResult> for HydratedGgTournament {
-    type Error = GgConversionError;
+fn tournament_ref(response: &GetTournamentForId) -> Result<&get_tournament_for_id::Tournament, GgConversionError> {
+    response.tournament.as_ref().required("GetTournamentForId", "tournament")
+}
 
-    fn try_from(result: TournamentQueryResult) -> Result<Self, Self::Error> {
-        let tournament = result.response.tournament.required("GetTournamentForId", "tournament")?;
-
-        let name = tournament.name.required("Tournament", "name")?;
-
-        let participant_ids = tournament
-            .participants
-            .and_then(|pc| pc.nodes)
-            .unwrap_or_default()
-            .into_iter()
-            .flatten()
-            .filter_map(|p| p.player)
-            .filter_map(|p| p.id)
-            .filter_map(|id| parse_gg_id(&id).ok())
-            .collect();
-
-        Ok(HydratedGgTournament {
-            id: result.id,
-            name,
-            participant_ids,
+/// Pulls the participant player IDs out of a single page of a tournament's
+/// `participants` connection, skipping any nodes with missing or unparseable IDs.
+fn participant_ids_from_connection(participants: Option<&get_tournament_for_id::ParticipantConnection>) -> Vec<StartGgId> {
+    participants
+        .and_then(|pc| pc.nodes.as_ref())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .flatten()
+                .filter_map(|p| p.player.as_ref())
+                .filter_map(|p| p.id.as_ref())
+                .filter_map(|id| parse_gg_id(id).ok())
+                .collect()
         })
-    }
+        .unwrap_or_default()
+}
+
+/// Extracts one page of participant IDs plus the connection's total page count
+/// (defaulting to 1 when `pageInfo` is absent). Suitable as the `extract_page`
+/// argument to [`GGProvider::fetch_all_pages`](crate::provider).
+pub fn extract_tournament_participants_page(response: &GetTournamentForId) -> Result<Page<StartGgId>, GgConversionError> {
+    let participants = tournament_ref(response)?.participants.as_ref();
+    let total_pages = participants
+        .and_then(|pc| pc.page_info.as_ref())
+        .and_then(|pi| pi.total_pages)
+        .unwrap_or(1);
+
+    Ok(Page {
+        items: participant_ids_from_connection(participants),
+        total_pages,
+    })
+}
+
+/// Reads the tournament name, present on every page's response.
+pub fn tournament_name(response: &GetTournamentForId) -> Result<String, GgConversionError> {
+    tournament_ref(response)?.name.clone().required("Tournament", "name")
 }
 
 impl TryFrom<PlayerQueryResult> for HydratedGgPlayer {
@@ -173,78 +188,103 @@ mod tests {
     use bracket_tools_startgg_schema::{get_games_for_set as gfs, get_player_for_player_id as gp, get_tournament_for_id as gt};
 
     use super::{
-        GgConversionError, HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, PlayerQueryResult, SetQueryResult,
-        TournamentQueryResult,
+        extract_tournament_participants_page, tournament_name, GgConversionError, HydratedGgPlayer, HydratedGgSet, Matchup,
+        PlayerQueryResult, SetQueryResult,
     };
 
+    fn participant(id: &str) -> Option<gt::Participant> {
+        Some(gt::Participant {
+            player: Some(gt::Player {
+                id: Some(cynic::Id::new(id)),
+            }),
+        })
+    }
+
     #[test]
-    fn tournament_conversion() {
+    fn tournament_page_extraction() {
         let response = gt::GetTournamentForId {
             tournament: Some(gt::Tournament {
                 name: Some("Genesis 9".to_string()),
                 participants: Some(gt::ParticipantConnection {
-                    nodes: Some(vec![
-                        Some(gt::Participant {
-                            player: Some(gt::Player {
-                                id: Some(cynic::Id::new("42")),
-                            }),
-                        }),
-                        Some(gt::Participant {
-                            player: Some(gt::Player {
-                                id: Some(cynic::Id::new("43")),
-                            }),
-                        }),
-                    ]),
+                    page_info: Some(gt::PageInfo { total_pages: Some(3) }),
+                    nodes: Some(vec![participant("42"), participant("43")]),
                 }),
             }),
         };
 
-        let result = HydratedGgTournament::try_from(TournamentQueryResult { id: 100, response }).unwrap();
+        assert_eq!(tournament_name(&response).unwrap(), "Genesis 9");
 
-        assert_eq!(result.id, 100);
-        assert_eq!(result.name, "Genesis 9");
-        assert_eq!(result.participant_ids, vec![42, 43]);
+        let page = extract_tournament_participants_page(&response).unwrap();
+        assert_eq!(page.items, vec![42, 43]);
+        assert_eq!(page.total_pages, 3);
     }
 
     #[test]
-    fn tournament_conversion_missing_tournament() {
-        let response = gt::GetTournamentForId { tournament: None };
-        let err = HydratedGgTournament::try_from(TournamentQueryResult { id: 100, response }).unwrap_err();
-
-        assert!(matches!(
-            err,
-            GgConversionError::MissingField {
-                entity: "GetTournamentForId",
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn tournament_conversion_skips_invalid_ids() {
+    fn tournament_total_pages_defaults_to_one_without_page_info() {
         let response = gt::GetTournamentForId {
             tournament: Some(gt::Tournament {
                 name: Some("Test".to_string()),
                 participants: Some(gt::ParticipantConnection {
-                    nodes: Some(vec![
-                        Some(gt::Participant {
-                            player: Some(gt::Player {
-                                id: Some(cynic::Id::new("not-a-number")),
-                            }),
-                        }),
-                        Some(gt::Participant {
-                            player: Some(gt::Player {
-                                id: Some(cynic::Id::new("42")),
-                            }),
-                        }),
-                    ]),
+                    page_info: None,
+                    nodes: Some(vec![]),
                 }),
             }),
         };
 
-        let result = HydratedGgTournament::try_from(TournamentQueryResult { id: 1, response }).unwrap();
+        let page = extract_tournament_participants_page(&response).unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.total_pages, 1);
+    }
 
-        assert_eq!(result.participant_ids, vec![42]);
+    #[test]
+    fn tournament_page_skips_invalid_ids() {
+        let response = gt::GetTournamentForId {
+            tournament: Some(gt::Tournament {
+                name: Some("Test".to_string()),
+                participants: Some(gt::ParticipantConnection {
+                    page_info: None,
+                    nodes: Some(vec![participant("not-a-number"), participant("42")]),
+                }),
+            }),
+        };
+
+        assert_eq!(extract_tournament_participants_page(&response).unwrap().items, vec![42]);
+    }
+
+    #[test]
+    fn tournament_extraction_missing_tournament() {
+        let response = gt::GetTournamentForId { tournament: None };
+
+        for err in [
+            extract_tournament_participants_page(&response).unwrap_err(),
+            tournament_name(&response).unwrap_err(),
+        ] {
+            assert!(matches!(
+                err,
+                GgConversionError::MissingField {
+                    entity: "GetTournamentForId",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn tournament_name_missing() {
+        let response = gt::GetTournamentForId {
+            tournament: Some(gt::Tournament {
+                name: None,
+                participants: None,
+            }),
+        };
+
+        assert!(matches!(
+            tournament_name(&response).unwrap_err(),
+            GgConversionError::MissingField {
+                entity: "Tournament",
+                field: "name",
+            }
+        ));
     }
 
     #[test]

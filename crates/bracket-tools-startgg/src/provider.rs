@@ -15,7 +15,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
 use crate::{
-    conversions::{GgConversionError, PlayerQueryResult, SetQueryResult, TournamentQueryResult},
+    conversions::{extract_tournament_participants_page, tournament_name, GgConversionError, Page, PlayerQueryResult, SetQueryResult},
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
     types::GGRestToken,
 };
@@ -97,6 +97,35 @@ impl<S: Storage> GGProvider<S> {
         response.data.ok_or(GGProviderError::EmptyResponse)
     }
 
+    /// Fetches every page of a paginated query, accumulating items in page order.
+    ///
+    /// `build_page` builds the cynic operation for a 1-based page number;
+    /// `extract_page` pulls that page's items and total page count from the
+    /// response. Returns the accumulated items plus the first page's raw
+    /// response, so callers can read any page-1 scalar fields (e.g. a
+    /// tournament's name) without issuing a second request.
+    async fn fetch_all_pages<T, ResponseData, Vars, B, E>(
+        &self,
+        build_page: B,
+        extract_page: E,
+    ) -> Result<(Vec<T>, ResponseData), GGProviderError>
+    where
+        Vars: Serialize,
+        ResponseData: DeserializeOwned + 'static,
+        B: Fn(i32) -> Operation<ResponseData, Vars>,
+        E: Fn(&ResponseData) -> Result<Page<T>, GgConversionError>,
+    {
+        let first = self.run_query(build_page(1)).await?;
+        let Page { mut items, total_pages } = extract_page(&first)?;
+
+        for page_num in 2..=total_pages {
+            let response = self.run_query(build_page(page_num)).await?;
+            items.extend(extract_page(&response)?.items);
+        }
+
+        Ok((items, first))
+    }
+
     /// Checks the cache for a stored value, falling back to `fetch` on miss.
     /// On a successful fetch, the result is serialized and stored before returning.
     async fn cached_fetch<T, F, Fut>(&self, entity: &str, id: StartGgId, fetch: F) -> Result<T, GGProviderError>
@@ -146,14 +175,24 @@ impl<S: Storage> GGProvider<S> {
 
     async fn fetch_tournament(&self, id: StartGgId) -> Result<HydratedGgTournament, GGProviderError> {
         let gg_id = gg_id(id);
-        let operation = GetTournamentForId::build(GetTournamentForIdVariables {
-            t_id: &gg_id,
-            num_per_page: self.page_size,
-            page_num: 1,
-        });
-        let data = self.run_query(operation).await?;
+        let page_size = self.page_size;
 
-        HydratedGgTournament::try_from(TournamentQueryResult { id, response: data }).map_err(GGProviderError::from)
+        let (participant_ids, first_page) = self
+            .fetch_all_pages(
+                |page_num| {
+                    GetTournamentForId::build(GetTournamentForIdVariables {
+                        t_id: &gg_id,
+                        num_per_page: page_size,
+                        page_num,
+                    })
+                },
+                extract_tournament_participants_page,
+            )
+            .await?;
+
+        let name = tournament_name(&first_page)?;
+
+        Ok(HydratedGgTournament { id, name, participant_ids })
     }
 
     async fn fetch_player(&self, id: StartGgId) -> Result<HydratedGgPlayer, GGProviderError> {

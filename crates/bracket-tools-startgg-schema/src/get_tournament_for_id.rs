@@ -24,7 +24,13 @@ pub struct Tournament {
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct ParticipantConnection {
+    pub page_info: Option<PageInfo>,
     pub nodes: Option<Vec<Option<Participant>>>,
+}
+
+#[derive(cynic::QueryFragment, Debug)]
+pub struct PageInfo {
+    pub total_pages: Option<i32>,
 }
 
 #[derive(cynic::QueryFragment, Debug)]

@@ -3,7 +3,7 @@ use bracket_tools_core::{
     types::{GameType, GameWinningSide, PlayerId},
 };
 use bracket_tools_startgg::{
-    conversions::{PlayerQueryResult, SetQueryResult, TournamentQueryResult},
+    conversions::{extract_tournament_participants_page, tournament_name, PlayerQueryResult, SetQueryResult},
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup},
 };
 use bracket_tools_startgg_schema::{
@@ -24,11 +24,13 @@ fn load_set_fixture(json: &str, set_id: u64) -> HydratedGgSet {
 fn load_tournament_fixture(json: &str, tournament_id: u64) -> HydratedGgTournament {
     let response: cynic::GraphQlResponse<GetTournamentForId> = serde_json::from_str(json).expect("fixture should deserialize");
     let data = response.data.expect("fixture should have data");
-    HydratedGgTournament::try_from(TournamentQueryResult {
+    HydratedGgTournament {
         id: tournament_id,
-        response: data,
-    })
-    .expect("conversion should succeed")
+        name: tournament_name(&data).expect("conversion should succeed"),
+        participant_ids: extract_tournament_participants_page(&data)
+            .expect("conversion should succeed")
+            .items,
+    }
 }
 
 fn load_player_fixture(json: &str, player_id: u64) -> HydratedGgPlayer {
