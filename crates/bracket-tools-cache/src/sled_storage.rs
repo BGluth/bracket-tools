@@ -1,6 +1,4 @@
-use std::fmt::Display;
-use std::sync::Mutex;
-use std::time::SystemTime;
+use std::{fmt::Display, sync::Mutex, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 use sled::Db;
@@ -71,18 +69,12 @@ impl Storage for SledStorage {
             return Ok(None);
         };
 
-        let entry: StoredEntry = bincode::deserialize(&bytes)
-            .map_err(|e| StorageError::Deserialization(e.to_string()))?;
+        let entry: StoredEntry = bincode::deserialize(&bytes).map_err(|e| StorageError::Deserialization(e.to_string()))?;
 
         Ok(Some((entry.timestamp, entry.data)))
     }
 
-    async fn put(
-        &self,
-        key: &str,
-        timestamp: SystemTime,
-        value: &[u8],
-    ) -> Result<(), StorageError> {
+    async fn put(&self, key: &str, timestamp: SystemTime, value: &[u8]) -> Result<(), StorageError> {
         let entry = StoredEntry {
             timestamp,
             data: value.to_vec(),
