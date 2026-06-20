@@ -1,3 +1,5 @@
+use std::fmt::Debug;
+
 use bracket_tools_core::{
     data_types::Normalizable,
     types::{GameType, GameWinningSide, PlayerId},
@@ -260,7 +262,7 @@ fn player_craiglerok() {
 /// Verifies a type survives bincode serialize → deserialize without data loss.
 fn assert_bincode_roundtrip<T>(value: &T)
 where
-    T: Serialize + DeserializeOwned + std::fmt::Debug + PartialEq,
+    T: Serialize + DeserializeOwned + Debug + PartialEq,
 {
     let bytes = bincode::serialize(value).expect("serialize should succeed");
     let recovered: T = bincode::deserialize(&bytes).expect("deserialize should succeed");

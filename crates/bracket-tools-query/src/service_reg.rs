@@ -1,4 +1,4 @@
-use futures::{Future, Stream};
+use futures::{future, Future, Stream};
 
 use bracket_tools_core::types::TournamentId;
 
@@ -28,6 +28,6 @@ trait NormalizedCoreQuery {
     #[allow(unused_variables)]
     // TODO: Probably don't want to be using `Normalized` here...
     fn get_tournament<I>(&self, id: I) -> impl Future<Output = TournamentId> {
-        futures::future::pending()
+        future::pending()
     }
 }

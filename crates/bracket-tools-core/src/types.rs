@@ -94,9 +94,11 @@ pub struct Player {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
+
     use super::*;
 
-    fn round_trip<T: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug>(val: &T) {
+    fn round_trip<T: Serialize + for<'de> Deserialize<'de> + Debug>(val: &T) {
         let json = serde_json::to_string(val).expect("serialize");
         let _: T = serde_json::from_str(&json).expect("deserialize");
     }

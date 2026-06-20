@@ -9,8 +9,15 @@ use bracket_tools_startgg_schema::{
     get_player_for_player_id::{GetPlayerForPlayerId, GetPlayerForPlayerIdVariables},
     get_tournament_for_id::{GetTournamentForId, GetTournamentForIdVariables},
 };
-use cynic::{http::ReqwestExt, GraphQlResponse, Operation, QueryBuilder};
+use cynic::{
+    http::{CynicReqwestError, ReqwestExt},
+    GraphQlError, GraphQlResponse, Operation, QueryBuilder,
+};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use reqwest::{
+    header::{HeaderMap, HeaderValue, AUTHORIZATION},
+    Client,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
@@ -31,10 +38,10 @@ fn gg_id(id: StartGgId) -> cynic::Id {
 #[derive(Debug, Error)]
 pub enum GGProviderError {
     #[error("HTTP error: {0}")]
-    Http(#[from] cynic::http::CynicReqwestError),
+    Http(#[from] CynicReqwestError),
 
     #[error("GraphQL errors: {}", format_graphql_errors(.0))]
-    GraphQl(Vec<cynic::GraphQlError>),
+    GraphQl(Vec<GraphQlError>),
 
     #[error("conversion error: {0}")]
     Conversion(#[from] GgConversionError),
@@ -49,7 +56,7 @@ pub enum GGProviderError {
     CacheDeserialization(String),
 }
 
-fn format_graphql_errors(errors: &[cynic::GraphQlError]) -> String {
+fn format_graphql_errors(errors: &[GraphQlError]) -> String {
     errors.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join("; ")
 }
 
@@ -59,7 +66,7 @@ fn format_graphql_errors(errors: &[cynic::GraphQlError]) -> String {
 /// Use [`NullStorage`] for an uncached provider, or [`SledStorage`](bracket_tools_cache::sled_storage::SledStorage)
 /// for persistent caching.
 pub struct GGProvider<S: Storage> {
-    client: reqwest::Client,
+    client: Client,
     rate_limiter: Arc<DefaultDirectRateLimiter>,
     page_size: i32,
     storage: S,
@@ -81,8 +88,8 @@ impl<S: Storage> GGProvider<S> {
     /// Waits for rate limit clearance, then executes a cynic GraphQL operation.
     async fn run_query<ResponseData, Vars>(&self, operation: Operation<ResponseData, Vars>) -> Result<ResponseData, GGProviderError>
     where
-        Vars: serde::Serialize,
-        ResponseData: serde::de::DeserializeOwned + 'static,
+        Vars: Serialize,
+        ResponseData: DeserializeOwned + 'static,
     {
         self.rate_limiter.until_ready().await;
 
@@ -246,13 +253,13 @@ impl<S: Storage> GGProviderBuilder<S> {
     }
 
     pub fn build(self) -> Result<GGProvider<S>, reqwest::Error> {
-        let mut headers = reqwest::header::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         headers.insert(
-            reqwest::header::AUTHORIZATION,
-            reqwest::header::HeaderValue::from_str(&self.token.as_bearer_value()).expect("bearer token should be valid ASCII"),
+            AUTHORIZATION,
+            HeaderValue::from_str(&self.token.as_bearer_value()).expect("bearer token should be valid ASCII"),
         );
 
-        let client = reqwest::Client::builder().default_headers(headers).build()?;
+        let client = Client::builder().default_headers(headers).build()?;
 
         let quota =
             Quota::per_minute(NonZeroU32::new(self.requests_per_minute).unwrap_or(NonZeroU32::new(DEFAULT_REQUESTS_PER_MINUTE).unwrap()));

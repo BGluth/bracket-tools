@@ -1,7 +1,11 @@
-use std::{fmt::Display, sync::Mutex, time::SystemTime};
+use std::{
+    fmt::Display,
+    sync::{Mutex, MutexGuard},
+    time::SystemTime,
+};
 
 use serde::{Deserialize, Serialize};
-use sled::Db;
+use sled::{Config, Db};
 
 use crate::storage::{Storage, StorageError};
 
@@ -43,8 +47,8 @@ impl SledStorageBuilder {
 
     pub fn build(self) -> Result<SledStorage, StorageError> {
         let config = match self.path {
-            Some(path) => sled::Config::new().path(path),
-            None => sled::Config::tmp().map_err(to_io_err)?,
+            Some(path) => Config::new().path(path),
+            None => Config::tmp().map_err(to_io_err)?,
         };
 
         let db = config.open().map_err(to_io_err)?;
@@ -57,7 +61,7 @@ fn to_io_err(e: impl Display) -> StorageError {
     StorageError::Io(e.to_string())
 }
 
-fn lock_db(db: &Mutex<Db>) -> Result<std::sync::MutexGuard<'_, Db>, StorageError> {
+fn lock_db(db: &Mutex<Db>) -> Result<MutexGuard<'_, Db>, StorageError> {
     db.lock().map_err(|e| StorageError::Io(e.to_string()))
 }
 
