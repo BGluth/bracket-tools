@@ -1,6 +1,6 @@
 use crate::{
     enums::{ActivityState, BracketType},
-    scalars::Timestamp,
+    scalars::{Id, Timestamp},
     schema::schema,
 };
 
@@ -18,7 +18,7 @@ pub struct GetEventStructure {
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct Event {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
     pub name: Option<String>,
     pub state: Option<ActivityState>,
     pub start_at: Option<Timestamp>,
@@ -30,19 +30,19 @@ pub struct Event {
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct Tournament {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
     pub slug: Option<String>,
 }
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct Phase {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
     pub state: Option<ActivityState>,
 }
 
 #[derive(cynic::QueryFragment, Debug)]
 pub struct PhaseGroup {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
     pub bracket_type: Option<BracketType>,
     pub num_rounds: Option<i32>,
     pub start_at: Option<Timestamp>,

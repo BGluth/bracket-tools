@@ -1,4 +1,7 @@
-use crate::{scalars::Timestamp, schema::schema};
+use crate::{
+    scalars::{Id, Timestamp},
+    schema::schema,
+};
 
 #[derive(cynic::QueryVariables, Debug)]
 pub struct MarkSetCalledVariables<'a> {
@@ -16,7 +19,7 @@ pub struct MarkSetCalled {
 /// values observed here are recorded evidence for the scheduler's state map.
 #[derive(cynic::QueryFragment, Debug)]
 pub struct Set {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
     pub state: Option<i32>,
     pub started_at: Option<Timestamp>,
     pub completed_at: Option<Timestamp>,

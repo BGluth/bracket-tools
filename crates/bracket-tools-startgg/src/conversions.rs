@@ -137,7 +137,7 @@ macro_rules! impl_set_mutation_result_from {
         impl From<$set_ty> for SetMutationResult {
             fn from(set: $set_ty) -> Self {
                 Self {
-                    id: set.id.as_ref().and_then(|id| parse_gg_id(id).ok()),
+                    id: set.id.as_ref().and_then(|id| id.inner().parse::<u64>().ok()),
                     state: set.state,
                     started_at: set.started_at,
                     completed_at: set.completed_at,
@@ -256,8 +256,10 @@ fn slot_score(standing: &get_games_for_set::Standing) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use bracket_tools_startgg_schema::{
-        enums::ActivityState, get_event_structure as ges, get_games_for_set as gfs, get_player_for_player_id as gp,
-        get_sets_for_event as gse, get_tournament_for_id as gt, mark_set_called as msc, mark_set_in_progress as msip, scalars::Timestamp,
+        enums::ActivityState,
+        get_event_structure as ges, get_games_for_set as gfs, get_player_for_player_id as gp, get_sets_for_event as gse,
+        get_tournament_for_id as gt, mark_set_called as msc, mark_set_in_progress as msip,
+        scalars::{Id, Timestamp},
     };
 
     use super::{
@@ -455,7 +457,7 @@ mod tests {
 
     fn event_set(id: &str) -> Option<gse::Set> {
         Some(gse::Set {
-            id: Some(cynic::Id::new(id)),
+            id: Some(Id::new(id)),
             state: Some(1),
             round: Some(1),
             identifier: Some("A".to_string()),
@@ -513,7 +515,7 @@ mod tests {
     fn event_structure_extraction() {
         let response = ges::GetEventStructure {
             event: Some(ges::Event {
-                id: Some(cynic::Id::new("100")),
+                id: Some(Id::new("100")),
                 name: Some("Ultimate Singles".to_string()),
                 state: Some(ActivityState::Active),
                 start_at: Some(Timestamp(1751234567)),
@@ -546,7 +548,7 @@ mod tests {
     fn mark_set_called_extraction() {
         let response = msc::MarkSetCalled {
             mark_set_called: Some(msc::Set {
-                id: Some(cynic::Id::new("777")),
+                id: Some(Id::new("777")),
                 state: Some(6),
                 started_at: Some(Timestamp(1751234567)),
                 completed_at: None,
@@ -569,7 +571,7 @@ mod tests {
     fn mark_set_in_progress_extraction() {
         let response = msip::MarkSetInProgress {
             mark_set_in_progress: Some(msip::Set {
-                id: Some(cynic::Id::new("888")),
+                id: Some(Id::new("888")),
                 state: Some(2),
                 started_at: None,
                 completed_at: None,
@@ -597,7 +599,7 @@ mod tests {
     #[test]
     fn set_mutation_result_keeps_non_numeric_id_as_none() {
         let set = msc::Set {
-            id: Some(cynic::Id::new("preview_123_45")),
+            id: Some(Id::new("preview_123_45")),
             state: None,
             started_at: None,
             completed_at: None,

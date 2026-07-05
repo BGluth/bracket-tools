@@ -256,6 +256,7 @@ dependencies = [
  "anyhow",
  "cynic",
  "cynic-codegen",
+ "serde",
  "serde_json",
 ]
 

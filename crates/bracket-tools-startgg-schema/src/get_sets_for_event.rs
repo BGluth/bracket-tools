@@ -1,4 +1,7 @@
-use crate::{scalars::Timestamp, schema::schema};
+use crate::{
+    scalars::{Id, Timestamp},
+    schema::schema,
+};
 
 #[derive(cynic::QueryVariables, Debug)]
 pub struct GetSetsForEventVariables<'a> {
@@ -36,7 +39,7 @@ pub struct PageInfo {
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct Set {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
     pub state: Option<i32>,
     pub round: Option<i32>,
     pub identifier: Option<String>,
@@ -51,7 +54,7 @@ pub struct Set {
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct PhaseGroup {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
 }
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
@@ -65,7 +68,7 @@ pub struct SetSlot {
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct Entrant {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
     pub name: Option<String>,
     pub is_disqualified: Option<bool>,
     pub participants: Option<Vec<Option<Participant>>>,
@@ -79,7 +82,7 @@ pub struct Participant {
 
 #[derive(cynic::QueryFragment, Debug, Clone)]
 pub struct Player {
-    pub id: Option<cynic::Id>,
+    pub id: Option<Id>,
 }
 
 #[cfg(test)]
