@@ -1,0 +1,40 @@
+query get_sets_for_event($slug: String!, $page: Int!, $per_page: Int!) {
+    event(slug: $slug) {
+        sets(page: $page, perPage: $per_page, sortType: ROUND, filters: { hideEmpty: false }) {
+            pageInfo {
+                totalPages
+            }
+            nodes {
+                id
+                state
+                round
+                identifier
+                fullRoundText
+                startedAt
+                completedAt
+                winnerId
+                hasPlaceholder
+                phaseGroup {
+                    id
+                }
+                slots {
+                    slotIndex
+                    prereqId
+                    prereqType
+                    prereqPlacement
+                    entrant {
+                        id
+                        name
+                        isDisqualified
+                        participants {
+                            gamerTag
+                            player {
+                                id
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
