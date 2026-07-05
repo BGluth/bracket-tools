@@ -1,3 +1,4 @@
+pub mod scalars;
 pub mod schema;
 
 pub mod get_games_for_set;

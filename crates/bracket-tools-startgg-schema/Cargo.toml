@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 cynic = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [build-dependencies]
 anyhow = { workspace = true }
 cynic-codegen = "3.8"
