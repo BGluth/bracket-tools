@@ -6,6 +6,8 @@ pub mod provider;
 pub mod session;
 pub mod types;
 
+pub use conversions::SetMutationResult;
+pub use gg_data_types::StartGgId;
 pub use lazy::{LazyPlayer, LazySet, LazyTournament};
-pub use provider::{GGProvider, GGProviderError};
+pub use provider::{GGProvider, GGProviderError, STARTGG_API_URL};
 pub use session::GgSession;

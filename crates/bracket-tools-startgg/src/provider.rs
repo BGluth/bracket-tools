@@ -10,13 +10,17 @@ use bracket_tools_cache::{
     storage::{Storage, StorageError},
 };
 use bracket_tools_startgg_schema::{
+    get_event_structure::{self, GetEventStructure, GetEventStructureVariables},
     get_games_for_set::{GetGamesOfSet, GetGamesOfSetVariables},
     get_player_for_player_id::{GetPlayerForPlayerId, GetPlayerForPlayerIdVariables},
+    get_sets_for_event::{self, GetSetsForEvent, GetSetsForEventVariables},
     get_tournament_for_id::{GetTournamentForId, GetTournamentForIdVariables},
+    mark_set_called::{MarkSetCalled, MarkSetCalledVariables},
+    mark_set_in_progress::{MarkSetInProgress, MarkSetInProgressVariables},
 };
 use cynic::{
     http::{CynicReqwestError, ReqwestExt},
-    GraphQlError, GraphQlResponse, Operation, QueryBuilder,
+    GraphQlError, GraphQlResponse, MutationBuilder, Operation, QueryBuilder,
 };
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use reqwest::{
@@ -27,12 +31,18 @@ use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
 
 use crate::{
-    conversions::{extract_tournament_participants_page, tournament_name, GgConversionError, Page, PlayerQueryResult, SetQueryResult},
+    conversions::{
+        extract_event_sets_page, extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress,
+        extract_tournament_participants_page, tournament_name, GgConversionError, Page, PlayerQueryResult, SetMutationResult,
+        SetQueryResult,
+    },
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
     types::GGRestToken,
 };
 
-const STARTGG_API_URL: &str = "https://api.start.gg/gql/alpha";
+/// The start.gg GraphQL endpoint. Public so tools capturing raw responses can
+/// hit the same URL the provider does.
+pub const STARTGG_API_URL: &str = "https://api.start.gg/gql/alpha";
 const DEFAULT_REQUESTS_PER_MINUTE: u32 = 80;
 const DEFAULT_PAGE_SIZE: i32 = 25;
 
@@ -313,6 +323,74 @@ impl<S: Storage> GGProvider<S> {
         let data = self.run_query(operation).await?;
 
         HydratedGgSet::try_from(SetQueryResult { id, response: data }).map_err(GGProviderError::from)
+    }
+
+    /// Fetches every set in an event (all pages), including not-yet-filled
+    /// future sets (`hideEmpty: false`), sorted by round.
+    ///
+    /// Bypasses the cache entirely: pollers want a full fresh snapshot each
+    /// time, and stale set data must never be served back.
+    pub async fn fetch_event_sets(&self, slug: &str) -> Result<Vec<get_sets_for_event::Set>, GGProviderError> {
+        let (sets, _first_page) = self
+            .fetch_all_pages(
+                |page| {
+                    GetSetsForEvent::build(GetSetsForEventVariables {
+                        slug,
+                        page,
+                        per_page: self.page_size,
+                    })
+                },
+                extract_event_sets_page,
+            )
+            .await?;
+
+        Ok(sets)
+    }
+
+    /// Fetches an event's structural skeleton: phases, phase groups (bracket
+    /// type, rounds, wave) and entrant count. Bypasses the cache entirely.
+    pub async fn fetch_event_structure(&self, slug: &str) -> Result<get_event_structure::Event, GGProviderError> {
+        let data = self.run_query(GetEventStructure::build(GetEventStructureVariables { slug })).await?;
+
+        Ok(extract_event_structure(data)?)
+    }
+
+    /// Marks a set as called (players summoned to their station).
+    pub async fn mark_set_called(&self, id: StartGgId) -> Result<SetMutationResult, GGProviderError> {
+        let gg_id = gg_id(id);
+        let operation = MarkSetCalled::build(MarkSetCalledVariables { set_id: &gg_id });
+
+        self.run_set_mutation(id, operation, extract_mark_set_called).await
+    }
+
+    /// Marks a set as in progress.
+    pub async fn mark_set_in_progress(&self, id: StartGgId) -> Result<SetMutationResult, GGProviderError> {
+        let gg_id = gg_id(id);
+        let operation = MarkSetInProgress::build(MarkSetInProgressVariables { set_id: &gg_id });
+
+        self.run_set_mutation(id, operation, extract_mark_set_in_progress).await
+    }
+
+    /// Runs a set-mutating operation, then deletes the set's cache entry.
+    ///
+    /// The mutation's 4-field payload can't rebuild a cached `HydratedGgSet`,
+    /// so delete-invalidation is what restores read-your-writes for cached
+    /// providers (a no-op under `NullStorage`).
+    async fn run_set_mutation<ResponseData, Vars>(
+        &self,
+        id: StartGgId,
+        operation: Operation<ResponseData, Vars>,
+        extract: impl FnOnce(ResponseData) -> Result<SetMutationResult, GgConversionError>,
+    ) -> Result<SetMutationResult, GGProviderError>
+    where
+        Vars: Serialize,
+        ResponseData: DeserializeOwned + 'static,
+    {
+        let data = self.run_query(operation).await?;
+
+        self.storage.delete(&cache_key(CacheEntity::Set.key_prefix(), id)).await?;
+
+        Ok(extract(data)?)
     }
 }
 

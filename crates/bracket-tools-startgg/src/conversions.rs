@@ -1,7 +1,12 @@
 use bracket_tools_startgg_schema::{
+    get_event_structure::{self, GetEventStructure},
     get_games_for_set::{self, GetGamesOfSet},
     get_player_for_player_id::GetPlayerForPlayerId,
+    get_sets_for_event::{self, GetSetsForEvent},
     get_tournament_for_id::{self, GetTournamentForId},
+    mark_set_called::MarkSetCalled,
+    mark_set_in_progress::MarkSetInProgress,
+    scalars::Timestamp,
 };
 use thiserror::Error;
 
@@ -91,6 +96,68 @@ pub fn extract_tournament_participants_page(response: &GetTournamentForId) -> Re
 /// Reads the tournament name, present on every page's response.
 pub fn tournament_name(response: &GetTournamentForId) -> Result<String, GgConversionError> {
     tournament_ref(response)?.name.clone().required("Tournament", "name")
+}
+
+/// Extracts one page of an event's sets plus the connection's total page count
+/// (defaulting to 1 when `pageInfo` is absent). Suitable as the `extract_page`
+/// argument to [`GGProvider::fetch_all_pages`](crate::provider).
+pub fn extract_event_sets_page(response: &GetSetsForEvent) -> Result<Page<get_sets_for_event::Set>, GgConversionError> {
+    let sets = response.event.as_ref().required("GetSetsForEvent", "event")?.sets.as_ref();
+
+    let total_pages = sets.and_then(|sc| sc.page_info.as_ref()).and_then(|pi| pi.total_pages).unwrap_or(1);
+    let items = sets
+        .and_then(|sc| sc.nodes.as_ref())
+        .map(|nodes| nodes.iter().flatten().cloned().collect())
+        .unwrap_or_default();
+
+    Ok(Page { items, total_pages })
+}
+
+/// Unwraps the event from a structure query response.
+pub fn extract_event_structure(response: GetEventStructure) -> Result<get_event_structure::Event, GgConversionError> {
+    response.event.required("GetEventStructure", "event")
+}
+
+/// The set fields returned by the `markSet*` mutations.
+///
+/// `state` is start.gg's undocumented Int; values observed here are evidence
+/// for the scheduler's state map. A non-numeric set ID (e.g. `preview_*`)
+/// yields `id: None` rather than an error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetMutationResult {
+    pub id: Option<StartGgId>,
+    pub state: Option<i32>,
+    pub started_at: Option<Timestamp>,
+    pub completed_at: Option<Timestamp>,
+}
+
+/// The two mutation payloads are module-local twins; one conversion serves both.
+macro_rules! impl_set_mutation_result_from {
+    ($set_ty:ty) => {
+        impl From<$set_ty> for SetMutationResult {
+            fn from(set: $set_ty) -> Self {
+                Self {
+                    id: set.id.as_ref().and_then(|id| parse_gg_id(id).ok()),
+                    state: set.state,
+                    started_at: set.started_at,
+                    completed_at: set.completed_at,
+                }
+            }
+        }
+    };
+}
+
+impl_set_mutation_result_from!(bracket_tools_startgg_schema::mark_set_called::Set);
+impl_set_mutation_result_from!(bracket_tools_startgg_schema::mark_set_in_progress::Set);
+
+/// Unwraps a `markSetCalled` mutation response.
+pub fn extract_mark_set_called(response: MarkSetCalled) -> Result<SetMutationResult, GgConversionError> {
+    response.mark_set_called.required("MarkSetCalled", "markSetCalled").map(Into::into)
+}
+
+/// Unwraps a `markSetInProgress` mutation response.
+pub fn extract_mark_set_in_progress(response: MarkSetInProgress) -> Result<SetMutationResult, GgConversionError> {
+    response.mark_set_in_progress.required("MarkSetInProgress", "markSetInProgress").map(Into::into)
 }
 
 impl TryFrom<PlayerQueryResult> for HydratedGgPlayer {
@@ -185,11 +252,16 @@ fn slot_score(standing: &get_games_for_set::Standing) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use bracket_tools_startgg_schema::{get_games_for_set as gfs, get_player_for_player_id as gp, get_tournament_for_id as gt};
+    use bracket_tools_startgg_schema::{
+        enums::ActivityState, get_event_structure as ges, get_games_for_set as gfs, get_player_for_player_id as gp,
+        get_sets_for_event as gse, get_tournament_for_id as gt, mark_set_called as msc, mark_set_in_progress as msip,
+        scalars::Timestamp,
+    };
 
     use super::{
+        extract_event_sets_page, extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress,
         extract_tournament_participants_page, tournament_name, GgConversionError, HydratedGgPlayer, HydratedGgSet, Matchup,
-        PlayerQueryResult, SetQueryResult,
+        PlayerQueryResult, SetMutationResult, SetQueryResult,
     };
 
     fn participant(id: &str) -> Option<gt::Participant> {
@@ -377,6 +449,159 @@ mod tests {
 
         assert!(result.games.is_empty());
         assert!(result.matchup.is_none());
+    }
+
+    fn event_set(id: &str) -> Option<gse::Set> {
+        Some(gse::Set {
+            id: Some(cynic::Id::new(id)),
+            state: Some(1),
+            round: Some(1),
+            identifier: Some("A".to_string()),
+            full_round_text: Some("Winners Round 1".to_string()),
+            started_at: None,
+            completed_at: None,
+            winner_id: None,
+            has_placeholder: Some(false),
+            phase_group: None,
+            slots: None,
+        })
+    }
+
+    fn sets_response(page_info: Option<gse::PageInfo>, nodes: Option<Vec<Option<gse::Set>>>) -> gse::GetSetsForEvent {
+        gse::GetSetsForEvent {
+            event: Some(gse::Event {
+                sets: Some(gse::SetConnection { page_info, nodes }),
+            }),
+        }
+    }
+
+    #[test]
+    fn event_sets_page_extraction() {
+        let response = sets_response(
+            Some(gse::PageInfo { total_pages: Some(4) }),
+            Some(vec![event_set("1"), event_set("2")]),
+        );
+
+        let page = extract_event_sets_page(&response).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.total_pages, 4);
+    }
+
+    #[test]
+    fn event_sets_page_defaults_to_one_page_without_page_info() {
+        let page = extract_event_sets_page(&sets_response(None, None)).unwrap();
+        assert!(page.items.is_empty());
+        assert_eq!(page.total_pages, 1);
+    }
+
+    #[test]
+    fn event_sets_page_missing_event() {
+        let response = gse::GetSetsForEvent { event: None };
+
+        assert!(matches!(
+            extract_event_sets_page(&response).unwrap_err(),
+            GgConversionError::MissingField {
+                entity: "GetSetsForEvent",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn event_structure_extraction() {
+        let response = ges::GetEventStructure {
+            event: Some(ges::Event {
+                id: Some(cynic::Id::new("100")),
+                name: Some("Ultimate Singles".to_string()),
+                state: Some(ActivityState::Active),
+                start_at: Some(Timestamp(1751234567)),
+                tournament: None,
+                phases: None,
+                phase_groups: None,
+                num_entrants: Some(32),
+            }),
+        };
+
+        let event = extract_event_structure(response).unwrap();
+        assert_eq!(event.name.as_deref(), Some("Ultimate Singles"));
+        assert_eq!(event.num_entrants, Some(32));
+    }
+
+    #[test]
+    fn event_structure_missing_event() {
+        let response = ges::GetEventStructure { event: None };
+
+        assert!(matches!(
+            extract_event_structure(response).unwrap_err(),
+            GgConversionError::MissingField {
+                entity: "GetEventStructure",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mark_set_called_extraction() {
+        let response = msc::MarkSetCalled {
+            mark_set_called: Some(msc::Set {
+                id: Some(cynic::Id::new("777")),
+                state: Some(6),
+                started_at: Some(Timestamp(1751234567)),
+                completed_at: None,
+            }),
+        };
+
+        let result = extract_mark_set_called(response).unwrap();
+        assert_eq!(
+            result,
+            SetMutationResult {
+                id: Some(777),
+                state: Some(6),
+                started_at: Some(Timestamp(1751234567)),
+                completed_at: None,
+            }
+        );
+    }
+
+    #[test]
+    fn mark_set_in_progress_extraction() {
+        let response = msip::MarkSetInProgress {
+            mark_set_in_progress: Some(msip::Set {
+                id: Some(cynic::Id::new("888")),
+                state: Some(2),
+                started_at: None,
+                completed_at: None,
+            }),
+        };
+
+        let result = extract_mark_set_in_progress(response).unwrap();
+        assert_eq!(result.id, Some(888));
+        assert_eq!(result.state, Some(2));
+    }
+
+    #[test]
+    fn mark_set_called_missing_payload() {
+        let response = msc::MarkSetCalled { mark_set_called: None };
+
+        assert!(matches!(
+            extract_mark_set_called(response).unwrap_err(),
+            GgConversionError::MissingField {
+                entity: "MarkSetCalled",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn set_mutation_result_keeps_non_numeric_id_as_none() {
+        let set = msc::Set {
+            id: Some(cynic::Id::new("preview_123_45")),
+            state: None,
+            started_at: None,
+            completed_at: None,
+        };
+
+        assert_eq!(SetMutationResult::from(set).id, None);
     }
 
     fn make_slot(entrant_id: &str, player_id: &str, score: f64) -> gfs::SetSlot {
