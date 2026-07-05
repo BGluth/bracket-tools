@@ -45,6 +45,9 @@ use crate::{
 pub const STARTGG_API_URL: &str = "https://api.start.gg/gql/alpha";
 const DEFAULT_REQUESTS_PER_MINUTE: u32 = 80;
 const DEFAULT_PAGE_SIZE: i32 = 25;
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_BURST: u32 = 20;
 
 /// The cached entity kinds. Each is its own cache-key namespace and TTL bucket.
 #[derive(Clone, Copy)]
@@ -403,6 +406,9 @@ pub fn cache_key(entity: &str, id: StartGgId) -> String {
 pub struct GGProviderBuilder<S: Storage> {
     token: GGRestToken,
     requests_per_minute: u32,
+    burst: u32,
+    connect_timeout: Duration,
+    request_timeout: Duration,
     page_size: i32,
     ttls: EntityTtls,
     storage: S,
@@ -413,6 +419,9 @@ impl<S: Storage> GGProviderBuilder<S> {
         Self {
             token,
             requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
+            burst: DEFAULT_BURST,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
             page_size: DEFAULT_PAGE_SIZE,
             ttls: EntityTtls::default(),
             storage,
@@ -421,6 +430,27 @@ impl<S: Storage> GGProviderBuilder<S> {
 
     pub fn requests_per_minute(mut self, rpm: u32) -> Self {
         self.requests_per_minute = rpm;
+        self
+    }
+
+    /// Sets how many requests may fire back-to-back before the limiter starts
+    /// spacing them out. Clamped to the per-minute rate. Defaults to 20
+    /// (previously the implicit burst equaled the full per-minute quota).
+    pub fn burst(mut self, burst: u32) -> Self {
+        self.burst = burst;
+        self
+    }
+
+    /// Sets the TCP connect timeout. Defaults to 5s.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Sets the total per-request timeout (connect + transfer). Defaults to
+    /// 15s; without one, a black-holed connection hangs forever.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 
@@ -458,10 +488,15 @@ impl<S: Storage> GGProviderBuilder<S> {
             HeaderValue::from_str(&self.token.as_bearer_value()).expect("bearer token should be valid ASCII"),
         );
 
-        let client = Client::builder().default_headers(headers).build()?;
+        let client = Client::builder()
+            .default_headers(headers)
+            .connect_timeout(self.connect_timeout)
+            .timeout(self.request_timeout)
+            .build()?;
 
-        let quota =
-            Quota::per_minute(NonZeroU32::new(self.requests_per_minute).unwrap_or(NonZeroU32::new(DEFAULT_REQUESTS_PER_MINUTE).unwrap()));
+        let rpm = NonZeroU32::new(self.requests_per_minute).unwrap_or(NonZeroU32::new(DEFAULT_REQUESTS_PER_MINUTE).unwrap());
+        let burst = NonZeroU32::new(self.burst.min(rpm.get())).unwrap_or(NonZeroU32::new(1).unwrap());
+        let quota = Quota::per_minute(rpm).allow_burst(burst);
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
 
         Ok(GGProvider {
@@ -484,7 +519,10 @@ mod tests {
     use bracket_tools_cache::{null_storage::NullStorage, sled_storage::SledStorage, storage::Storage};
     use serde::Serialize;
 
-    use super::{is_stale, CacheEntity, CacheFreshness, EntityTtls, GGProvider, DEFAULT_PAGE_SIZE, DEFAULT_REQUESTS_PER_MINUTE};
+    use super::{
+        is_stale, CacheEntity, CacheFreshness, EntityTtls, GGProvider, DEFAULT_BURST, DEFAULT_CONNECT_TIMEOUT, DEFAULT_PAGE_SIZE,
+        DEFAULT_REQUESTS_PER_MINUTE, DEFAULT_REQUEST_TIMEOUT,
+    };
     use crate::{
         gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData, StartGgId},
         types::GGRestToken,
@@ -533,13 +571,31 @@ mod tests {
         let builder = GGProvider::builder(test_token());
         assert_eq!(builder.requests_per_minute, DEFAULT_REQUESTS_PER_MINUTE);
         assert_eq!(builder.page_size, DEFAULT_PAGE_SIZE);
+        assert_eq!(builder.burst, DEFAULT_BURST);
+        assert_eq!(builder.connect_timeout, DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(builder.request_timeout, DEFAULT_REQUEST_TIMEOUT);
     }
 
     #[test]
     fn builder_custom_config() {
-        let builder = GGProvider::builder(test_token()).requests_per_minute(40).page_size(50);
+        let builder = GGProvider::builder(test_token())
+            .requests_per_minute(40)
+            .page_size(50)
+            .burst(5)
+            .connect_timeout(Duration::from_secs(2))
+            .request_timeout(Duration::from_secs(30));
         assert_eq!(builder.requests_per_minute, 40);
         assert_eq!(builder.page_size, 50);
+        assert_eq!(builder.burst, 5);
+        assert_eq!(builder.connect_timeout, Duration::from_secs(2));
+        assert_eq!(builder.request_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn builder_accepts_burst_above_rpm_and_zero_burst() {
+        // Clamping happens in build(); both extremes must still produce a provider.
+        assert!(GGProvider::builder(test_token()).requests_per_minute(40).burst(500).build().is_ok());
+        assert!(GGProvider::builder(test_token()).burst(0).build().is_ok());
     }
 
     #[test]
