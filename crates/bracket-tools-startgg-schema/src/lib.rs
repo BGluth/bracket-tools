@@ -1,6 +1,8 @@
+pub mod enums;
 pub mod scalars;
 pub mod schema;
 
+pub mod get_event_structure;
 pub mod get_games_for_set;
 pub mod get_num_players_in_tournament;
 pub mod get_number_of_player_sets_after_datetime;

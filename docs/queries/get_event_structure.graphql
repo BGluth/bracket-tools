@@ -1,0 +1,31 @@
+query get_event_structure($slug: String!) {
+    event(slug: $slug) {
+        id
+        name
+        state
+        startAt
+        tournament {
+            id
+            slug
+        }
+        phases {
+            id
+            state
+        }
+        phaseGroups {
+            id
+            bracketType
+            numRounds
+            startAt
+            wave {
+                identifier
+                startAt
+            }
+            rounds {
+                number
+                bestOf
+            }
+        }
+        numEntrants
+    }
+}
