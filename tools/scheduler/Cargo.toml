@@ -1,0 +1,17 @@
+[package]
+name = "bracket-tools-scheduler"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bracket-tools-cache = { path = "../../crates/bracket-tools-cache" }
+bracket-tools-startgg = { path = "../../crates/bracket-tools-startgg" }
+bracket-tools-startgg-schema = { path = "../../crates/bracket-tools-startgg-schema" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+cynic = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["time"] }

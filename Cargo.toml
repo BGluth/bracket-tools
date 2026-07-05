@@ -8,6 +8,7 @@ members = [
     "tools/reporter/reporter-cli",
     "tools/reporter/reporter-state",
     "tools/daemon",
+    "tools/scheduler",
 ]
 resolver = "2"
 
