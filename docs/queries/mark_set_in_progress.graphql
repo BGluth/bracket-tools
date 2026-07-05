@@ -1,0 +1,8 @@
+mutation mark_set_in_progress($set_id: ID!) {
+    markSetInProgress(setId: $set_id) {
+        id
+        state
+        startedAt
+        completedAt
+    }
+}

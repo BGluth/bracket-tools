@@ -1,0 +1,8 @@
+mutation mark_set_called($set_id: ID!) {
+    markSetCalled(setId: $set_id) {
+        id
+        state
+        startedAt
+        completedAt
+    }
+}
