@@ -157,7 +157,10 @@ pub fn extract_mark_set_called(response: MarkSetCalled) -> Result<SetMutationRes
 
 /// Unwraps a `markSetInProgress` mutation response.
 pub fn extract_mark_set_in_progress(response: MarkSetInProgress) -> Result<SetMutationResult, GgConversionError> {
-    response.mark_set_in_progress.required("MarkSetInProgress", "markSetInProgress").map(Into::into)
+    response
+        .mark_set_in_progress
+        .required("MarkSetInProgress", "markSetInProgress")
+        .map(Into::into)
 }
 
 impl TryFrom<PlayerQueryResult> for HydratedGgPlayer {
@@ -254,8 +257,7 @@ fn slot_score(standing: &get_games_for_set::Standing) -> Option<f64> {
 mod tests {
     use bracket_tools_startgg_schema::{
         enums::ActivityState, get_event_structure as ges, get_games_for_set as gfs, get_player_for_player_id as gp,
-        get_sets_for_event as gse, get_tournament_for_id as gt, mark_set_called as msc, mark_set_in_progress as msip,
-        scalars::Timestamp,
+        get_sets_for_event as gse, get_tournament_for_id as gt, mark_set_called as msc, mark_set_in_progress as msip, scalars::Timestamp,
     };
 
     use super::{

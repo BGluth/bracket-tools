@@ -1,6 +1,5 @@
-use futures::{future, Future, Stream};
-
 use bracket_tools_core::types::TournamentId;
+use futures::{future, Future, Stream};
 
 pub struct ScraperService {
     name: String,

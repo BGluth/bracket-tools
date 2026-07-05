@@ -353,7 +353,9 @@ impl<S: Storage> GGProvider<S> {
     /// Fetches an event's structural skeleton: phases, phase groups (bracket
     /// type, rounds, wave) and entrant count. Bypasses the cache entirely.
     pub async fn fetch_event_structure(&self, slug: &str) -> Result<get_event_structure::Event, GGProviderError> {
-        let data = self.run_query(GetEventStructure::build(GetEventStructureVariables { slug })).await?;
+        let data = self
+            .run_query(GetEventStructure::build(GetEventStructureVariables { slug }))
+            .await?;
 
         Ok(extract_event_structure(data)?)
     }

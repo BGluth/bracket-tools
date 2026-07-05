@@ -327,7 +327,9 @@ where
     if let Some(errors) = &response.errors {
         if !errors.is_empty() {
             report.full_shape_page_ok = false;
-            report.graphql_errors.extend(errors.iter().map(|e| format!("{label}: {}", e.message)));
+            report
+                .graphql_errors
+                .extend(errors.iter().map(|e| format!("{label}: {}", e.message)));
         }
     }
 
@@ -340,7 +342,11 @@ where
 }
 
 fn absorb_structure(report: &mut EventReport, event: &get_event_structure::Event) {
-    report.tournament_id = event.tournament.as_ref().and_then(|t| t.id.as_ref()).map(|id| id.inner().to_string());
+    report.tournament_id = event
+        .tournament
+        .as_ref()
+        .and_then(|t| t.id.as_ref())
+        .map(|id| id.inner().to_string());
     report.tournament_slug = event.tournament.as_ref().and_then(|t| t.slug.clone());
     report.num_entrants = event.num_entrants;
     report.has_double_elim = phase_groups(event).any(|pg| pg.bracket_type == Some(BracketType::DoubleElimination));
@@ -386,7 +392,10 @@ fn analyze_sets(report: &mut EventReport, sets: &[get_sets_for_event::Set]) {
         if has_empty_slot && set.completed_at.is_none() {
             report.pending_sets_with_null_entrant += 1;
         }
-        if slots.iter().any(|s| s.entrant.is_none() && (s.prereq_id.is_some() || s.prereq_type.is_some())) {
+        if slots
+            .iter()
+            .any(|s| s.entrant.is_none() && (s.prereq_id.is_some() || s.prereq_type.is_some()))
+        {
             report.empty_slot_sets_with_prereq += 1;
         }
 

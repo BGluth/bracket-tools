@@ -126,8 +126,14 @@ mod tests {
         round_trip(&Game {
             g_id: GameId(1),
             g_type: GameType::OneVOne(
-                PlayerGameInfo { p_id: PlayerId(1), meta: 0 },
-                PlayerGameInfo { p_id: PlayerId(2), meta: 0 },
+                PlayerGameInfo {
+                    p_id: PlayerId(1),
+                    meta: 0,
+                },
+                PlayerGameInfo {
+                    p_id: PlayerId(2),
+                    meta: 0,
+                },
             ),
             winning_side: GameWinningSide::Left,
         });
@@ -138,8 +144,14 @@ mod tests {
         round_trip(&Game {
             g_id: GameId(2),
             g_type: GameType::MultiVsMulti(
-                vec![PlayerGameInfo { p_id: PlayerId(1), meta: 0 }],
-                vec![PlayerGameInfo { p_id: PlayerId(2), meta: 0 }],
+                vec![PlayerGameInfo {
+                    p_id: PlayerId(1),
+                    meta: 0,
+                }],
+                vec![PlayerGameInfo {
+                    p_id: PlayerId(2),
+                    meta: 0,
+                }],
             ),
             winning_side: GameWinningSide::Right,
         });
@@ -152,8 +164,14 @@ mod tests {
             games: vec![Game {
                 g_id: GameId(1),
                 g_type: GameType::OneVOne(
-                    PlayerGameInfo { p_id: PlayerId(1), meta: 0 },
-                    PlayerGameInfo { p_id: PlayerId(2), meta: 0 },
+                    PlayerGameInfo {
+                        p_id: PlayerId(1),
+                        meta: 0,
+                    },
+                    PlayerGameInfo {
+                        p_id: PlayerId(2),
+                        meta: 0,
+                    },
                 ),
                 winning_side: GameWinningSide::Left,
             }],

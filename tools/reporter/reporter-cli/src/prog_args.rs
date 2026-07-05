@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use clap::{Args, Parser};
 use bracket_tools_startgg::types::GGRestToken;
+use clap::{Args, Parser};
 
 #[derive(Debug, Parser)]
 #[command(version, about, author)]
