@@ -19,7 +19,7 @@ use crate::{
     },
     duration::{diff_snapshots, DurationModel},
     model::{BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
-    persist::{OverlayDoc, OVERLAY_VERSION},
+    persist::{BracketSnapshot, OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     ranker::GreedyRanker,
     world::{assigned_sets, recompute, BracketState, World, WorldInputs},
 };
@@ -308,6 +308,9 @@ pub struct AppState {
     /// Set whenever a message may have changed the persisted overlay; the main
     /// loop debounces a save and clears it.
     pub overlay_dirty: bool,
+    /// Set when a snapshot applied (the last-good tables changed); the main
+    /// loop debounces the snapshot-file save and clears it.
+    pub snapshot_dirty: bool,
     /// The last overlay save failed (state file unwritable) — drives the
     /// "STATE NOT PERSISTING" badge.
     pub persist_failed: bool,
@@ -364,6 +367,7 @@ impl AppState {
             world: World::default(),
             dirty: false,
             overlay_dirty: false,
+            snapshot_dirty: false,
             persist_failed: false,
             ui: UiState::default(),
             undo: None,
@@ -463,6 +467,24 @@ impl AppState {
         }
         self.no_show_alerted = doc.no_show_alerted.into_iter().collect();
         self.world = recompute_world(self, now_millis);
+    }
+
+    /// Snapshots the last-good per-event set tables for the snapshot file
+    /// (the offline cold-start seed).
+    pub fn to_snapshot(&self) -> SnapshotDoc {
+        SnapshotDoc {
+            version: SNAPSHOT_VERSION,
+            brackets: self
+                .brackets
+                .iter()
+                .map(|b| BracketSnapshot {
+                    id: b.state.id.clone(),
+                    captured_at: b.last_good_poll.unwrap_or(0),
+                    sets: b.state.sets.clone(),
+                    groups: b.state.groups.clone(),
+                })
+                .collect(),
+        }
     }
 
     /// All state ints we can interpret (deviation baseline).
@@ -1094,6 +1116,7 @@ fn apply_snapshot(
     stamp_ready(state, ix, now);
     release_held_writes(state, ix, captured_at, now, effects);
     state.dirty = true;
+    state.snapshot_dirty = true;
 }
 
 /// The flush discipline's release half: a successful poll for an event

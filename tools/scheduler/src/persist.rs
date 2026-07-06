@@ -17,19 +17,20 @@ use std::{
 };
 
 use fs2::FileExt;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
     app::{Notice, PendingWrite},
     conflict::{ConflictKey, PlayerFlags, SetupBoard, Tombstones, UnixMillis},
     duration::DurationModel,
-    model::{BracketId, SetKey},
+    model::{BracketId, LiveSet, PhaseGroupInfo, SetKey},
 };
 
 /// Bumped when the on-disk shape changes incompatibly; an older file then
 /// recovers to `.bak` rather than mis-parsing.
 pub const OVERLAY_VERSION: u32 = 1;
+pub const SNAPSHOT_VERSION: u32 = 1;
 
 /// The persisted overlay. Maps with non-string keys become vectors of pairs so
 /// the document is plain JSON.
@@ -71,26 +72,52 @@ pub enum PersistError {
     },
 }
 
-/// Outcome of loading the overlay at startup.
-pub enum OverlayLoad {
+/// The last good per-event set tables: the offline cold-start seed. Remote
+/// state authority is untouched — this is a stale cache with a visible age,
+/// not owned state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotDoc {
+    pub version: u32,
+    pub brackets: Vec<BracketSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BracketSnapshot {
+    pub id: BracketId,
+    /// When this table was captured (unix millis) — restart staleness age.
+    pub captured_at: UnixMillis,
+    pub sets: Vec<LiveSet>,
+    pub groups: Vec<PhaseGroupInfo>,
+}
+
+/// Outcome of loading a persisted document at startup.
+pub enum Load<T> {
     /// No file yet (first run).
     None,
-    Loaded(Box<OverlayDoc>),
+    Loaded(Box<T>),
     /// The file was corrupt or a mismatched version; it was renamed here and a
     /// fresh session begins.
     Recovered(PathBuf),
 }
 
-/// Serializes and writes the overlay atomically: full contents to a sibling
+/// Serializes and writes a document atomically: full contents to a sibling
 /// temp file, fsync, then rename over the target (atomic on the same
 /// filesystem), so a crash mid-write never truncates the live file.
-pub fn save_overlay(path: &Path, doc: &OverlayDoc) -> Result<(), PersistError> {
+fn save_json<T: Serialize>(path: &Path, doc: &T) -> Result<(), PersistError> {
     let json = serde_json::to_vec_pretty(doc).map_err(PersistError::Serialize)?;
     let tmp = temp_path(path);
     write_then_rename(&tmp, path, &json).map_err(|source| PersistError::Write {
         path: path.to_owned(),
         source,
     })
+}
+
+pub fn save_overlay(path: &Path, doc: &OverlayDoc) -> Result<(), PersistError> {
+    save_json(path, doc)
+}
+
+pub fn save_snapshot(path: &Path, doc: &SnapshotDoc) -> Result<(), PersistError> {
+    save_json(path, doc)
 }
 
 fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -102,11 +129,12 @@ fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(tmp, path)
 }
 
-/// Loads the overlay, recovering a corrupt/version-mismatched file to `.bak`.
-pub fn load_overlay(path: &Path) -> Result<OverlayLoad, PersistError> {
+/// Loads a versioned document, recovering a corrupt/version-mismatched file
+/// to `.bak` (never a startup failure).
+fn load_versioned<T: DeserializeOwned>(path: &Path, version_of: impl Fn(&T) -> u32, expected: u32) -> Result<Load<T>, PersistError> {
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(OverlayLoad::None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Load::None),
         Err(source) => {
             return Err(PersistError::Read {
                 path: path.to_owned(),
@@ -115,8 +143,8 @@ pub fn load_overlay(path: &Path) -> Result<OverlayLoad, PersistError> {
         }
     };
 
-    match serde_json::from_str::<OverlayDoc>(&raw) {
-        Ok(doc) if doc.version == OVERLAY_VERSION => Ok(OverlayLoad::Loaded(Box::new(doc))),
+    match serde_json::from_str::<T>(&raw) {
+        Ok(doc) if version_of(&doc) == expected => Ok(Load::Loaded(Box::new(doc))),
         // Parsed but from an incompatible version, or failed to parse at all:
         // back it up and start fresh rather than bricking startup.
         _ => {
@@ -125,9 +153,17 @@ pub fn load_overlay(path: &Path) -> Result<OverlayLoad, PersistError> {
                 path: backup.clone(),
                 source,
             })?;
-            Ok(OverlayLoad::Recovered(backup))
+            Ok(Load::Recovered(backup))
         }
     }
+}
+
+pub fn load_overlay(path: &Path) -> Result<Load<OverlayDoc>, PersistError> {
+    load_versioned(path, |doc: &OverlayDoc| doc.version, OVERLAY_VERSION)
+}
+
+pub fn load_snapshot(path: &Path) -> Result<Load<SnapshotDoc>, PersistError> {
+    load_versioned(path, |doc: &SnapshotDoc| doc.version, SNAPSHOT_VERSION)
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -228,7 +264,7 @@ fn read_pid(path: &Path) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{load_overlay, save_overlay, Lockfile, OverlayDoc, OverlayLoad, OVERLAY_VERSION};
+    use super::{load_overlay, save_overlay, Load, Lockfile, OverlayDoc, OVERLAY_VERSION};
     use crate::{conflict::SetupBoard, config::SetupId, duration::DurationModel};
 
     fn scratch(name: &str) -> PathBuf {
@@ -264,7 +300,7 @@ mod tests {
         let doc = sample_doc();
         save_overlay(&path, &doc).unwrap();
 
-        let OverlayLoad::Loaded(loaded) = load_overlay(&path).unwrap() else {
+        let Load::Loaded(loaded) = load_overlay(&path).unwrap() else {
             panic!("expected a loaded overlay");
         };
         assert_eq!(loaded.called_ints, vec![6]);
@@ -277,14 +313,14 @@ mod tests {
     fn missing_file_is_none_not_error() {
         let path = scratch("absent.json");
         let _ = std::fs::remove_file(&path);
-        assert!(matches!(load_overlay(&path).unwrap(), OverlayLoad::None));
+        assert!(matches!(load_overlay(&path).unwrap(), Load::None));
     }
 
     #[test]
     fn corrupt_file_recovers_to_bak() {
         let path = scratch("corrupt.json");
         std::fs::write(&path, b"{ this is not valid json").unwrap();
-        let OverlayLoad::Recovered(backup) = load_overlay(&path).unwrap() else {
+        let Load::Recovered(backup) = load_overlay(&path).unwrap() else {
             panic!("expected recovery");
         };
         assert!(backup.exists(), "corrupt file backed up");
@@ -298,9 +334,37 @@ mod tests {
         let mut doc = sample_doc();
         doc.version = OVERLAY_VERSION + 1;
         save_overlay(&path, &doc).unwrap();
-        assert!(matches!(load_overlay(&path).unwrap(), OverlayLoad::Recovered(_)));
+        assert!(matches!(load_overlay(&path).unwrap(), Load::Recovered(_)));
         let backup = super::backup_path(&path);
         let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn snapshot_round_trips_with_live_sets() {
+        use super::{load_snapshot, save_snapshot, BracketSnapshot, SnapshotDoc, SNAPSHOT_VERSION};
+        use crate::{model::BracketId, synth::make_se_bracket};
+
+        let bracket = make_se_bracket(1001, 4);
+        let path = scratch("snapshot.json");
+        let _ = std::fs::remove_file(&path);
+        let doc = SnapshotDoc {
+            version: SNAPSHOT_VERSION,
+            brackets: vec![BracketSnapshot {
+                id: BracketId("ultimate".to_owned()),
+                captured_at: 1_751_000_000_000,
+                sets: bracket.sets.clone(),
+                groups: vec![bracket.info.clone()],
+            }],
+        };
+        save_snapshot(&path, &doc).unwrap();
+
+        let Load::Loaded(loaded) = load_snapshot(&path).unwrap() else {
+            panic!("expected a loaded snapshot");
+        };
+        assert_eq!(loaded.brackets.len(), 1);
+        assert_eq!(loaded.brackets[0].sets, bracket.sets, "LiveSet subtree round-trips exactly");
+        assert_eq!(loaded.brackets[0].groups[0], bracket.info);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

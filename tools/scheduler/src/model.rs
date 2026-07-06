@@ -42,7 +42,7 @@ pub struct BracketId(pub String);
 /// A slot's prerequisite: either a real bracket edge to another set, or
 /// something the scheduler treats as already satisfied (seed placements,
 /// unknown vocabulary, and dangling references to sets the API never returned).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Prereq {
     /// The occupant comes from another set's outcome. `placement` is 1 for the
     /// feeder's winner, 2 for its loser.
@@ -54,7 +54,7 @@ pub enum Prereq {
 /// An entrant sitting in a slot. `player_ids` carries every participant's
 /// global player id (doubles-safe); it may be empty when the API degraded the
 /// identity, in which case conflict tracking falls back to the entrant id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotOccupant {
     pub entrant_id: EntrantId,
     pub display_name: String,
@@ -62,14 +62,14 @@ pub struct SlotOccupant {
     pub player_ids: Vec<PlayerId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Slot {
     pub prereq: Option<Prereq>,
     pub occupant: Option<SlotOccupant>,
 }
 
 /// One set as of the latest poll, in scheduler-local form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveSet {
     pub id: SetId,
     pub key: SetKey,
@@ -114,7 +114,7 @@ impl LiveSet {
 
 /// How a phase group schedules its sets; drives the per-group branch in the
 /// bracket graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupKind {
     /// Single or double elimination: the prereq edges form the real DAG.
     Elimination,
@@ -126,7 +126,7 @@ pub enum GroupKind {
 }
 
 /// Structural facts about one phase group, from the event-structure query.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhaseGroupInfo {
     pub id: String,
     pub kind: GroupKind,

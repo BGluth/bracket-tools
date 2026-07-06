@@ -118,10 +118,12 @@ pub struct SchedulerConfig {
     /// beside the tool. The single-instance lockfile lives beside it.
     #[serde(default)]
     pub state_file: Option<PathBuf>,
-    // Remaining journaling paths land with their features. TODO(S4):
-    // snapshot_file, log_file, capture_dir.
+    /// Last-good snapshot (offline cold-start seed); defaults to
+    /// ./scheduler-snapshot.json.
     #[serde(default)]
     pub snapshot_file: Option<PathBuf>,
+    // Remaining journaling paths land with their features. TODO(S4):
+    // log_file, capture_dir.
     #[serde(default)]
     pub log_file: Option<PathBuf>,
     #[serde(default)]

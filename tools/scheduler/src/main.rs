@@ -14,12 +14,12 @@ use std::{
 
 use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
-    app::{update, AppState, Msg, NoticeLevel, PollFailure, UpdateEffects, WriteIntent},
+    app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, UpdateEffects, WriteIntent},
     cli::{build_live_source, resolve_token, Cli},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
     model::BracketId,
-    persist::{load_overlay, save_overlay, sibling_with_suffix, Lockfile, OverlayLoad},
+    persist::{load_overlay, load_snapshot, save_overlay, save_snapshot, sibling_with_suffix, Load, Lockfile},
     poller::{classify_provider_error, run_poller, PollerConfig},
     preflight::preflight,
     set_source::SetSource,
@@ -39,6 +39,7 @@ const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Overlay save cadence: at most one write per this window while state churns.
 const SAVE_DEBOUNCE_MS: i64 = 2000;
 const DEFAULT_STATE_FILE: &str = "scheduler-state.json";
+const DEFAULT_SNAPSHOT_FILE: &str = "scheduler-snapshot.json";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,7 +63,8 @@ where
 {
     // Single-instance guard, held for the process lifetime. A simulate run
     // uses sibling paths so a rehearsal never touches (or races) live state.
-    let state_path = state_file_path(&config, cli.simulate.is_some());
+    let state_path = persisted_path(config.state_file.as_deref(), DEFAULT_STATE_FILE, cli.simulate.is_some());
+    let snapshot_path = persisted_path(config.snapshot_file.as_deref(), DEFAULT_SNAPSHOT_FILE, cli.simulate.is_some());
     let _lock = Lockfile::acquire(&sibling_with_suffix(&state_path, "lock"))?;
 
     let arm_writes = !(cli.advisor_only || config.advisor_only);
@@ -82,10 +84,14 @@ where
     }
 
     let writes_armed = report.writes_armed;
-    let bootstraps = report.into_bootstraps();
+    let mut bootstraps = report.into_bootstraps();
+    // Events preflight couldn't fetch open on the persisted last-good
+    // snapshot (stale-flagged) instead of a blank table.
+    let seeded = seed_from_snapshot(&mut bootstraps, &snapshot_path);
     let events: Vec<BracketId> = bootstraps.iter().map(|b| b.id.clone()).collect();
     let mut state = AppState::new(config.clone(), writes_armed, bootstraps, now_millis());
     restore_overlay(&mut state, &state_path);
+    mark_seeded_stale(&mut state, &seeded);
 
     let (tx, rx) = unbounded_channel::<Msg>();
     let mut tasks = Tasks::new(source, PollerConfig::from_scheduler(&config), events, classify, tx.clone());
@@ -95,21 +101,62 @@ where
     let mut guard = TerminalGuard::new().context("entering the terminal")?;
 
     guard.terminal.draw(|frame| ui::draw(frame, &state, now_millis()))?;
-    event_loop(&mut state, rx, &mut tasks, &mut guard, &state_path).await?;
+    event_loop(&mut state, rx, &mut tasks, &mut guard, &state_path, &snapshot_path).await?;
 
     drop(guard);
     tasks.join_set.abort_all();
     Ok(())
 }
 
-/// Where the overlay lives: config's `state_file`, else a file beside the
-/// config-relative working directory. Simulate runs get a `.sim` sibling.
-fn state_file_path(config: &SchedulerConfig, simulate: bool) -> PathBuf {
-    let base = config.state_file.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_FILE));
+/// Where a persisted document lives: the configured path, else the default
+/// beside the working directory. Simulate runs get a `.sim` sibling.
+fn persisted_path(configured: Option<&Path>, default: &str, simulate: bool) -> PathBuf {
+    let base = configured.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(default));
     if simulate {
         sibling_with_suffix(&base, "sim")
     } else {
         base
+    }
+}
+
+/// Fills fetch-failed bootstraps from the persisted last-good snapshot.
+/// Returns what was seeded, with each table's capture time (for staleness).
+fn seed_from_snapshot(bootstraps: &mut [BracketBootstrap], path: &Path) -> Vec<(BracketId, UnixMillis)> {
+    let doc = match load_snapshot(path) {
+        Ok(Load::Loaded(doc)) => doc,
+        // A corrupt snapshot is just a lost cache; overlay recovery already
+        // warns loudly, so start cold quietly.
+        Ok(Load::Recovered(_)) | Ok(Load::None) | Err(_) => return Vec::new(),
+    };
+    let mut seeded = Vec::new();
+    for boot in bootstraps.iter_mut() {
+        if !boot.sets.is_empty() {
+            continue;
+        }
+        let Some(snap) = doc.brackets.iter().find(|b| b.id == boot.id && !b.sets.is_empty()) else {
+            continue;
+        };
+        boot.sets = snap.sets.clone();
+        if boot.groups.is_empty() {
+            boot.groups = snap.groups.clone();
+        }
+        seeded.push((boot.id.clone(), snap.captured_at));
+    }
+    seeded
+}
+
+/// Stamps snapshot-seeded brackets with their true capture age (the staleness
+/// badge must not read "fresh") and says so.
+fn mark_seeded_stale(state: &mut AppState, seeded: &[(BracketId, UnixMillis)]) {
+    let now = now_millis();
+    for (id, captured_at) in seeded {
+        if let Some(runtime) = state.brackets.iter_mut().find(|b| &b.state.id == id) {
+            runtime.last_good_poll = (*captured_at > 0).then_some(*captured_at);
+            runtime.health = PollHealth::Offline;
+        }
+        let age_secs = (now - captured_at) / 1000;
+        let text = format!("{}: seeded from the snapshot file ({}m old) — poller retries", id.0, age_secs / 60);
+        state.notice(now, NoticeLevel::Warn, text);
     }
 }
 
@@ -119,15 +166,15 @@ fn state_file_path(config: &SchedulerConfig, simulate: bool) -> PathBuf {
 fn restore_overlay(state: &mut AppState, path: &Path) {
     let now = now_millis();
     match load_overlay(path) {
-        Ok(OverlayLoad::Loaded(doc)) => {
+        Ok(Load::Loaded(doc)) => {
             state.apply_overlay(*doc, now);
             state.notice(now, NoticeLevel::Info, format!("restored session state from {}", path.display()));
         }
-        Ok(OverlayLoad::Recovered(backup)) => {
+        Ok(Load::Recovered(backup)) => {
             let text = format!("state file was corrupt or from another version; backed up to {} — starting fresh", backup.display());
             state.notice(now, NoticeLevel::Warn, text);
         }
-        Ok(OverlayLoad::None) => {}
+        Ok(Load::None) => {}
         Err(e) => {
             state.persist_failed = true;
             state.notice(now, NoticeLevel::Error, format!("cannot read state file: {e}"));
@@ -137,21 +184,33 @@ fn restore_overlay(state: &mut AppState, path: &Path) {
 
 /// One overlay save, tracking the badge through failure and recovery.
 fn persist_overlay(state: &mut AppState, path: &Path) {
-    match save_overlay(path, &state.to_overlay()) {
-        Ok(()) => {
+    let result = save_overlay(path, &state.to_overlay());
+    track_persist_outcome(state, result.err().map(|e| e.to_string()));
+    state.overlay_dirty = false;
+}
+
+/// One snapshot-file save; shares the badge with the overlay.
+fn persist_snapshot(state: &mut AppState, path: &Path) {
+    let result = save_snapshot(path, &state.to_snapshot());
+    track_persist_outcome(state, result.err().map(|e| e.to_string()));
+    state.snapshot_dirty = false;
+}
+
+fn track_persist_outcome(state: &mut AppState, error: Option<String>) {
+    match error {
+        None => {
             if state.persist_failed {
-                state.notice(now_millis(), NoticeLevel::Info, "state file writable again");
+                state.notice(now_millis(), NoticeLevel::Info, "state files writable again");
             }
             state.persist_failed = false;
         }
-        Err(e) => {
+        Some(e) => {
             if !state.persist_failed {
                 state.notice(now_millis(), NoticeLevel::Error, format!("state save failed: {e}"));
             }
             state.persist_failed = true;
         }
     }
-    state.overlay_dirty = false;
 }
 
 async fn event_loop<S, F>(
@@ -160,6 +219,7 @@ async fn event_loop<S, F>(
     tasks: &mut Tasks<S, F>,
     guard: &mut TerminalGuard,
     state_path: &Path,
+    snapshot_path: &Path,
 ) -> anyhow::Result<()>
 where
     S: SetSource + Send + Sync + 'static,
@@ -195,8 +255,13 @@ where
         if effects.quit {
             break;
         }
-        if state.overlay_dirty && now_millis() - last_save >= SAVE_DEBOUNCE_MS {
-            persist_overlay(state, state_path);
+        if (state.overlay_dirty || state.snapshot_dirty) && now_millis() - last_save >= SAVE_DEBOUNCE_MS {
+            if state.overlay_dirty {
+                persist_overlay(state, state_path);
+            }
+            if state.snapshot_dirty {
+                persist_snapshot(state, snapshot_path);
+            }
             last_save = now_millis();
         }
         guard.terminal.draw(|frame| ui::draw(frame, state, now_millis()))?;
@@ -205,6 +270,9 @@ where
     // Final flush so a clean quit never loses the debounce window.
     if state.overlay_dirty {
         persist_overlay(state, state_path);
+    }
+    if state.snapshot_dirty {
+        persist_snapshot(state, snapshot_path);
     }
     Ok(())
 }
