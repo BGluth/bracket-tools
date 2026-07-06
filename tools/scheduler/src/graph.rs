@@ -164,6 +164,14 @@ impl BracketGraph {
         self.remaining_by_entrant.get(entrant).copied().unwrap_or(0)
     }
 
+    pub fn remaining_player_counts(&self) -> impl Iterator<Item = (&PlayerId, u32)> {
+        self.remaining_by_player.iter().map(|(p, &n)| (p, n))
+    }
+
+    pub fn remaining_entrant_counts(&self) -> impl Iterator<Item = (&EntrantId, u32)> {
+        self.remaining_by_entrant.iter().map(|(e, &n)| (e, n))
+    }
+
     fn kind_of(&self, set_idx: usize) -> &GroupKind {
         self.group(&self.sets[set_idx].key.phase_group)
             .map_or(&GroupKind::Elimination, |g| &g.info.kind)
@@ -489,6 +497,8 @@ fn stage_runs(groups: &[GroupStats]) -> Vec<Vec<usize>> {
 
 #[cfg(test)]
 mod tests {
+    use std::slice::from_ref;
+
     use super::{BracketGraph, GraphWarning};
     use crate::{
         model::{GroupKind, PlayerId, Prereq, SetId},
@@ -549,7 +559,7 @@ mod tests {
 
         // Fresh bracket: the deepest route is W1[1] -> W2 (loser drops) ->
         // L2 -> GF = 4 incomplete sets.
-        let (graph, _) = BracketGraph::build(&bracket.sets, &[bracket.info.clone()]);
+        let (graph, _) = BracketGraph::build(&bracket.sets, from_ref(&bracket.info));
         let w1_1 = graph.index_of_id(&w1_1_id).unwrap();
         assert_eq!(graph.depth(w1_1), 4);
 
@@ -568,7 +578,7 @@ mod tests {
     #[test]
     fn gf_reset_excluded_until_reachable() {
         let bracket = make_de_bracket(9, 4);
-        let (graph, _) = BracketGraph::build(&bracket.sets, &[bracket.info.clone()]);
+        let (graph, _) = BracketGraph::build(&bracket.sets, from_ref(&bracket.info));
         let gf = graph.index_of_id(&SetId("preview_9_3_0".to_owned())).unwrap();
         let reset = graph.index_of_id(&SetId("preview_9_4_0".to_owned())).unwrap();
 
@@ -587,7 +597,7 @@ mod tests {
 
         // Winners-side champion: GF completed, reset never fills — pruned.
         bracket.sets[gf_pos].completed_at = Some(NOW);
-        let (graph, _) = BracketGraph::build(&bracket.sets, &[bracket.info.clone()]);
+        let (graph, _) = BracketGraph::build(&bracket.sets, from_ref(&bracket.info));
         let reset = graph.index_of_id(&reset_id).unwrap();
         assert!(graph.is_gf_reset_excluded(reset), "unfilled reset stays pruned");
 
@@ -631,7 +641,7 @@ mod tests {
     #[test]
     fn swiss_depth_is_remaining_rounds() {
         let swiss = make_swiss(9, 9, 4);
-        let (graph, _) = BracketGraph::build(&swiss.sets, &[swiss.info.clone()]);
+        let (graph, _) = BracketGraph::build(&swiss.sets, from_ref(&swiss.info));
         assert!(graph.sets().iter().all(|s| s.key.round == 1));
         assert_eq!(graph.depth(0), 4);
         assert_eq!(graph.remaining_critical_path(), 4, "3 future rounds + current");
@@ -682,7 +692,7 @@ mod tests {
         let bracket = make_de_bracket(9, 8);
         let numeric_sets = materialize_ids(&bracket.sets, 5000);
 
-        let (preview_graph, w1) = BracketGraph::build(&bracket.sets, &[bracket.info.clone()]);
+        let (preview_graph, w1) = BracketGraph::build(&bracket.sets, from_ref(&bracket.info));
         let (numeric_graph, w2) = BracketGraph::build(&numeric_sets, &[bracket.info]);
 
         assert_eq!(w1, w2);
