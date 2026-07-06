@@ -13,7 +13,7 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 | bracket-tools-startgg | crates/bracket-tools-startgg | ~82% | Main SDK: caching, rate-limited start.gg client |
 | reporter-cli | tools/reporter/reporter-cli | ~20% | ratatui TUI for set reporting |
 | reporter-state | tools/reporter/reporter-state | ~25% | Reporter state management (store pattern) |
-| bracket-tools-scheduler | tools/scheduler | ~15% | Multi-bracket calling tool for the TO desk |
+| bracket-tools-scheduler | tools/scheduler | ~40% | Multi-bracket calling tool for the TO desk |
 | bracket-tools-daemon | tools/daemon | ~5% | Background scraper daemon |
 | edmonton-smash | web/edmonton-smash | Early | Leptos community website (not in workspace yet) |
 
@@ -21,7 +21,7 @@ Rust mono-repo for esports tournament tooling, primarily targeting the start.gg 
 
 Phase 1 -- Foundation (paused for the Scheduler V1 build week). Sessions 1-11 complete. Completed: Entrant.id fix + Matchup enum, fixture tests, GGRestToken refactor, cache layer integration (Storage trait + GGProvider<S>), cache-hit path, lazy-hydration session layer (GgSession + smart handles), pagination (generic `fetch_all_pages`), MemoryStorage (HashMap-backed Storage backend), cache freshness (per-entity TTL + terminal-state immutability). Remaining: request coalescing, doubles.
 
-Scheduler V1 (tools/scheduler, ADR 006/007): S1 complete (session 14) -- SDK event surface (`get_sets_for_event` with hideEmpty:false, `get_event_structure`, first mutations `markSetCalled`/`markSetInProgress` with delete-invalidation, shared i64 Timestamp + tolerant Id scalars, HTTP timeout/burst knobs), `SetSource` trait + tokio Send spike, smoke bin -> live capture gave a GO verdict (empty future sets carry prereq fields; unstarted brackets use preview_* set ids that become numeric at bracket start). Next: S2 -- pure core (bracket graph, ConflictIndex, greedy policy, simulator).
+Scheduler V1 (tools/scheduler, ADR 006/007): S1 complete (session 14) -- SDK event surface (`get_sets_for_event` with hideEmpty:false, `get_event_structure`, first mutations `markSetCalled`/`markSetInProgress` with delete-invalidation, shared i64 Timestamp + tolerant Id scalars, HTTP timeout/burst knobs), `SetSource` trait + tokio Send spike, smoke bin -> live capture gave a GO verdict (empty future sets carry prereq fields; unstarted brackets use preview_* set ids that become numeric at bracket start). S2 complete (session 16) -- the pure core: scheduler-local model (`LiveSet`/`SetKey`), per-phase-group bracket graph (DAG/RR/Swiss), ConflictIndex + callable predicate with retained block reasons, greedy Ranker, DurationModel, deterministic forward simulator, rollout evaluator (tail item landed), synth builders + env-gated fixture-replay suite. Next: S3 -- TUI (Elm loop, setup board, poller, writer queue, preflight).
 
 **Housekeeping:** At the end of each session, update the crate status percentages in the table above, run `/handoff` to refresh the active task file in `memory/tasks/` (and `/epic update` for the Phase 1 epic), and refresh the codebase map (`.claude/rules/codebase_map.md`) — only update sections that changed.
 
