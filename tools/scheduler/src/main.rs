@@ -13,7 +13,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
-    app::{update, AppState, Msg, NoticeLevel, PollFailure, UpdateEffects},
+    app::{update, AppState, Msg, NoticeLevel, PollFailure, UpdateEffects, WriteIntent},
     cli::{build_live_source, resolve_token, Cli},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
@@ -22,7 +22,9 @@ use bracket_tools_scheduler::{
     preflight::preflight,
     set_source::SetSource,
     terminal::{install_panic_hook, TerminalGuard},
-    ui, SchedulerConfig,
+    ui,
+    writer::{run_writer, WriterConfig},
+    SchedulerConfig,
 };
 use clap::Parser;
 use crossterm::event::{Event, KeyEventKind};
@@ -117,10 +119,7 @@ where
             let _ = tasks.force_tx.send(bracket);
         }
         for intent in effects.writes.drain(..) {
-            // TODO(S3-writer): route to the writer task (next commit). The
-            // shipped example config is advisor-only, so nothing reaches
-            // this arm before the writer lands.
-            tracing::warn!(?intent, "write intent dropped: writer task not wired yet");
+            let _ = tasks.write_tx.send(intent);
         }
         if effects.quit {
             return Ok(());
@@ -137,6 +136,7 @@ where
 {
     join_set: JoinSet<&'static str>,
     force_tx: UnboundedSender<BracketId>,
+    write_tx: UnboundedSender<WriteIntent>,
     source: Arc<S>,
     poller_config: PollerConfig,
     events: Vec<BracketId>,
@@ -150,10 +150,12 @@ where
     F: Fn(&S::Error) -> PollFailure + Send + Sync + Clone + 'static,
 {
     fn new(source: Arc<S>, poller_config: PollerConfig, events: Vec<BracketId>, classify: F, tx: UnboundedSender<Msg>) -> Self {
-        let (force_tx, _unused) = unbounded_channel();
+        let (force_tx, _unused_force) = unbounded_channel();
+        let (write_tx, _unused_write) = unbounded_channel();
         let mut tasks = Self {
             join_set: JoinSet::new(),
             force_tx,
+            write_tx,
             source,
             poller_config,
             events,
@@ -161,6 +163,7 @@ where
             tx,
         };
         tasks.spawn_poller();
+        tasks.spawn_writer();
         tasks.spawn_tick();
         tasks
     }
@@ -181,6 +184,16 @@ where
         });
     }
 
+    fn spawn_writer(&mut self) {
+        let (write_tx, write_rx) = unbounded_channel();
+        self.write_tx = write_tx;
+        let (source, classify, tx) = (self.source.clone(), self.classify.clone(), self.tx.clone());
+        self.join_set.spawn(async move {
+            run_writer(&*source, WriterConfig::default(), classify, tx, write_rx).await;
+            "writer"
+        });
+    }
+
     fn spawn_tick(&mut self) {
         let tx = self.tx.clone();
         self.join_set.spawn(async move {
@@ -196,15 +209,16 @@ where
     }
 
     /// Respawns whichever supervised task ended; returns its name for the
-    /// banner. A panic (Err) can't name its task; the tick task's only
-    /// fallible operation is a channel send that returns cleanly, so a
-    /// panic is attributed to the poller.
+    /// banner. A panic (Err) can't name its task; the poller is the likely
+    /// culprit (the tick task's only fallible operation is a channel send
+    /// that returns cleanly), so panics respawn it. In-flight write intents
+    /// die with a crashed writer; the app's pending list still shows them.
     fn restart_dead_task(&mut self, result: Result<&'static str, tokio::task::JoinError>) -> &'static str {
         let name = result.unwrap_or("poller (panicked)");
-        if name == "tick" {
-            self.spawn_tick();
-        } else {
-            self.spawn_poller();
+        match name {
+            "tick" => self.spawn_tick(),
+            "writer" => self.spawn_writer(),
+            _ => self.spawn_poller(),
         }
         name
     }

@@ -17,6 +17,7 @@ pub mod synth;
 pub mod terminal;
 pub mod ui;
 pub mod world;
+pub mod writer;
 
 pub use config::{BracketConfig, BracketMode, ConfigError, SchedulerConfig, SetupId};
 pub use conflict::{
