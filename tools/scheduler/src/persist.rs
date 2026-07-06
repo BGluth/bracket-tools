@@ -131,16 +131,17 @@ pub fn load_overlay(path: &Path) -> Result<OverlayLoad, PersistError> {
 }
 
 fn temp_path(path: &Path) -> PathBuf {
-    with_suffix(path, "tmp")
+    sibling_with_suffix(path, "tmp")
 }
 
 fn backup_path(path: &Path) -> PathBuf {
-    with_suffix(path, "bak")
+    sibling_with_suffix(path, "bak")
 }
 
 /// `foo.json` → `foo.json.<suffix>` (keeps the original name intact so the
-/// pairing is obvious on disk).
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+/// pairing is obvious on disk). Public so `main` derives the lockfile and
+/// simulate-mode paths the same way.
+pub fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.file_name().map(|n| n.to_owned()).unwrap_or_default();
     name.push(".");
     name.push(suffix);

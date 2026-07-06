@@ -114,10 +114,12 @@ pub struct SchedulerConfig {
     /// responses when unset.
     #[serde(default)]
     pub known_in_progress_state_int: Option<i32>,
-    // Persistence / journaling paths land in S4; parsed now so Friday's config
-    // file doesn't churn. TODO(S4): wire these up.
+    /// Overlay (local operator state) path; defaults to ./scheduler-state.json
+    /// beside the tool. The single-instance lockfile lives beside it.
     #[serde(default)]
     pub state_file: Option<PathBuf>,
+    // Remaining journaling paths land with their features. TODO(S4):
+    // snapshot_file, log_file, capture_dir.
     #[serde(default)]
     pub snapshot_file: Option<PathBuf>,
     #[serde(default)]

@@ -6,6 +6,7 @@
 //! so tests drive it without a terminal or network.
 
 use std::{
+    path::{Path, PathBuf},
     sync::Arc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -18,6 +19,7 @@ use bracket_tools_scheduler::{
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
     model::BracketId,
+    persist::{load_overlay, save_overlay, sibling_with_suffix, Lockfile, OverlayLoad},
     poller::{classify_provider_error, run_poller, PollerConfig},
     preflight::preflight,
     set_source::SetSource,
@@ -34,6 +36,9 @@ use tokio::{
 };
 
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Overlay save cadence: at most one write per this window while state churns.
+const SAVE_DEBOUNCE_MS: i64 = 2000;
+const DEFAULT_STATE_FILE: &str = "scheduler-state.json";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,6 +60,11 @@ where
     S: SetSource + Send + Sync + 'static,
     F: Fn(&S::Error) -> PollFailure + Send + Sync + Clone + 'static,
 {
+    // Single-instance guard, held for the process lifetime. A simulate run
+    // uses sibling paths so a rehearsal never touches (or races) live state.
+    let state_path = state_file_path(&config, cli.simulate.is_some());
+    let _lock = Lockfile::acquire(&sibling_with_suffix(&state_path, "lock"))?;
+
     let arm_writes = !(cli.advisor_only || config.advisor_only);
     let report = preflight(&*source, &config, PREFLIGHT_TIMEOUT, arm_writes, classify.clone()).await;
     print!("{}", report.render());
@@ -69,6 +79,7 @@ where
     let bootstraps = report.into_bootstraps();
     let events: Vec<BracketId> = bootstraps.iter().map(|b| b.id.clone()).collect();
     let mut state = AppState::new(config.clone(), writes_armed, bootstraps, now_millis());
+    restore_overlay(&mut state, &state_path);
 
     let (tx, rx) = unbounded_channel::<Msg>();
     let mut tasks = Tasks::new(source, PollerConfig::from_scheduler(&config), events, classify, tx.clone());
@@ -78,11 +89,63 @@ where
     let mut guard = TerminalGuard::new().context("entering the terminal")?;
 
     guard.terminal.draw(|frame| ui::draw(frame, &state, now_millis()))?;
-    event_loop(&mut state, rx, &mut tasks, &mut guard).await?;
+    event_loop(&mut state, rx, &mut tasks, &mut guard, &state_path).await?;
 
     drop(guard);
     tasks.join_set.abort_all();
     Ok(())
+}
+
+/// Where the overlay lives: config's `state_file`, else a file beside the
+/// config-relative working directory. Simulate runs get a `.sim` sibling.
+fn state_file_path(config: &SchedulerConfig, simulate: bool) -> PathBuf {
+    let base = config.state_file.clone().unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_FILE));
+    if simulate {
+        sibling_with_suffix(&base, "sim")
+    } else {
+        base
+    }
+}
+
+/// Rehydrates a persisted overlay (if any) over the freshly-bootstrapped
+/// state. Corruption recovers to `.bak`; only an unreadable file (permissions)
+/// leaves the badge up. Never fails startup.
+fn restore_overlay(state: &mut AppState, path: &Path) {
+    let now = now_millis();
+    match load_overlay(path) {
+        Ok(OverlayLoad::Loaded(doc)) => {
+            state.apply_overlay(*doc, now);
+            state.notice(now, NoticeLevel::Info, format!("restored session state from {}", path.display()));
+        }
+        Ok(OverlayLoad::Recovered(backup)) => {
+            let text = format!("state file was corrupt or from another version; backed up to {} — starting fresh", backup.display());
+            state.notice(now, NoticeLevel::Warn, text);
+        }
+        Ok(OverlayLoad::None) => {}
+        Err(e) => {
+            state.persist_failed = true;
+            state.notice(now, NoticeLevel::Error, format!("cannot read state file: {e}"));
+        }
+    }
+}
+
+/// One overlay save, tracking the badge through failure and recovery.
+fn persist_overlay(state: &mut AppState, path: &Path) {
+    match save_overlay(path, &state.to_overlay()) {
+        Ok(()) => {
+            if state.persist_failed {
+                state.notice(now_millis(), NoticeLevel::Info, "state file writable again");
+            }
+            state.persist_failed = false;
+        }
+        Err(e) => {
+            if !state.persist_failed {
+                state.notice(now_millis(), NoticeLevel::Error, format!("state save failed: {e}"));
+            }
+            state.persist_failed = true;
+        }
+    }
+    state.overlay_dirty = false;
 }
 
 async fn event_loop<S, F>(
@@ -90,16 +153,18 @@ async fn event_loop<S, F>(
     mut rx: UnboundedReceiver<Msg>,
     tasks: &mut Tasks<S, F>,
     guard: &mut TerminalGuard,
+    state_path: &Path,
 ) -> anyhow::Result<()>
 where
     S: SetSource + Send + Sync + 'static,
     F: Fn(&S::Error) -> PollFailure + Send + Sync + Clone + 'static,
 {
+    let mut last_save: UnixMillis = 0;
     loop {
         let mut effects = UpdateEffects::default();
         tokio::select! {
             maybe_msg = rx.recv() => {
-                let Some(msg) = maybe_msg else { return Ok(()) };
+                let Some(msg) = maybe_msg else { break };
                 effects = update(state, msg, now_millis());
                 // Coalesce whatever else is already queued before drawing.
                 while let Ok(more) = rx.try_recv() {
@@ -122,10 +187,20 @@ where
             let _ = tasks.write_tx.send(intent);
         }
         if effects.quit {
-            return Ok(());
+            break;
+        }
+        if state.overlay_dirty && now_millis() - last_save >= SAVE_DEBOUNCE_MS {
+            persist_overlay(state, state_path);
+            last_save = now_millis();
         }
         guard.terminal.draw(|frame| ui::draw(frame, state, now_millis()))?;
     }
+
+    // Final flush so a clean quit never loses the debounce window.
+    if state.overlay_dirty {
+        persist_overlay(state, state_path);
+    }
+    Ok(())
 }
 
 /// The supervised background tasks plus everything needed to respawn them.

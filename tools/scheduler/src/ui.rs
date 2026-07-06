@@ -182,6 +182,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMil
             Style::new().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
     }
+    if state.persist_failed {
+        spans.push(Span::styled(
+            " STATE NOT PERSISTING ",
+            Style::new().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let healthy = state.brackets.iter().filter(|b| b.health == PollHealth::Ok).count();
     let oldest = state
