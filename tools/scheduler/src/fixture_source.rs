@@ -254,6 +254,12 @@ impl SetSource for FixtureSource {
     }
 }
 
+/// Three-bucket classification for fixture errors (`--simulate` runs): an
+/// unknown event is a config typo — definitively wrong, never retried.
+pub fn classify_fixture_error(error: &FixtureError) -> crate::app::PollFailure {
+    crate::app::PollFailure::Persistent(error.to_string())
+}
+
 /// Event lookups tolerate both slug forms: the live `tournament/x/event/y`
 /// and the capture directory's `tournament_x_event_y`.
 fn capture_key(slug: &str) -> String {

@@ -1,0 +1,62 @@
+# French Bread Rumble 100 — example scheduler config (S3 review artifact).
+#
+#   cargo run -p bracket-tools-scheduler --bin scheduler -- --config tools/scheduler/examples/fbr-100.toml
+#
+# SAFE BY DEFAULT: advisor_only pins the session to read-only regardless of
+# token permissions — flip it (or pass no --advisor-only) on Friday once the
+# real setup pool below is corrected. The setup pool here is synthetic
+# (8 stations, Pokemon pinned to 7-8); the real bracket→setup sharing map is
+# still an open question for the TO desk.
+
+tournament_slug = "tournament/french-bread-rumble-100"
+advisor_only = true
+
+setups = [1, 2, 3, 4, 5, 6, 7, 8]
+poll_interval_secs = 30
+no_show_secs = 300
+rest_window_secs = 300
+
+# Live-observed state ints (session 14 write probe).
+known_called_state_int = 6
+known_in_progress_state_int = 2
+
+# Same-human links across events, by player id: uncomment and fill from the
+# preflight identity-split report.
+# player_aliases = [["1234567", "7654321"]]
+
+[[brackets]]
+slug = "tournament/french-bread-rumble-100/event/ultimate-singles"
+expected_kind = "elimination"
+pool = [1, 2, 3, 4, 5, 6, 7, 8]
+
+[[brackets]]
+slug = "tournament/french-bread-rumble-100/event/melee-singles"
+expected_kind = "elimination"
+duration_prior_secs = 600
+pool = [1, 2, 3, 4, 5, 6, 7, 8]
+
+[[brackets]]
+slug = "tournament/french-bread-rumble-100/event/brawl-singles"
+expected_kind = "elimination"
+pool = [1, 2, 3, 4, 5, 6, 7, 8]
+
+[[brackets]]
+slug = "tournament/french-bread-rumble-100/event/rivals-2-singles"
+expected_kind = "elimination"
+pool = [1, 2, 3, 4, 5, 6, 7, 8]
+
+[[brackets]]
+slug = "tournament/french-bread-rumble-100/event/mugen-singles"
+expected_kind = "elimination"
+pool = [1, 2, 3, 4, 5, 6, 7, 8]
+
+[[brackets]]
+slug = "tournament/french-bread-rumble-100/event/special-smash"
+expected_kind = "elimination"
+pool = [1, 2, 3, 4, 5, 6, 7, 8]
+
+[[brackets]]
+slug = "tournament/french-bread-rumble-100/event/pokemon-champions-4v4-double-battle"
+expected_kind = "swiss"
+duration_prior_secs = 600
+pool = [7, 8]

@@ -7,25 +7,28 @@ use bracket_tools_startgg_schema::{get_event_structure, get_sets_for_event};
 /// A source of live bracket data the scheduler polls and writes through.
 ///
 /// The scheduler is generic over this trait so a fixture-replay source can
-/// stand in for start.gg in tests and `--simulate` runs. Methods return
-/// schema-layer types in S1; the scheduler-local set model arrives in S3.
+/// stand in for start.gg in tests and `--simulate` runs.
 ///
 /// Declared in the desugared `impl Future` form (like `Storage`); impls can
-/// use plain `async fn`.
+/// use plain `async fn`. The `+ Send` bounds exist for the *generic* task
+/// wiring (`tokio::spawn` inside `run<S: SetSource>`): monomorphic spawns
+/// proved Send without them (the S1 spike), but generic code can't see
+/// through an opaque RPITIT, so the trait states it. Both implementations'
+/// futures are naturally Send.
 pub trait SetSource {
     type Error: Error + Send + Sync + 'static;
 
     /// Fetches every set in an event, including not-yet-filled future sets.
-    fn fetch_event_sets(&self, event_slug: &str) -> impl Future<Output = Result<Vec<get_sets_for_event::Set>, Self::Error>>;
+    fn fetch_event_sets(&self, event_slug: &str) -> impl Future<Output = Result<Vec<get_sets_for_event::Set>, Self::Error>> + Send;
 
     /// Fetches an event's structural skeleton (phases, groups, waves, rounds).
-    fn fetch_event_structure(&self, event_slug: &str) -> impl Future<Output = Result<get_event_structure::Event, Self::Error>>;
+    fn fetch_event_structure(&self, event_slug: &str) -> impl Future<Output = Result<get_event_structure::Event, Self::Error>> + Send;
 
     /// Marks a set as called (players summoned to their station).
-    fn mark_called(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>>;
+    fn mark_called(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + Send;
 
     /// Marks a set as in progress.
-    fn mark_in_progress(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>>;
+    fn mark_in_progress(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + Send;
 }
 
 /// A [`SetSource`] backed by the live start.gg API through an uncached

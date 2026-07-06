@@ -194,6 +194,15 @@ pub struct UpdateEffects {
     pub quit: bool,
 }
 
+impl UpdateEffects {
+    /// Folds another update's effects in (drain-then-draw coalescing).
+    pub fn merge(&mut self, other: Self) {
+        self.writes.extend(other.writes);
+        self.force_poll.extend(other.force_poll);
+        self.quit |= other.quit;
+    }
+}
+
 /// Undo is single-level and local: it restores the overlay, not writes
 /// already handed to the writer.
 #[derive(Debug, Clone)]
