@@ -4,7 +4,19 @@ pub mod duration;
 pub mod graph;
 pub mod model;
 pub mod ranker;
+pub mod rollout;
 pub mod set_source;
 pub mod simulator;
 #[doc(hidden)]
 pub mod synth;
+
+pub use config::{BracketConfig, BracketMode, SchedulerConfig, SetupId};
+pub use conflict::{
+    callable, callable_sets, BlockReason, BracketView, CallableSet, ConflictIndex, ConflictInputs, ConflictKey, SetupBoard, SetupStatus,
+};
+pub use duration::{diff_snapshots, DurationModel, SnapshotDiff};
+pub use graph::{BracketGraph, GraphWarning};
+pub use model::{BracketId, LiveSet, PhaseGroupInfo, SetId, SetKey};
+pub use ranker::{GreedyRanker, RankedAction, RankedCandidate, Ranker};
+pub use rollout::RolloutRanker;
+pub use simulator::{simulate, simulate_action, Action, SimBracket, SimOutcome, SimWorld};
