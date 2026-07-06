@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod config;
 pub mod conflict;
 pub mod duration;
@@ -10,7 +11,7 @@ pub mod simulator;
 #[doc(hidden)]
 pub mod synth;
 
-pub use config::{BracketConfig, BracketMode, SchedulerConfig, SetupId};
+pub use config::{BracketConfig, BracketMode, ConfigError, SchedulerConfig, SetupId};
 pub use conflict::{
     callable, callable_sets, BlockReason, BracketView, CallableSet, ConflictIndex, ConflictInputs, ConflictKey, SetupBoard, SetupStatus,
 };
