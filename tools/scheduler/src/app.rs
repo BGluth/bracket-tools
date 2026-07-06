@@ -104,6 +104,12 @@ pub enum WriteOutcome {
         error: String,
         attempts: u32,
     },
+    /// Connectivity failure: the writer hands the intent back; the app holds
+    /// it until the target event polls successfully again, then revalidates
+    /// and re-sends (or drops a moot intent). Never consumes park attempts.
+    AwaitReconnect {
+        error: String,
+    },
     /// Given up; parked for the TO to retry or discard.
     Terminal {
         error: String,
@@ -124,6 +130,9 @@ pub struct OffsetSample {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingStatus {
     Queued,
+    /// Failed on connectivity; held until its event polls successfully again
+    /// (the flush discipline — revalidated before re-sending).
+    AwaitingReconnect,
     Parked,
 }
 
@@ -264,6 +273,10 @@ pub struct AppState {
     pub soft_busy: Vec<(BracketId, SetKey)>,
     pub durations: DurationModel,
     pub pending_writes: Vec<PendingWrite>,
+    /// Intents awaiting reconnect (in-memory twin of the AwaitingReconnect
+    /// pending entries): released back to the writer only once their event
+    /// polls successfully, strictly newer than the intent.
+    pub held_writes: Vec<WriteIntent>,
     pub notices: VecDeque<Notice>,
     /// Latest server-clock offset estimate (from mutation round trips);
     /// retained until a fresher sample replaces it. Not persisted — clocks
@@ -325,6 +338,7 @@ impl AppState {
             soft_busy: Vec::new(),
             durations,
             pending_writes: Vec::new(),
+            held_writes: Vec::new(),
             notices: VecDeque::new(),
             clock_offset: None,
             no_show_alerted: HashSet::new(),
@@ -411,14 +425,15 @@ impl AppState {
         merge_ints(&mut self.in_progress_ints, doc.in_progress_ints);
         self.soft_busy = doc.soft_busy;
         self.durations.restore(doc.durations);
-        // A write left in flight when we crashed has an uncertain fate; park it
-        // for the TO rather than silently re-sending (avoids a duplicate) or
-        // leaving a Queued entry that suppresses a fresh enqueue.
+        // A write left in flight (or held for reconnect) when we crashed has
+        // an uncertain fate; park it for the TO rather than silently
+        // re-sending (avoids a duplicate) or leaving a Queued entry that
+        // suppresses a fresh enqueue.
         self.pending_writes = doc
             .pending_writes
             .into_iter()
             .map(|mut p| {
-                if p.status == PendingStatus::Queued {
+                if p.status != PendingStatus::Parked {
                     p.status = PendingStatus::Parked;
                 }
                 p
@@ -731,10 +746,11 @@ fn enqueue_write(
     if !state.writes_armed {
         return;
     }
+    // Queued or reconnect-held both count as in flight for single-flight.
     if state
         .pending_writes
         .iter()
-        .any(|p| p.intent.id == id && p.intent.kind == kind && p.status == PendingStatus::Queued)
+        .any(|p| p.intent.id == id && p.intent.kind == kind && p.status != PendingStatus::Parked)
     {
         return;
     }
@@ -805,7 +821,7 @@ fn verify_callable(
 
 // --- polls
 
-fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, _effects: &mut UpdateEffects) {
+fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, effects: &mut UpdateEffects) {
     let Some(ix) = state.bracket_ix(&poll.bracket) else {
         state.notice(now, NoticeLevel::Warn, format!("poll for unknown bracket {}", poll.bracket.0));
         return;
@@ -830,7 +846,7 @@ fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, _effects
             if poll.seq <= state.brackets[ix].applied_seq {
                 return;
             }
-            apply_snapshot(state, ix, poll.seq, poll.captured_at, sets, now);
+            apply_snapshot(state, ix, poll.seq, poll.captured_at, sets, now, effects);
             if !skipped.is_empty() {
                 let text = format!("{}: {} sets skipped in conversion", poll.bracket.0, skipped.len());
                 state.notice(now, NoticeLevel::Error, text);
@@ -847,7 +863,15 @@ fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, _effects
     }
 }
 
-fn apply_snapshot(state: &mut AppState, ix: usize, seq: u64, captured_at: UnixMillis, mut sets: Vec<LiveSet>, now: UnixMillis) {
+fn apply_snapshot(
+    state: &mut AppState,
+    ix: usize,
+    seq: u64,
+    captured_at: UnixMillis,
+    mut sets: Vec<LiveSet>,
+    now: UnixMillis,
+    effects: &mut UpdateEffects,
+) {
     let bracket_id = state.brackets[ix].state.id.clone();
     let dropped = apply_tearing_guard(&mut state.brackets[ix], &mut sets);
     if dropped > 0 {
@@ -894,7 +918,40 @@ fn apply_snapshot(state: &mut AppState, ix: usize, seq: u64, captured_at: UnixMi
 
     ingest_deviations(state, ix, &prev, now);
     stamp_ready(state, ix, now);
+    release_held_writes(state, ix, captured_at, now, effects);
     state.dirty = true;
+}
+
+/// The flush discipline's release half: a successful poll for an event
+/// revalidates that event's reconnect-held intents against the fresh
+/// snapshot — moot targets (vanished, already completed) drop with a notice,
+/// live ones re-queue to the writer. The strictly-newer guard means an intent
+/// created after this snapshot was captured keeps waiting.
+fn release_held_writes(state: &mut AppState, ix: usize, captured_at: UnixMillis, now: UnixMillis, effects: &mut UpdateEffects) {
+    let bracket_id = state.brackets[ix].state.id.clone();
+    let (candidates, still_held): (Vec<WriteIntent>, Vec<WriteIntent>) = std::mem::take(&mut state.held_writes)
+        .into_iter()
+        .partition(|i| i.bracket == bracket_id && captured_at > i.created_at);
+    state.held_writes = still_held;
+
+    for intent in candidates {
+        let target = state.brackets[ix].state.sets.iter().find(|s| s.key == intent.key);
+        let moot = match target {
+            None => Some("its set vanished"),
+            Some(set) if set.is_completed() => Some("the set already completed"),
+            Some(_) => None,
+        };
+        if let Some(reason) = moot {
+            state.pending_writes.retain(|p| p.intent != intent);
+            let text = format!("dropped held write {:?} for set {}: {reason}", intent.kind, intent.id);
+            state.notice(now, NoticeLevel::Warn, text);
+            continue;
+        }
+        if let Some(pending) = state.pending_writes.iter_mut().find(|p| p.intent == intent) {
+            pending.status = PendingStatus::Queued;
+        }
+        effects.writes.push(intent);
+    }
 }
 
 /// The tearing guard: a set present last cycle but missing from this
@@ -1003,6 +1060,20 @@ fn handle_write_result(state: &mut AppState, result: WriteResult, now: UnixMilli
             if let Some(pending) = state.pending_writes.iter_mut().find(|p| p.intent == intent) {
                 pending.attempts = attempts;
                 pending.last_error = Some(error);
+            }
+        }
+        WriteOutcome::AwaitReconnect { error } => {
+            if let Some(pending) = state.pending_writes.iter_mut().find(|p| p.intent == intent) {
+                pending.status = PendingStatus::AwaitingReconnect;
+                pending.last_error = Some(error);
+            }
+            let text = format!(
+                "write {:?} for set {} held until {} polls again",
+                intent.kind, intent.id, intent.bracket.0
+            );
+            state.notice(now, NoticeLevel::Warn, text);
+            if !state.held_writes.contains(&intent) {
+                state.held_writes.push(intent);
             }
         }
         WriteOutcome::Terminal { error } => {
@@ -1655,6 +1726,59 @@ mod tests {
         );
         assert!(state.notices.iter().any(|n| n.text.contains("removed server-side")));
         assert_eq!(state.world.queue.len(), 1);
+    }
+
+    #[test]
+    fn reconnect_held_write_releases_on_fresh_poll_and_drops_when_moot() {
+        let mut state = se4_app(true);
+        let effects = call_top_candidate(&mut state, '1');
+        let intent = effects.writes[0].clone();
+
+        // Writer reports a connectivity failure: the intent is held.
+        update(
+            &mut state,
+            Msg::Write(WriteResult {
+                intent: intent.clone(),
+                outcome: WriteOutcome::AwaitReconnect {
+                    error: "request timed out".to_owned(),
+                },
+            }),
+            NOW + 1000,
+        );
+        assert_eq!(state.held_writes.len(), 1);
+        assert!(state
+            .pending_writes
+            .iter()
+            .any(|p| p.status == PendingStatus::AwaitingReconnect));
+
+        // A successful poll of the target's event (newer than the intent)
+        // revalidates and re-releases it to the writer.
+        let sets = state.brackets[0].state.sets.clone();
+        let effects = update(&mut state, snapshot_msg("ultimate", 1, sets), NOW + 30_000);
+        assert_eq!(effects.writes, vec![intent.clone()]);
+        assert!(state.held_writes.is_empty());
+        assert!(state.pending_writes.iter().all(|p| p.status == PendingStatus::Queued));
+
+        // Held again, but this time the set completes remotely before the
+        // poll: the intent is moot and drops with a notice.
+        update(
+            &mut state,
+            Msg::Write(WriteResult {
+                intent: intent.clone(),
+                outcome: WriteOutcome::AwaitReconnect {
+                    error: "request timed out".to_owned(),
+                },
+            }),
+            NOW + 31_000,
+        );
+        let mut next = state.brackets[0].state.sets.clone();
+        let ix = next.iter().position(|s| s.key == intent.key).unwrap();
+        complete(&mut next[ix], 0, NOW / 1000 + 600);
+        let effects = update(&mut state, snapshot_msg("ultimate", 2, next), NOW + 60_000);
+        assert!(effects.writes.is_empty(), "moot intent must not re-send");
+        assert!(state.held_writes.is_empty());
+        assert!(state.pending_writes.is_empty(), "moot intent dropped from pending");
+        assert!(state.notices.iter().any(|n| n.text.contains("dropped held write")));
     }
 
     #[test]

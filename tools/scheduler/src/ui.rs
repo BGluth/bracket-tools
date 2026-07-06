@@ -218,7 +218,9 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMil
         ));
     }
 
-    let queued = state.pending_writes.iter().filter(|p| p.status == PendingStatus::Queued).count();
+    // Reconnect-held writes count as pending — they are in flight from the
+    // TO's point of view, just waiting on the network.
+    let queued = state.pending_writes.iter().filter(|p| p.status != PendingStatus::Parked).count();
     let parked = state.pending_writes.iter().filter(|p| p.status == PendingStatus::Parked).count();
     if queued + parked > 0 {
         let style = if parked > 0 {

@@ -12,10 +12,15 @@
 //! the payload is stamped by the mutation itself, so server time minus the
 //! local send/receive midpoint is a one-RTT-tight offset sample.
 //!
-//! TODO(S4): flush discipline — hold an intent until its event has a
-//! successful poll newer than the intent (reconnect safety); today intents
-//! flush immediately in arrival order. Limiter headroom priority over the
-//! poller is likewise S4.
+//! Flush discipline: a connectivity-class failure (offline, request timeout)
+//! doesn't burn retry attempts — the intent goes back to the app as
+//! AwaitReconnect and is re-released only once its target event polls
+//! successfully again (revalidated there against the fresh snapshot). 429/5xx
+//! server trouble keeps the bounded in-writer backoff, then parks visibly.
+//!
+//! TODO(S4): limiter headroom priority for mutations over poll pages — the
+//! shared governor lives inside GGProvider today, so both paths contend
+//! equally; acceptable for FBR volumes.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -51,14 +56,17 @@ impl Default for WriterConfig {
 }
 
 enum AttemptFailure {
+    /// Offline / timed out: hand back to the app until the event polls again.
+    Connectivity(String),
+    /// Server trouble (429/5xx): bounded in-writer retries.
     Retryable(String),
     Definitive(String),
 }
 
 /// Consumes intents until the channel closes. Every intent ends in exactly
-/// one Success/Terminal result; each failed retryable attempt additionally
-/// reports a Transient result (the pending view shows liveness, not
-/// silence).
+/// one Success/Terminal/AwaitReconnect result; each failed retryable attempt
+/// additionally reports a Transient result (the pending view shows liveness,
+/// not silence).
 pub async fn run_writer<S, F>(
     source: &S,
     config: WriterConfig,
@@ -76,6 +84,7 @@ pub async fn run_writer<S, F>(
             match write_attempt(source, &intent, config.request_timeout, &classify).await {
                 Ok((payload, offset)) => break WriteOutcome::Success { payload, offset },
                 Err(AttemptFailure::Definitive(error)) => break WriteOutcome::Terminal { error },
+                Err(AttemptFailure::Connectivity(error)) => break WriteOutcome::AwaitReconnect { error },
                 Err(AttemptFailure::Retryable(error)) => {
                     if attempts >= config.max_attempts {
                         break WriteOutcome::Terminal {
@@ -118,9 +127,10 @@ where
     };
     let sent_at = now_millis();
     match timeout(request_timeout, mutation).await {
-        Err(_elapsed) => Err(AttemptFailure::Retryable("request timed out".to_owned())),
+        Err(_elapsed) => Err(AttemptFailure::Connectivity("request timed out".to_owned())),
         Ok(Err(error)) => match classify(&error) {
-            PollFailure::Offline | PollFailure::Transient => Err(AttemptFailure::Retryable(error.to_string())),
+            PollFailure::Offline => Err(AttemptFailure::Connectivity(error.to_string())),
+            PollFailure::Transient => Err(AttemptFailure::Retryable(error.to_string())),
             PollFailure::Persistent(msg) => Err(AttemptFailure::Definitive(msg)),
         },
         Ok(Ok(payload)) => {
@@ -329,7 +339,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn hung_mutations_time_out_and_eventually_park() {
+    async fn hung_mutations_hand_back_for_reconnect() {
         let source = FlakySource {
             failures_before_success: 0,
             calls: AtomicU32::new(0),
@@ -338,10 +348,29 @@ mod tests {
         };
         let outcomes = drive(source, classify, intent(WriteKind::Called)).await;
 
-        let Some(WriteOutcome::Terminal { error }) = outcomes.last() else {
-            panic!("expected terminal park: {outcomes:?}");
+        // A hang is connectivity-class: one timeout, no burned attempts, the
+        // intent goes back to the app to await its event's next poll.
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        let WriteOutcome::AwaitReconnect { error } = &outcomes[0] else {
+            panic!("expected reconnect hand-back: {outcomes:?}");
         };
-        assert!(error.contains("gave up after 3 attempts"), "{error}");
-        assert_eq!(outcomes.len(), 3, "two transient reports then the park");
+        assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn offline_classified_errors_hand_back_for_reconnect() {
+        fn offline(_: &FixtureError) -> PollFailure {
+            PollFailure::Offline
+        }
+        let source = FlakySource {
+            failures_before_success: u32::MAX,
+            calls: AtomicU32::new(0),
+            hang: false,
+            server_started_at: None,
+        };
+        let outcomes = drive(source, offline, intent(WriteKind::Called)).await;
+
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        assert!(matches!(&outcomes[0], WriteOutcome::AwaitReconnect { .. }));
     }
 }
