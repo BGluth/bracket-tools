@@ -7,6 +7,7 @@ pub mod fixture_source;
 pub mod graph;
 pub mod model;
 pub mod poller;
+pub mod preflight;
 pub mod ranker;
 pub mod rollout;
 pub mod set_source;
