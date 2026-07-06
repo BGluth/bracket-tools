@@ -165,6 +165,10 @@ pub struct BracketRuntime {
     pub last_good_poll: Option<UnixMillis>,
     pub consecutive_failures: u32,
     pub health: PollHealth,
+    /// Tearing guard: sets that vanished from the last successful snapshot,
+    /// carried forward one grace cycle before being dropped for real (a torn
+    /// paginated fetch can miss a set that still exists).
+    suspects: HashSet<SetKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +284,7 @@ impl AppState {
                     last_good_poll: Some(now_millis),
                     consecutive_failures: 0,
                     health: PollHealth::Ok,
+                    suspects: HashSet::new(),
                 }
             })
             .collect();
@@ -821,8 +826,13 @@ fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, _effects
     }
 }
 
-fn apply_snapshot(state: &mut AppState, ix: usize, seq: u64, captured_at: UnixMillis, sets: Vec<LiveSet>, now: UnixMillis) {
+fn apply_snapshot(state: &mut AppState, ix: usize, seq: u64, captured_at: UnixMillis, mut sets: Vec<LiveSet>, now: UnixMillis) {
     let bracket_id = state.brackets[ix].state.id.clone();
+    let dropped = apply_tearing_guard(&mut state.brackets[ix], &mut sets);
+    if dropped > 0 {
+        let text = format!("{}: {dropped} set(s) removed server-side (absent two polls)", bracket_id.0);
+        state.notice(now, NoticeLevel::Warn, text);
+    }
     let prev = std::mem::replace(&mut state.brackets[ix].state.sets, sets);
     {
         let runtime = &mut state.brackets[ix];
@@ -863,6 +873,30 @@ fn apply_snapshot(state: &mut AppState, ix: usize, seq: u64, captured_at: UnixMi
     ingest_deviations(state, ix, &prev, now);
     stamp_ready(state, ix, now);
     state.dirty = true;
+}
+
+/// The tearing guard: a set present last cycle but missing from this
+/// otherwise-successful snapshot is carried forward once (as a suspect); only
+/// a second consecutive absence lets it drop. A reappearing set clears its
+/// suspicion naturally (this cycle's absences rebuild the suspect list).
+/// Returns how many sets were dropped for real.
+fn apply_tearing_guard(runtime: &mut BracketRuntime, sets: &mut Vec<LiveSet>) -> usize {
+    let incoming: HashSet<&SetKey> = sets.iter().map(|s| &s.key).collect();
+    let mut retained = Vec::new();
+    let mut dropped = 0;
+    for old in &runtime.state.sets {
+        if incoming.contains(&old.key) {
+            continue;
+        }
+        if runtime.suspects.contains(&old.key) {
+            dropped += 1;
+        } else {
+            retained.push(old.clone());
+        }
+    }
+    runtime.suspects = retained.iter().map(|s| s.key.clone()).collect();
+    sets.extend(retained);
+    dropped
 }
 
 /// A set the server reports finished releases its station automatically.
@@ -1561,6 +1595,34 @@ mod tests {
         assert_eq!(state.board.setups()[0].status, SetupStatus::Free, "result arrival frees the setup");
         assert_eq!(state.durations.sample_count(&BracketId(slug.to_owned())), 1);
         assert_eq!(state.world.queue.len(), 1, "B still callable; the final waits on B");
+    }
+
+    #[test]
+    fn tearing_guard_retains_vanished_set_for_one_cycle() {
+        let mut state = se4_app(false);
+        let full = state.brackets[0].state.sets.clone();
+        let victim = full[0].key.clone();
+        let torn: Vec<LiveSet> = full.iter().filter(|s| s.key != victim).cloned().collect();
+
+        // A single torn snapshot doesn't lose the set.
+        update(&mut state, snapshot_msg("ultimate", 1, torn.clone()), NOW + 30_000);
+        assert!(state.brackets[0].state.sets.iter().any(|s| s.key == victim), "retained one cycle");
+        assert_eq!(state.world.queue.len(), 2, "retained set still ranks");
+
+        // Reappearing clears the suspicion.
+        update(&mut state, snapshot_msg("ultimate", 2, full.clone()), NOW + 60_000);
+        assert!(state.brackets[0].state.sets.iter().any(|s| s.key == victim));
+
+        // Two consecutive absences drop it for real, with one aggregate notice.
+        update(&mut state, snapshot_msg("ultimate", 3, torn.clone()), NOW + 90_000);
+        assert!(state.brackets[0].state.sets.iter().any(|s| s.key == victim), "first absence: suspect");
+        update(&mut state, snapshot_msg("ultimate", 4, torn), NOW + 120_000);
+        assert!(
+            !state.brackets[0].state.sets.iter().any(|s| s.key == victim),
+            "second absence: gone"
+        );
+        assert!(state.notices.iter().any(|n| n.text.contains("removed server-side")));
+        assert_eq!(state.world.queue.len(), 1);
     }
 
     #[test]

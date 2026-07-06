@@ -6,8 +6,9 @@
 //! bounded concurrency and a per-request timeout, so one wedged event costs
 //! its timeout, not the cycle.
 //!
-//! TODO(S4): tearing guard — retain a set that vanished from one successful
-//! fetch as suspect for a cycle before destructive reconciliation.
+//! The tearing guard (retain a set that vanished from one successful fetch
+//! for a grace cycle) lives app-side in `apply_snapshot`, where the previous
+//! snapshot already exists to diff against.
 
 use std::{
     collections::HashSet,
