@@ -239,7 +239,7 @@ mod tests {
                     (id.clone(), graph)
                 })
                 .collect();
-            let graph_refs: Vec<_> = graphs.iter().map(|(id, g)| (id, g)).collect();
+            let graph_refs: Vec<_> = graphs.iter().collect();
             let remaining = aggregate_remaining(&graph_refs, &aliases);
 
             let ctx = RankContext {
