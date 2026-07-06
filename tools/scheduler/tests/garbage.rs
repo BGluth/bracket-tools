@@ -198,22 +198,26 @@ fn adversarial_snapshot_survives_the_full_pipeline() {
 fn empty_snapshot_after_data_is_tolerated() {
     let bracket = make_de_bracket(77, 8);
     let mut state = app_with(bracket.sets.clone(), &bracket);
-
-    update(
-        &mut state,
+    let empty_snapshot = |seq: u64| {
         Msg::Poll(PollResult {
             bracket: BracketId("garbage".to_owned()),
-            seq: 1,
-            captured_at: NOW,
+            seq,
+            captured_at: NOW + seq as i64 * 1000,
             outcome: PollOutcome::Snapshot {
                 sets: Vec::new(),
                 warnings: Vec::new(),
                 skipped: Vec::new(),
             },
-        }),
-        NOW + 1000,
-    );
+        })
+    };
 
+    // One empty snapshot: the tearing guard retains every set for a grace
+    // cycle, so nothing vanishes off the queue yet.
+    update(&mut state, empty_snapshot(1), NOW + 1000);
+    assert!(!state.world.queue.is_empty(), "sets retained one cycle");
+
+    // A second consecutive empty snapshot drops them for real.
+    update(&mut state, empty_snapshot(2), NOW + 2000);
     assert!(state.world.queue.is_empty());
     render(&state);
 }

@@ -133,9 +133,10 @@ impl DurationModel {
     }
 
     /// Ingests one completed set. `called_at` is our local call time (unix
-    /// millis) and `offset_secs` the estimated call→start lag, used only when
-    /// the server never saw a start. Returns whether a sample was added or
-    /// replaced.
+    /// millis) and `offset_secs` the estimated server-clock offset
+    /// (server − local), used to convert `called_at` into the server domain
+    /// when the server never saw a start. Returns whether a sample was added
+    /// or replaced.
     pub fn ingest(
         &mut self,
         bracket: &BracketId,

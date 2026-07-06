@@ -8,13 +8,16 @@
 //! failures retry with linear backoff up to a cap, definitive failures park
 //! immediately (the app keeps them visible for the TO).
 //!
+//! Successful mutations also bracket the server-clock offset: `startedAt` in
+//! the payload is stamped by the mutation itself, so server time minus the
+//! local send/receive midpoint is a one-RTT-tight offset sample.
+//!
 //! TODO(S4): flush discipline — hold an intent until its event has a
 //! successful poll newer than the intent (reconnect safety); today intents
 //! flush immediately in arrival order. Limiter headroom priority over the
-//! poller is likewise S4, as is the clock-offset estimate from mutation
-//! responses.
+//! poller is likewise S4.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bracket_tools_startgg::SetMutationResult;
 use tokio::{
@@ -23,7 +26,8 @@ use tokio::{
 };
 
 use crate::{
-    app::{Msg, PollFailure, WriteIntent, WriteKind, WriteOutcome, WriteResult},
+    app::{Msg, OffsetSample, PollFailure, WriteIntent, WriteKind, WriteOutcome, WriteResult},
+    conflict::UnixMillis,
     set_source::SetSource,
 };
 
@@ -70,7 +74,7 @@ pub async fn run_writer<S, F>(
         let outcome = loop {
             attempts += 1;
             match write_attempt(source, &intent, config.request_timeout, &classify).await {
-                Ok(payload) => break WriteOutcome::Success(payload),
+                Ok((payload, offset)) => break WriteOutcome::Success { payload, offset },
                 Err(AttemptFailure::Definitive(error)) => break WriteOutcome::Terminal { error },
                 Err(AttemptFailure::Retryable(error)) => {
                     if attempts >= config.max_attempts {
@@ -101,7 +105,7 @@ async fn write_attempt<S, F>(
     intent: &WriteIntent,
     request_timeout: Duration,
     classify: &F,
-) -> Result<SetMutationResult, AttemptFailure>
+) -> Result<(SetMutationResult, Option<OffsetSample>), AttemptFailure>
 where
     S: SetSource,
     F: Fn(&S::Error) -> PollFailure,
@@ -112,14 +116,32 @@ where
             WriteKind::InProgress => source.mark_in_progress(intent.id).await,
         }
     };
+    let sent_at = now_millis();
     match timeout(request_timeout, mutation).await {
         Err(_elapsed) => Err(AttemptFailure::Retryable("request timed out".to_owned())),
         Ok(Err(error)) => match classify(&error) {
             PollFailure::Offline | PollFailure::Transient => Err(AttemptFailure::Retryable(error.to_string())),
             PollFailure::Persistent(msg) => Err(AttemptFailure::Definitive(msg)),
         },
-        Ok(Ok(payload)) => Ok(payload),
+        Ok(Ok(payload)) => {
+            let offset = offset_sample(&payload, sent_at, now_millis());
+            Ok((payload, offset))
+        }
     }
+}
+
+/// `startedAt` (server seconds) minus the local send/receive midpoint. None
+/// when the payload carried no server timestamp.
+fn offset_sample(payload: &SetMutationResult, sent_at: UnixMillis, received_at: UnixMillis) -> Option<OffsetSample> {
+    let started = payload.started_at.as_ref()?;
+    Some(OffsetSample {
+        offset_secs: started.0 - (sent_at + received_at) / 2 / 1000,
+        at: received_at,
+    })
+}
+
+fn now_millis() -> UnixMillis {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]
@@ -131,7 +153,7 @@ mod tests {
     };
 
     use bracket_tools_startgg::{SetMutationResult, StartGgId};
-    use bracket_tools_startgg_schema::{get_event_structure, get_sets_for_event};
+    use bracket_tools_startgg_schema::{get_event_structure, get_sets_for_event, scalars::Timestamp};
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::{run_writer, WriterConfig};
@@ -175,6 +197,7 @@ mod tests {
         failures_before_success: u32,
         calls: AtomicU32,
         hang: bool,
+        server_started_at: Option<i64>,
     }
 
     impl SetSource for FlakySource {
@@ -199,7 +222,7 @@ mod tests {
                 Ok(SetMutationResult {
                     id: Some(set_id),
                     state: Some(6),
-                    started_at: None,
+                    started_at: self.server_started_at.map(Timestamp),
                     completed_at: None,
                 })
             }
@@ -237,13 +260,39 @@ mod tests {
         run_writer(&source, test_config(), classify, tx, intent_rx).await;
 
         let Some(Msg::Write(first)) = rx.recv().await else { panic!() };
-        let WriteOutcome::Success(payload) = first.outcome else {
+        let WriteOutcome::Success { payload, .. } = first.outcome else {
             panic!("expected success: {:?}", first.outcome);
         };
         assert_eq!(payload.state, Some(6));
         let Some(Msg::Write(second)) = rx.recv().await else { panic!() };
-        assert!(matches!(second.outcome, WriteOutcome::Success(_)));
+        assert!(matches!(second.outcome, WriteOutcome::Success { .. }));
         assert_eq!(source.mutation_log().len(), 2, "both mutations reached the source in order");
+    }
+
+    #[tokio::test]
+    async fn success_with_started_at_brackets_a_clock_offset() {
+        // Server clock reads 100s ahead of ours.
+        let ahead = 100i64;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let source = FlakySource {
+            failures_before_success: 0,
+            calls: AtomicU32::new(0),
+            hang: false,
+            server_started_at: Some(now_secs + ahead),
+        };
+        let outcomes = drive(source, classify, intent(WriteKind::Called)).await;
+
+        let Some(WriteOutcome::Success { offset: Some(sample), .. }) = outcomes.last() else {
+            panic!("expected a success with an offset sample: {outcomes:?}");
+        };
+        assert!(
+            (sample.offset_secs - ahead).abs() <= 5,
+            "offset ≈ +{ahead}s, got {}",
+            sample.offset_secs
+        );
     }
 
     #[tokio::test]
@@ -252,6 +301,7 @@ mod tests {
             failures_before_success: u32::MAX,
             calls: AtomicU32::new(0),
             hang: false,
+            server_started_at: None,
         };
         let outcomes = drive(source, classify, intent(WriteKind::Called)).await;
 
@@ -268,13 +318,14 @@ mod tests {
             failures_before_success: 2,
             calls: AtomicU32::new(0),
             hang: false,
+            server_started_at: None,
         };
         let outcomes = drive(source, transient, intent(WriteKind::Called)).await;
 
         assert_eq!(outcomes.len(), 3, "{outcomes:?}");
         assert!(matches!(outcomes[0], WriteOutcome::Transient { attempts: 1, .. }));
         assert!(matches!(outcomes[1], WriteOutcome::Transient { attempts: 2, .. }));
-        assert!(matches!(outcomes[2], WriteOutcome::Success(_)));
+        assert!(matches!(outcomes[2], WriteOutcome::Success { .. }));
     }
 
     #[tokio::test(start_paused = true)]
@@ -283,6 +334,7 @@ mod tests {
             failures_before_success: 0,
             calls: AtomicU32::new(0),
             hang: true,
+            server_started_at: None,
         };
         let outcomes = drive(source, classify, intent(WriteKind::Called)).await;
 

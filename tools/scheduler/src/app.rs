@@ -93,7 +93,12 @@ pub struct WriteResult {
 
 #[derive(Debug)]
 pub enum WriteOutcome {
-    Success(SetMutationResult),
+    Success {
+        payload: SetMutationResult,
+        /// Server-clock offset observed on this round trip, when the payload
+        /// carried a server timestamp.
+        offset: Option<OffsetSample>,
+    },
     /// Still being retried by the writer; informational.
     Transient {
         error: String,
@@ -103,6 +108,17 @@ pub enum WriteOutcome {
     Terminal {
         error: String,
     },
+}
+
+/// One server-clock offset observation, bracketed from a mutation round trip
+/// (`started_at` is stamped by the mutation itself, so server time minus the
+/// local send/receive midpoint is one-RTT tight).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OffsetSample {
+    /// `server_seconds - local_seconds` at the sample instant.
+    pub offset_secs: i64,
+    /// When the sample was taken (local millis) — drives the status-line age.
+    pub at: UnixMillis,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +265,10 @@ pub struct AppState {
     pub durations: DurationModel,
     pub pending_writes: Vec<PendingWrite>,
     pub notices: VecDeque<Notice>,
+    /// Latest server-clock offset estimate (from mutation round trips);
+    /// retained until a fresher sample replaces it. Not persisted — clocks
+    /// drift and a restart re-estimates on the first write.
+    pub clock_offset: Option<OffsetSample>,
     no_show_alerted: HashSet<(BracketId, SetKey)>,
 
     pub world: World,
@@ -306,6 +326,7 @@ impl AppState {
             durations,
             pending_writes: Vec::new(),
             notices: VecDeque::new(),
+            clock_offset: None,
             no_show_alerted: HashSet::new(),
             world: World::default(),
             dirty: false,
@@ -852,7 +873,8 @@ fn apply_snapshot(state: &mut AppState, ix: usize, seq: u64, captured_at: UnixMi
             .find(|g| g.id == completed.key.phase_group)
             .and_then(|g| g.best_of_by_round.get(&completed.key.round).copied());
         let called_at = state.called_at.get(&(bracket_id.clone(), completed.key.clone())).copied();
-        state.durations.ingest(&bracket_id, completed, best_of, called_at, 0);
+        let offset_secs = state.clock_offset.map_or(0, |s| s.offset_secs);
+        state.durations.ingest(&bracket_id, completed, best_of, called_at, offset_secs);
     }
     for (key, at) in &diff.last_completed {
         let entry = state.last_completed.entry(key.clone()).or_insert(*at);
@@ -966,12 +988,15 @@ fn stamp_ready(state: &mut AppState, ix: usize, now: UnixMillis) {
 fn handle_write_result(state: &mut AppState, result: WriteResult, now: UnixMillis) {
     let intent = result.intent;
     match result.outcome {
-        WriteOutcome::Success(remote) => {
+        WriteOutcome::Success { payload, offset } => {
             state.pending_writes.retain(|p| p.intent != intent);
-            if let Some(new_int) = remote.state {
+            if let Some(new_int) = payload.state {
                 learn_state_int(state, intent.kind, new_int, now);
             }
-            merge_remote_set(state, &intent, &remote);
+            if offset.is_some() {
+                state.clock_offset = offset;
+            }
+            merge_remote_set(state, &intent, &payload);
             state.dirty = true;
         }
         WriteOutcome::Transient { error, attempts } => {
@@ -1419,22 +1444,29 @@ mod tests {
         let effects = call_top_candidate(&mut state, '1');
         let intent = effects.writes[0].clone();
 
-        // Success teaches an unseen int.
+        // Success teaches an unseen int and lands the offset sample.
         update(
             &mut state,
             Msg::Write(WriteResult {
                 intent: intent.clone(),
-                outcome: WriteOutcome::Success(SetMutationResult {
-                    id: Some(intent.id),
-                    state: Some(42),
-                    started_at: None,
-                    completed_at: None,
-                }),
+                outcome: WriteOutcome::Success {
+                    payload: SetMutationResult {
+                        id: Some(intent.id),
+                        state: Some(42),
+                        started_at: None,
+                        completed_at: None,
+                    },
+                    offset: Some(super::OffsetSample {
+                        offset_secs: 3,
+                        at: NOW + 900,
+                    }),
+                },
             }),
             NOW + 1000,
         );
         assert!(state.called_ints.contains(&42));
         assert!(state.pending_writes.is_empty());
+        assert_eq!(state.clock_offset.map(|s| s.offset_secs), Some(3));
         // The local set mirrors the confirmed state int.
         let set = state.find_set(&intent.bracket, &intent.key).unwrap();
         assert_eq!(set.state_int, Some(42));

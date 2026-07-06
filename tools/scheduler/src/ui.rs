@@ -203,6 +203,21 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMil
         fmt_age(oldest)
     )));
 
+    if let Some(sample) = state.clock_offset {
+        let age = now - sample.at;
+        // The skew warning only fires on a fresh estimate — a stale one just
+        // reports with its age.
+        let style = if sample.offset_secs.abs() > 60 && age < 5 * 60 * 1000 {
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(
+            format!("│ offset {:+}s ({}) ", sample.offset_secs, fmt_age(age)),
+            style,
+        ));
+    }
+
     let queued = state.pending_writes.iter().filter(|p| p.status == PendingStatus::Queued).count();
     let parked = state.pending_writes.iter().filter(|p| p.status == PendingStatus::Parked).count();
     if queued + parked > 0 {
