@@ -387,8 +387,8 @@ fn collapse(sets: &mut [ProtoSet]) -> Vec<bool> {
             omitted[i] = true;
             changed = true;
 
-            for j in 0..sets.len() {
-                for slot in &mut sets[j].slots {
+            for set_proto in sets.iter_mut() {
+                for slot in &mut set_proto.slots {
                     let Source::FromSet { set, placement } = slot.source else {
                         continue;
                     };

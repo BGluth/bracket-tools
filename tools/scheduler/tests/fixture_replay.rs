@@ -6,7 +6,10 @@
 //! `~/work/personal/bracket-tools-captures/2026-07-05_s1_smoke`) and skip
 //! with a message when the directory is absent.
 
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use bracket_tools_scheduler::{
     config::{BracketMode, SetupId},
@@ -36,7 +39,7 @@ fn captures_dir() -> Option<PathBuf> {
 
 /// Replays one event's captured pages + structure through the conversion
 /// layer, asserting zero skipped sets along the way.
-fn load_event(dir: &PathBuf, event: &str) -> (Vec<LiveSet>, Vec<PhaseGroupInfo>) {
+fn load_event(dir: &Path, event: &str) -> (Vec<LiveSet>, Vec<PhaseGroupInfo>) {
     let event_dir = dir.join(event);
 
     let mut schema_sets = Vec::new();

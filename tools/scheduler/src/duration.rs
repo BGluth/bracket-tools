@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(diff.completed[0].completed_at, T0 + 600);
         assert_eq!(diff.results_arrived, vec![next[0].key.clone()]);
         // Both R1 occupants get last-completed updates, in millis.
-        let mut keys: Vec<_> = diff.last_completed.iter().cloned().collect();
+        let mut keys = diff.last_completed.to_vec();
         keys.sort();
         assert_eq!(
             keys,
