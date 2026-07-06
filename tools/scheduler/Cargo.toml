@@ -30,3 +30,7 @@ tracing-subscriber = { workspace = true }
 # crossterm's `event-stream` feature is intentionally not needed.
 crossterm = { workspace = true }
 ratatui = { workspace = true }
+
+[dev-dependencies]
+# Virtual-time tests (start_paused) for the poller loop.
+tokio = { workspace = true, features = ["test-util"] }

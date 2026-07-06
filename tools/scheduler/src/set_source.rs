@@ -60,28 +60,5 @@ impl SetSource for StartggSource {
     }
 }
 
-/// Polling-loop stub; S3 grows this into the real snapshot poller.
-pub async fn poller<S: SetSource>(source: S, event_slug: String) {
-    let _ = source.fetch_event_sets(&event_slug).await;
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use bracket_tools_startgg::{types::GGRestToken, GGProvider};
-
-    use super::{poller, StartggSource};
-
-    /// The S1 blocking item: `tokio::spawn` requires a `Send` future, so this
-    /// compiling at all proves the whole poller → SetSource → provider chain
-    /// stays `Send` with plain `async fn` in the trait (RPITIT).
-    #[tokio::test]
-    async fn poller_future_is_send() {
-        let token = GGRestToken::from_str("fake-token-for-compile-spike").unwrap();
-        let provider = GGProvider::builder(token).build().unwrap();
-
-        let handle = tokio::spawn(poller(StartggSource::new(provider), "tournament/x/event/y".to_string()));
-        handle.abort();
-    }
-}
+// The real poll loop lives in `crate::poller` (S3); its Send spike over this
+// source is `poller::tests::live_poller_future_is_send`.
