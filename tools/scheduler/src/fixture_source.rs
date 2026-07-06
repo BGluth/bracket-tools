@@ -16,7 +16,7 @@ use std::{
     sync::Mutex,
 };
 
-use bracket_tools_startgg::{SetMutationResult, StartGgId};
+use bracket_tools_startgg::{AdminProbeResult, SetMutationResult, StartGgId};
 use bracket_tools_startgg_schema::{
     enums::{ActivityState, BracketType},
     get_event_structure, get_sets_for_event,
@@ -91,6 +91,9 @@ struct EventFixture {
 pub struct FixtureSource {
     events: Mutex<HashMap<String, EventFixture>>,
     mutations: Mutex<Vec<MutationRecord>>,
+    /// Scripted admin-probe answer; unset answers as a full admin (id 1) so
+    /// writes-armed fixtures keep working.
+    admin_probe: Mutex<Option<AdminProbeResult>>,
 }
 
 impl FixtureSource {
@@ -163,6 +166,11 @@ impl FixtureSource {
     /// Every write answered so far, in arrival order.
     pub fn mutation_log(&self) -> Vec<MutationRecord> {
         self.mutations.lock().unwrap().clone()
+    }
+
+    /// Scripts the admin probe's answer (e.g. a non-admin token).
+    pub fn set_admin_probe(&mut self, result: AdminProbeResult) {
+        *self.admin_probe.get_mut().unwrap() = Some(result);
     }
 
     fn load_capture_event(&mut self, event_dir: &Path, name: &str) -> Result<(), FixtureLoadError> {
@@ -251,6 +259,13 @@ impl SetSource for FixtureSource {
 
     async fn mark_in_progress(&self, set_id: StartGgId) -> Result<SetMutationResult, FixtureError> {
         Ok(self.record_mutation(MutationKind::InProgress, set_id, FIXTURE_IN_PROGRESS_INT))
+    }
+
+    async fn probe_admin(&self, _tournament_id: StartGgId) -> Result<AdminProbeResult, FixtureError> {
+        Ok(self.admin_probe.lock().unwrap().clone().unwrap_or(AdminProbeResult {
+            current_user: Some(1),
+            admins: Some(vec![1]),
+        }))
     }
 }
 
@@ -349,7 +364,9 @@ pub fn schema_structure_from_groups(event_slug: &str, groups: &[PhaseGroupInfo],
         state: Some(ActivityState::Active),
         start_at: None,
         tournament: Some(get_event_structure::Tournament {
-            id: Some(Id::new(tournament_slug.clone())),
+            // Live tournament ids are numeric (the admin probe parses them),
+            // so the synthetic id is a stable hash of the slug.
+            id: Some(Id::new(synth_tournament_id(&tournament_slug).to_string())),
             slug: Some(tournament_slug),
         }),
         phases: Some(vec![Some(get_event_structure::Phase {
@@ -359,6 +376,16 @@ pub fn schema_structure_from_groups(event_slug: &str, groups: &[PhaseGroupInfo],
         phase_groups: Some(groups.iter().map(|g| Some(schema_phase_group(g))).collect()),
         num_entrants: Some(num_entrants),
     }
+}
+
+/// FNV-1a over the slug: deterministic, distinct per tournament.
+fn synth_tournament_id(slug: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in slug.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn schema_phase_group(info: &PhaseGroupInfo) -> get_event_structure::PhaseGroup {

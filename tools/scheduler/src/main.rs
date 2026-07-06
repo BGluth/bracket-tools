@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run<S, F>(cli: Cli, config: SchedulerConfig, source: Arc<S>, classify: F) -> anyhow::Result<()>
+async fn run<S, F>(cli: Cli, mut config: SchedulerConfig, source: Arc<S>, classify: F) -> anyhow::Result<()>
 where
     S: SetSource + Send + Sync + 'static,
     F: Fn(&S::Error) -> PollFailure + Send + Sync + Clone + 'static,
@@ -73,6 +73,12 @@ where
     }
     if cli.preflight_only {
         return Ok(());
+    }
+    // Advisor-only with no pinned CALLED int: remote-call detection is blind,
+    // so deviations escalate to soft-busy (rev-4 gap closure; the report
+    // printed the warning).
+    if report.escalate_soft_busy {
+        config.escalate_unpinned_state_deviation = true;
     }
 
     let writes_armed = report.writes_armed;

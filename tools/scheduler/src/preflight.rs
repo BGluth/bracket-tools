@@ -7,10 +7,13 @@
 //! launch the bracket empty in its configured mode (the poller keeps
 //! trying), definitive failures downgrade it to conflict-only.
 //!
-//! Admin probe: the SDK has no currentUser/admin surface yet, so S3 arms
-//! writes only when the caller asked for them AND every event preflighted
-//! clean (proof the token reads this tournament). TODO(S4): a real admin
-//! probe (tournament admins ∋ currentUser) once the SDK grows the query.
+//! Admin probe: writes arm only when the caller asked for them, every event
+//! preflighted clean, AND the tournament's admin list (an admin-only field)
+//! contains the token's user. A probe the network won't answer falls back to
+//! the fetch-success proxy with a warning; a definitive rejection or a
+//! non-admin answer disarms. Advisor-only with no pinned CALLED int
+//! additionally arms the soft-busy escalation (remote-call detection would
+//! otherwise be blind).
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -18,6 +21,7 @@ use std::{
     time::Duration,
 };
 
+use bracket_tools_startgg::StartGgId;
 use tokio::time::timeout;
 
 use crate::{
@@ -34,6 +38,12 @@ pub struct PreflightReport {
     pub tournament: Option<(String, String)>,
     pub identity_splits: Vec<IdentitySplit>,
     pub writes_armed: bool,
+    /// How the admin probe decided (rendered in the report).
+    pub admin_probe: Option<String>,
+    /// Advisor-only with no pinned CALLED int: remote-call detection is
+    /// degraded, so unpinned state-int deviations should escalate to
+    /// soft-busy. The caller applies this to the running config.
+    pub escalate_soft_busy: bool,
     /// Set when launching would be meaningless (identity mismatch, nothing
     /// reachable definitively).
     pub fatal: Option<String>,
@@ -98,14 +108,70 @@ where
         fatal = Some("no configured event preflighted successfully".to_owned());
     }
     let all_ready = brackets.iter().all(|b| matches!(b.outcome, BracketOutcome::Ready { .. }));
-    let writes_armed = arm_writes && fatal.is_none() && all_ready;
+    // The probe can only further restrict the S3 proxy (requested + every
+    // event fetched clean), never arm what the proxy wouldn't.
+    let proxy_armed = arm_writes && fatal.is_none() && all_ready;
+    let (writes_armed, admin_probe) = if proxy_armed {
+        resolve_admin_probe(source, request_timeout, &tournament, &classify).await
+    } else {
+        (false, None)
+    };
+    let escalate_soft_busy = !writes_armed && config.known_called_state_int.is_none();
 
     PreflightReport {
         brackets,
         tournament,
         identity_splits,
         writes_armed,
+        admin_probe,
+        escalate_soft_busy,
         fatal,
+    }
+}
+
+/// The writes-armed decision table, given a proxy-armed launch. Connectivity
+/// trouble keeps the proxy's answer (permission was never *denied*); a
+/// definitive rejection or a non-admin answer disarms.
+async fn resolve_admin_probe<S, F>(
+    source: &S,
+    request_timeout: Duration,
+    tournament: &Option<(String, String)>,
+    classify: &F,
+) -> (bool, Option<String>)
+where
+    S: SetSource,
+    F: Fn(&S::Error) -> PollFailure,
+{
+    let Some((raw_id, _)) = tournament else {
+        return (true, Some("no tournament id available — armed on the fetch-success proxy".to_owned()));
+    };
+    let Ok(id) = raw_id.parse::<StartGgId>() else {
+        return (
+            true,
+            Some(format!("non-numeric tournament id {raw_id:?} — armed on the fetch-success proxy")),
+        );
+    };
+    match timeout(request_timeout, source.probe_admin(id)).await {
+        Err(_elapsed) => (true, Some("admin probe timed out — armed on the fetch-success proxy".to_owned())),
+        Ok(Err(error)) => match classify(&error) {
+            PollFailure::Offline | PollFailure::Transient => (
+                true,
+                Some(format!("admin probe unreachable ({error}) — armed on the fetch-success proxy")),
+            ),
+            PollFailure::Persistent(msg) => (false, Some(format!("admin probe rejected definitively ({msg}) — advisor-only"))),
+        },
+        Ok(Ok(result)) => {
+            if result.is_admin() {
+                (true, Some("token administers this tournament — writes armed".to_owned()))
+            } else {
+                let why = match (&result.current_user, &result.admins) {
+                    (None, _) => "token carries no user identity",
+                    (_, None) => "admin list hidden from this token (not an admin)",
+                    _ => "token's user is not among the tournament admins",
+                };
+                (false, Some(format!("{why} — advisor-only")))
+            }
+        }
     }
 }
 
@@ -335,6 +401,16 @@ impl PreflightReport {
             "writes: {}",
             if self.writes_armed { "ARMED" } else { "advisor-only (disarmed)" }
         );
+        if let Some(probe) = &self.admin_probe {
+            let _ = writeln!(out, "admin probe: {probe}");
+        }
+        if self.escalate_soft_busy {
+            let _ = writeln!(
+                out,
+                "WARNING: writes disabled and no CALLED int pinned — remote-call detection degraded; \
+                 unpinned state-int deviations will escalate to soft-busy (run the web-UI capture and pin known_called_state_int)"
+            );
+        }
         for bracket in &self.brackets {
             let status = match &bracket.outcome {
                 BracketOutcome::Ready { sets, groups, .. } => {
@@ -465,6 +541,57 @@ mod tests {
             "connectivity keeps the configured mode"
         );
         assert!(!report.writes_armed, "not everything verified — stay disarmed");
+    }
+
+    #[tokio::test]
+    async fn non_admin_token_disarms_writes() {
+        let mut source = two_event_source();
+        source.set_admin_probe(bracket_tools_startgg::AdminProbeResult {
+            current_user: Some(42),
+            admins: Some(vec![1, 2]),
+        });
+        let config = config_for(&[ULTIMATE, MELEE]);
+
+        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+
+        assert!(report.fatal.is_none());
+        assert!(!report.writes_armed, "non-admin token must not arm writes");
+        assert!(report.admin_probe.as_deref().is_some_and(|p| p.contains("not among")), "{report:?}");
+        assert!(report.render().contains("advisor-only"));
+    }
+
+    #[tokio::test]
+    async fn hidden_admin_list_disarms_writes() {
+        let mut source = two_event_source();
+        source.set_admin_probe(bracket_tools_startgg::AdminProbeResult {
+            current_user: Some(42),
+            admins: None,
+        });
+        let config = config_for(&[ULTIMATE, MELEE]);
+
+        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        assert!(!report.writes_armed);
+        assert!(report.admin_probe.as_deref().is_some_and(|p| p.contains("hidden")));
+    }
+
+    #[tokio::test]
+    async fn advisor_only_without_pinned_called_int_escalates_soft_busy() {
+        let source = two_event_source();
+        let config = config_for(&[ULTIMATE, MELEE]);
+        assert_eq!(config.known_called_state_int, None);
+
+        // Not asking for writes at all: escalation still arms (detection is
+        // just as blind), and the report says so.
+        let report = preflight(&source, &config, TIMEOUT, false, classify).await;
+        assert!(!report.writes_armed);
+        assert!(report.escalate_soft_busy);
+        assert!(report.render().contains("remote-call detection degraded"));
+
+        // A pinned int quiets it.
+        let mut pinned = config_for(&[ULTIMATE, MELEE]);
+        pinned.known_called_state_int = Some(6);
+        let report = preflight(&source, &pinned, TIMEOUT, false, classify).await;
+        assert!(!report.escalate_soft_busy);
     }
 
     #[tokio::test]

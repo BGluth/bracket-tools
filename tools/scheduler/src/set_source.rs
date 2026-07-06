@@ -1,7 +1,7 @@
 use std::{error::Error, future::Future};
 
 use bracket_tools_cache::null_storage::NullStorage;
-use bracket_tools_startgg::{GGProvider, GGProviderError, SetMutationResult, StartGgId};
+use bracket_tools_startgg::{AdminProbeResult, GGProvider, GGProviderError, SetMutationResult, StartGgId};
 use bracket_tools_startgg_schema::{get_event_structure, get_sets_for_event};
 
 /// A source of live bracket data the scheduler polls and writes through.
@@ -29,6 +29,10 @@ pub trait SetSource {
 
     /// Marks a set as in progress.
     fn mark_in_progress(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + Send;
+
+    /// Probes whether the token administers the tournament (preflight's
+    /// writes-armed decision).
+    fn probe_admin(&self, tournament_id: StartGgId) -> impl Future<Output = Result<AdminProbeResult, Self::Error>> + Send;
 }
 
 /// A [`SetSource`] backed by the live start.gg API through an uncached
@@ -60,6 +64,10 @@ impl SetSource for StartggSource {
 
     async fn mark_in_progress(&self, set_id: StartGgId) -> Result<SetMutationResult, Self::Error> {
         self.provider.mark_set_in_progress(set_id).await
+    }
+
+    async fn probe_admin(&self, tournament_id: StartGgId) -> Result<AdminProbeResult, Self::Error> {
+        self.provider.fetch_admin_probe(tournament_id).await
     }
 }
 

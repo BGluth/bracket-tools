@@ -241,6 +241,10 @@ mod tests {
         async fn mark_in_progress(&self, set_id: StartGgId) -> Result<SetMutationResult, Self::Error> {
             self.mark_called(set_id).await
         }
+
+        async fn probe_admin(&self, _: StartGgId) -> Result<bracket_tools_startgg::AdminProbeResult, Self::Error> {
+            unreachable!("writer never probes")
+        }
     }
 
     async fn drive(source: FlakySource, classify: fn(&FixtureError) -> PollFailure, sent: WriteIntent) -> Vec<WriteOutcome> {
