@@ -159,6 +159,43 @@ impl SetupBoard {
     }
 }
 
+/// A per-setup pool override (the `a` reassignment): where a setup may take
+/// calls from, superseding every bracket's config pool for that setup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PoolOverride {
+    /// Only this bracket may call on the setup.
+    Dedicated(BracketId),
+    /// Any full bracket may call on the setup.
+    AllowAny,
+}
+
+/// One bracket's effective pool: config-pool setups that aren't overridden
+/// away, plus setups dedicated to this bracket or opened to all.
+pub fn effective_pool(
+    bracket: &BracketId,
+    config_pool: &[SetupId],
+    all_setups: &[SetupId],
+    overrides: &HashMap<SetupId, PoolOverride>,
+) -> Vec<SetupId> {
+    let mut pool: Vec<SetupId> = config_pool
+        .iter()
+        .filter(|s| !overrides.contains_key(s))
+        .copied()
+        .collect();
+    for setup in all_setups {
+        let extra = match overrides.get(setup) {
+            Some(PoolOverride::Dedicated(b)) => b == bracket,
+            Some(PoolOverride::AllowAny) => true,
+            None => false,
+        };
+        if extra && !pool.contains(setup) {
+            pool.push(*setup);
+        }
+    }
+    pool.sort();
+    pool
+}
+
 /// TO-set player state, keyed by canonical conflict key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlayerFlags {

@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::{
     config::{BracketMode, SetupId, SimConfig},
     conflict::{
-        aggregate_remaining, callable, callable_sets, AliasMap, BlockReason, BracketView, ConflictIndex, ConflictInputs, ConflictKey,
-        PlayerFlags, SetupBoard, SetupStatus, Tombstones, UnixMillis,
+        aggregate_remaining, callable, callable_sets, effective_pool, AliasMap, BlockReason, BracketView, ConflictIndex, ConflictInputs,
+        ConflictKey, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones, UnixMillis,
     },
     duration::DurationModel,
     graph::{BracketGraph, GraphWarning},
@@ -51,6 +51,11 @@ pub struct WorldInputs<'a> {
     /// When each set first became ready (slots filled), keyed by the
     /// swap-stable [`SetKey`]; feeds the wait-time tiebreak.
     pub callable_since: &'a HashMap<SetKey, UnixMillis>,
+    /// Per-setup reassignments (the `a` action); folded into every bracket's
+    /// effective pool here.
+    pub pool_overrides: &'a HashMap<SetupId, PoolOverride>,
+    /// Every configured station (override resolution needs the full roster).
+    pub all_setups: &'a [SetupId],
     pub rest_window_secs: u64,
     pub sim: SimConfig,
     pub now_millis: UnixMillis,
@@ -107,6 +112,9 @@ pub struct World {
     pub summaries: Vec<BracketSummary>,
     /// Latest projected finish across fully-scheduled brackets.
     pub overall_projected_finish: Option<UnixMillis>,
+    /// Setups whose every (effective-pool, full-mode) bracket is complete —
+    /// candidates for reassignment, freeing, or friendlies.
+    pub pool_exhausted: Vec<SetupId>,
     pub graph_warnings: Vec<(BracketId, GraphWarning)>,
 }
 
@@ -138,16 +146,22 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
         rest_window_secs: inputs.rest_window_secs,
         snoozes: inputs.snoozes,
     };
+    let pools: Vec<Vec<SetupId>> = inputs
+        .brackets
+        .iter()
+        .map(|bracket| effective_pool(&bracket.id, &bracket.pool, inputs.all_setups, inputs.pool_overrides))
+        .collect();
     let views: Vec<BracketView<'_>> = inputs
         .brackets
         .iter()
-        .map(|bracket| BracketView {
+        .zip(&pools)
+        .map(|(bracket, pool)| BracketView {
             id: &bracket.id,
             sets: &bracket.sets,
             mode: bracket.mode,
             start_at: bracket.start_at,
             held: bracket.held,
-            pool: &bracket.pool,
+            pool,
         })
         .collect();
     let index = ConflictIndex::build(&views, &conflict_inputs);
@@ -197,14 +211,15 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
         brackets: inputs
             .brackets
             .iter()
-            .map(|bracket| SimBracket {
+            .zip(&pools)
+            .map(|(bracket, pool)| SimBracket {
                 id: bracket.id.clone(),
                 sets: bracket.sets.clone(),
                 groups: bracket.groups.clone(),
                 mode: bracket.mode,
                 start_at: bracket.start_at,
                 held: bracket.held,
-                pool: bracket.pool.clone(),
+                pool: pool.clone(),
             })
             .collect(),
         board: inputs.board.clone(),
@@ -238,6 +253,8 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
         })
         .collect();
 
+    let pool_exhausted = exhausted_setups(inputs, &pools);
+
     World {
         queue,
         per_setup,
@@ -245,8 +262,32 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
         remaining,
         summaries,
         overall_projected_finish: (!inputs.brackets.is_empty()).then_some(outcome.overall_finish),
+        pool_exhausted,
         graph_warnings,
     }
+}
+
+/// Setups every one of whose serving full-mode brackets has affirmatively
+/// finished (a bracket with no sets yet — unstarted or unfetched — is not
+/// "finished", so a pre-start lull never reads as exhaustion).
+fn exhausted_setups(inputs: &WorldInputs<'_>, pools: &[Vec<SetupId>]) -> Vec<SetupId> {
+    inputs
+        .all_setups
+        .iter()
+        .filter(|setup| {
+            let serving: Vec<_> = inputs
+                .brackets
+                .iter()
+                .zip(pools)
+                .filter(|(bracket, pool)| bracket.mode == BracketMode::Full && pool.contains(setup))
+                .collect();
+            !serving.is_empty()
+                && serving
+                    .iter()
+                    .all(|(bracket, _)| !bracket.sets.is_empty() && bracket.sets.iter().all(LiveSet::is_completed))
+        })
+        .copied()
+        .collect()
 }
 
 /// The sets currently assigned to a setup (Called or InProgress on the
@@ -325,11 +366,11 @@ mod tests {
     use super::{recompute, BracketState, World, WorldInputs};
     use crate::{
         config::{BracketMode, SetupId, SimConfig},
-        conflict::{AliasMap, BlockReason, PlayerFlags, SetupBoard, SetupStatus, Tombstones},
+        conflict::{AliasMap, BlockReason, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones},
         duration::DurationModel,
         model::{BracketId, LiveSet},
         ranker::GreedyRanker,
-        synth::{complete, make_de_bracket, make_rr_pool, SynthBracket},
+        synth::{complete, make_de_bracket, make_rr_pool, make_se_bracket, SynthBracket},
     };
 
     const NOW: i64 = 1_751_000_000_000;
@@ -360,10 +401,15 @@ mod tests {
         }
 
         fn recompute(&self) -> World {
+            self.recompute_with_overrides(&HashMap::new())
+        }
+
+        fn recompute_with_overrides(&self, pool_overrides: &HashMap<SetupId, PoolOverride>) -> World {
             let aliases = AliasMap::default();
             let flags = PlayerFlags::default();
             let tombstones = Tombstones::default();
             let (last_completed, snoozes, callable_since) = (HashMap::new(), HashMap::new(), HashMap::new());
+            let all_setups: Vec<SetupId> = self.board.setups().iter().map(|s| s.id).collect();
             let bracket_refs: Vec<&BracketState> = self.brackets.iter().collect();
             let inputs = WorldInputs {
                 brackets: &bracket_refs,
@@ -376,6 +422,8 @@ mod tests {
                 last_completed: &last_completed,
                 snoozes: &snoozes,
                 callable_since: &callable_since,
+                pool_overrides,
+                all_setups: &all_setups,
                 rest_window_secs: 0,
                 sim: SimConfig::default(),
                 now_millis: NOW,
@@ -386,6 +434,47 @@ mod tests {
 
     fn sets_mut(fixture: &mut Fixture, bracket: usize) -> &mut Vec<LiveSet> {
         &mut fixture.brackets[bracket].sets
+    }
+
+    #[test]
+    fn pool_override_reshapes_candidates_and_exhaustion() {
+        // An RR pool for melee: every set occupied from round one, so the
+        // whole bracket can complete without winner propagation.
+        let mut fixture = Fixture::new(
+            vec![("ultimate", make_se_bracket(1001, 4)), ("melee", make_rr_pool(2001, 4))],
+            vec![SetupId(1), SetupId(2)],
+        );
+        for set in sets_mut(&mut fixture, 1).iter_mut() {
+            complete(set, 0, NOW / 1000 + 60);
+        }
+
+        // No overrides: nothing exhausted (setups still serve ultimate), and
+        // ultimate may call on both setups.
+        let world = fixture.recompute();
+        assert!(world.pool_exhausted.is_empty());
+        assert!(world.per_setup.contains_key(&SetupId(2)));
+
+        // Dedicate setup 2 to the finished melee: it leaves ultimate's
+        // effective pool (no candidates for it) and reads exhausted.
+        let overrides = HashMap::from([(SetupId(2), PoolOverride::Dedicated(BracketId("melee".to_owned())))]);
+        let world = fixture.recompute_with_overrides(&overrides);
+        assert_eq!(world.pool_exhausted, vec![SetupId(2)]);
+        assert!(
+            world.per_setup.get(&SetupId(2)).is_none_or(Vec::is_empty),
+            "dedicated setup offers nothing from other brackets: {:?}",
+            world.per_setup.get(&SetupId(2))
+        );
+        assert!(
+            world.queue.iter().all(|e| e.candidate_setups == vec![SetupId(1)]),
+            "ultimate candidates lost setup 2: {:?}",
+            world.queue
+        );
+
+        // AllowAny restores it as a candidate for ultimate.
+        let overrides = HashMap::from([(SetupId(2), PoolOverride::AllowAny)]);
+        let world = fixture.recompute_with_overrides(&overrides);
+        assert!(world.queue.iter().all(|e| e.candidate_setups.contains(&SetupId(2))));
+        assert!(world.pool_exhausted.is_empty(), "ultimate still runs on setup 2");
     }
 
     #[test]

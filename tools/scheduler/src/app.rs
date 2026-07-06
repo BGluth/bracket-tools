@@ -12,10 +12,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{SchedulerConfig, SetupId},
+    config::{BracketMode, SchedulerConfig, SetupId},
     conflict::{
-        callable, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView, CallableSet, ConflictIndex, ConflictInputs,
-        ConflictKey, PlayerFlags, SetupBoard, SetupStatus, Tombstones, UnixMillis,
+        callable, effective_pool, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView, CallableSet, ConflictIndex,
+        ConflictInputs, ConflictKey, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones, UnixMillis,
     },
     duration::{diff_snapshots, DurationModel},
     model::{BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
@@ -189,7 +189,36 @@ pub enum Modal {
         players: Vec<(ConflictKey, String)>,
         selected: usize,
     },
+    /// Reassign the selected setup's pool: dedicate to one bracket, open to
+    /// all, or restore the config pools (`a`).
+    Reassign {
+        setup: SetupId,
+        selected: usize,
+    },
     Help,
+}
+
+/// One choice in the reassign modal. Built deterministically so the render
+/// and the commit agree on indexing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReassignOption {
+    Dedicate(BracketId),
+    AllowAny,
+    RestoreConfig,
+}
+
+/// The reassign modal's option list: every full bracket, then the two
+/// blanket choices.
+pub(crate) fn reassign_options(state: &AppState) -> Vec<ReassignOption> {
+    let mut options: Vec<ReassignOption> = state
+        .brackets
+        .iter()
+        .filter(|b| b.state.mode == BracketMode::Full)
+        .map(|b| ReassignOption::Dedicate(b.state.id.clone()))
+        .collect();
+    options.push(ReassignOption::AllowAny);
+    options.push(ReassignOption::RestoreConfig);
+    options
 }
 
 #[derive(Debug, Clone, Default)]
@@ -264,6 +293,7 @@ struct UndoSnapshot {
     board: SetupBoard,
     tombstones: Tombstones,
     flags: PlayerFlags,
+    pool_overrides: HashMap<SetupId, PoolOverride>,
     snoozes: HashMap<(BracketId, SetKey), UnixMillis>,
     called_at: HashMap<(BracketId, SetKey), UnixMillis>,
     description: String,
@@ -280,6 +310,8 @@ pub struct AppState {
     pub board: SetupBoard,
     pub flags: PlayerFlags,
     pub tombstones: Tombstones,
+    /// Per-setup pool reassignments (the `a` action).
+    pub pool_overrides: HashMap<SetupId, PoolOverride>,
     pub aliases: AliasMap,
     pub snoozes: HashMap<(BracketId, SetKey), UnixMillis>,
     pub last_completed: HashMap<ConflictKey, UnixMillis>,
@@ -353,6 +385,7 @@ impl AppState {
             brackets,
             flags: PlayerFlags::default(),
             tombstones: Tombstones::default(),
+            pool_overrides: HashMap::new(),
             snoozes: HashMap::new(),
             last_completed: HashMap::new(),
             callable_since: HashMap::new(),
@@ -401,6 +434,7 @@ impl AppState {
             board: self.board.clone(),
             flags: self.flags.clone(),
             tombstones: self.tombstones.clone(),
+            pool_overrides: self.pool_overrides.iter().map(|(s, o)| (*s, o.clone())).collect(),
             snoozes: flatten_pair_map(&self.snoozes),
             last_completed: self.last_completed.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             callable_since: self.callable_since.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -439,6 +473,21 @@ impl AppState {
         self.board = board;
         self.flags = doc.flags;
         self.tombstones = doc.tombstones;
+        for (setup, over) in doc.pool_overrides {
+            let known_bracket = match &over {
+                PoolOverride::Dedicated(b) => self.bracket_ix(b).is_some(),
+                PoolOverride::AllowAny => true,
+            };
+            if self.config.setups.contains(&setup) && known_bracket {
+                self.pool_overrides.insert(setup, over);
+            } else {
+                self.notice(
+                    now_millis,
+                    NoticeLevel::Warn,
+                    format!("dropped persisted pool override for setup {} (no longer applies)", setup.0),
+                );
+            }
+        }
         self.snoozes = doc.snoozes.into_iter().map(|(b, k, v)| ((b, k), v)).collect();
         self.last_completed = doc.last_completed.into_iter().collect();
         self.callable_since = doc.callable_since.into_iter().collect();
@@ -560,6 +609,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
         KeyCode::Char('n') => state.ui.modal = Some(Modal::Notices { selected: 0 }),
         KeyCode::Char('w') => state.ui.modal = Some(Modal::PendingWrites { selected: 0 }),
         KeyCode::Char('d') => open_flags_modal(state, now),
+        KeyCode::Char('a') => open_reassign_modal(state, now),
         KeyCode::Up => state.ui.queue_ix = state.ui.queue_ix.saturating_sub(1),
         KeyCode::Down => {
             state.ui.queue_ix = (state.ui.queue_ix + 1).min(state.world.queue.len().saturating_sub(1));
@@ -590,6 +640,9 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
                     });
                 }
                 KeyCode::Enter => commit_call(state, setup, selected, now, effects),
+                // An exhausted pool presents an empty picker; `a` jumps
+                // straight to reassignment for the same setup.
+                KeyCode::Char('a') => state.ui.modal = Some(Modal::Reassign { setup, selected: 0 }),
                 _ => {}
             }
         }
@@ -619,6 +672,13 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
             KeyCode::Enter => cycle_selected_flag(state, &players, selected, now),
             code => match scroll(code, selected, players.len()) {
                 Some(next) => state.ui.modal = Some(Modal::PlayerFlags { players, selected: next }),
+                None => state.ui.modal = None,
+            },
+        },
+        Some(Modal::Reassign { setup, selected }) => match key.code {
+            KeyCode::Enter => apply_reassign(state, setup, selected, now),
+            code => match scroll(code, selected, reassign_options(state).len()) {
+                Some(next) => state.ui.modal = Some(Modal::Reassign { setup, selected: next }),
                 None => state.ui.modal = None,
             },
         },
@@ -789,6 +849,7 @@ fn undo(state: &mut AppState, now: UnixMillis) {
     state.board = snap.board;
     state.tombstones = snap.tombstones;
     state.flags = snap.flags;
+    state.pool_overrides = snap.pool_overrides;
     state.snoozes = snap.snoozes;
     state.called_at = snap.called_at;
     state.dirty = true;
@@ -800,6 +861,7 @@ fn push_undo(state: &mut AppState, description: String) {
         board: state.board.clone(),
         tombstones: state.tombstones.clone(),
         flags: state.flags.clone(),
+        pool_overrides: state.pool_overrides.clone(),
         snoozes: state.snoozes.clone(),
         called_at: state.called_at.clone(),
         description,
@@ -926,6 +988,40 @@ fn open_flags_modal(state: &mut AppState, now: UnixMillis) {
     state.ui.modal = Some(Modal::PlayerFlags { players, selected: 0 });
 }
 
+/// `a` on the main view: reassign the selected setup's pool.
+fn open_reassign_modal(state: &mut AppState, now: UnixMillis) {
+    let Some(setup) = state.ui.selected_setup else {
+        state.notice(now, NoticeLevel::Warn, "select a setup first (digit), then a");
+        return;
+    };
+    state.ui.modal = Some(Modal::Reassign { setup, selected: 0 });
+}
+
+fn apply_reassign(state: &mut AppState, setup: SetupId, selected: usize, now: UnixMillis) {
+    let options = reassign_options(state);
+    let Some(option) = options.get(selected) else {
+        return;
+    };
+    push_undo(state, format!("reassign setup {}", setup.0));
+    let text = match option {
+        ReassignOption::Dedicate(bracket) => {
+            state.pool_overrides.insert(setup, PoolOverride::Dedicated(bracket.clone()));
+            format!("setup {} now takes only {}", setup.0, bracket.0)
+        }
+        ReassignOption::AllowAny => {
+            state.pool_overrides.insert(setup, PoolOverride::AllowAny);
+            format!("setup {} now open to every bracket", setup.0)
+        }
+        ReassignOption::RestoreConfig => {
+            state.pool_overrides.remove(&setup);
+            format!("setup {} restored to its config pools", setup.0)
+        }
+    };
+    state.ui.modal = None;
+    state.dirty = true;
+    state.notice(now, NoticeLevel::Info, text);
+}
+
 fn cycle_selected_flag(state: &mut AppState, players: &[(ConflictKey, String)], selected: usize, now: UnixMillis) {
     let Some((key, name)) = players.get(selected) else {
         return;
@@ -992,16 +1088,22 @@ fn verify_callable(
         rest_window_secs: state.config.rest_window_secs,
         snoozes: &state.snoozes,
     };
+    let pools: Vec<Vec<SetupId>> = state
+        .brackets
+        .iter()
+        .map(|b| effective_pool(&b.state.id, &b.state.pool, &state.config.setups, &state.pool_overrides))
+        .collect();
     let views: Vec<BracketView<'_>> = state
         .brackets
         .iter()
-        .map(|b| BracketView {
+        .zip(&pools)
+        .map(|(b, pool)| BracketView {
             id: &b.state.id,
             sets: &b.state.sets,
             mode: b.state.mode,
             start_at: b.state.start_at,
             held: b.state.held,
-            pool: &b.state.pool,
+            pool,
         })
         .collect();
     let index = ConflictIndex::build(&views, &inputs);
@@ -1356,6 +1458,8 @@ fn recompute_world(state: &AppState, now: UnixMillis) -> World {
         last_completed: &state.last_completed,
         snoozes: &state.snoozes,
         callable_since: &state.callable_since,
+        pool_overrides: &state.pool_overrides,
+        all_setups: &state.config.setups,
         rest_window_secs: state.config.rest_window_secs,
         sim: state.config.sim.clone(),
         now_millis: now,
@@ -1389,7 +1493,7 @@ mod tests {
     };
     use crate::{
         config::{BracketConfig, BracketMode, SchedulerConfig, SetupId},
-        conflict::{BlockReason, SetupStatus},
+        conflict::{BlockReason, PoolOverride, SetupStatus},
         fixture_source::FixtureSource,
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
         set_source::SetSource,
@@ -2042,6 +2146,72 @@ mod tests {
         update(&mut state, key(KeyCode::Esc), NOW);
         update(&mut state, key(KeyCode::Char('u')), NOW);
         assert_eq!(state.flags.force_available.len(), 1, "undo restored the pre-clear flags");
+    }
+
+    #[test]
+    fn reassign_modal_writes_a_persisted_undoable_override() {
+        // Two brackets sharing two setups, disjoint players.
+        let players_a: Vec<SynthPlayer> = (1..=4)
+            .map(|i| SynthPlayer {
+                player_id: format!("A{i}"),
+                name: format!("Ult {i}"),
+            })
+            .collect();
+        let players_b: Vec<SynthPlayer> = (1..=4)
+            .map(|i| SynthPlayer {
+                player_id: format!("B{i}"),
+                name: format!("Melee {i}"),
+            })
+            .collect();
+        let ultimate = make_de_bracket_with(1001, &players_a);
+        let melee = make_de_bracket_with(2001, &players_b);
+        let config = test_config(&[1, 2], &["ultimate", "melee"]);
+        let boots = bootstrap(&config, vec![("ultimate", &ultimate), ("melee", &melee)]);
+        let mut state = AppState::new(config, false, boots, NOW);
+        assert!(state.world.queue.iter().any(|e| e.candidate_setups.contains(&SetupId(2))));
+
+        // Select setup 2 (opens the picker on a free setup), then a → the
+        // reassign modal for the same setup; dedicate it to melee (option 1).
+        update(&mut state, key(KeyCode::Char('2')), NOW);
+        update(&mut state, key(KeyCode::Char('a')), NOW);
+        assert!(matches!(state.ui.modal, Some(Modal::Reassign { setup: SetupId(2), .. })));
+        update(&mut state, key(KeyCode::Down), NOW); // options: [ultimate, melee, any, restore]
+        update(&mut state, key(KeyCode::Enter), NOW);
+
+        assert_eq!(
+            state.pool_overrides.get(&SetupId(2)),
+            Some(&PoolOverride::Dedicated(BracketId("melee".to_owned())))
+        );
+        // The queue reshaped immediately: ultimate entries lost setup 2.
+        assert!(state
+            .world
+            .queue
+            .iter()
+            .filter(|e| e.bracket.0 == "ultimate")
+            .all(|e| e.candidate_setups == vec![SetupId(1)]));
+        // Melee entries kept it (config pool + dedication agree).
+        assert!(state
+            .world
+            .queue
+            .iter()
+            .filter(|e| e.bracket.0 == "melee")
+            .all(|e| e.candidate_setups.contains(&SetupId(2))));
+
+        // The override survives an overlay round trip.
+        let doc = state.to_overlay();
+        let config = test_config(&[1, 2], &["ultimate", "melee"]);
+        let boots = bootstrap(&config, vec![("ultimate", &ultimate), ("melee", &melee)]);
+        let mut restored = AppState::new(config, false, boots, NOW);
+        restored.apply_overlay(doc, NOW);
+        assert_eq!(
+            restored.pool_overrides.get(&SetupId(2)),
+            Some(&PoolOverride::Dedicated(BracketId("melee".to_owned())))
+        );
+
+        // Undo reverts it.
+        update(&mut state, key(KeyCode::Char('u')), NOW);
+        assert!(state.pool_overrides.is_empty());
+        assert!(state.world.queue.iter().any(|e| e.candidate_setups.contains(&SetupId(2))));
     }
 
     #[test]

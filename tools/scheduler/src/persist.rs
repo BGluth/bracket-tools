@@ -22,7 +22,8 @@ use thiserror::Error;
 
 use crate::{
     app::{Notice, PendingWrite},
-    conflict::{ConflictKey, PlayerFlags, SetupBoard, Tombstones, UnixMillis},
+    config::SetupId,
+    conflict::{ConflictKey, PlayerFlags, PoolOverride, SetupBoard, Tombstones, UnixMillis},
     duration::DurationModel,
     model::{BracketId, LiveSet, PhaseGroupInfo, SetKey},
 };
@@ -40,6 +41,8 @@ pub struct OverlayDoc {
     pub board: SetupBoard,
     pub flags: PlayerFlags,
     pub tombstones: Tombstones,
+    #[serde(default)]
+    pub pool_overrides: Vec<(SetupId, PoolOverride)>,
     pub snoozes: Vec<(BracketId, SetKey, UnixMillis)>,
     pub last_completed: Vec<(ConflictKey, UnixMillis)>,
     pub callable_since: Vec<(SetKey, UnixMillis)>,
@@ -279,6 +282,7 @@ mod tests {
             board: SetupBoard::new(&[SetupId(1), SetupId(2)]),
             flags: Default::default(),
             tombstones: Default::default(),
+            pool_overrides: Vec::new(),
             snoozes: Vec::new(),
             last_completed: Vec::new(),
             callable_since: Vec::new(),

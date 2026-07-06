@@ -16,7 +16,7 @@ use ratatui::{
 };
 
 use crate::{
-    app::{blocked_entries, flag_label, AppState, Modal, NoticeLevel, PendingStatus, PollHealth},
+    app::{blocked_entries, flag_label, reassign_options, AppState, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption},
     conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
     model::{BracketId, SetKey},
     world::QueueEntry,
@@ -44,6 +44,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
         Some(Modal::Notices { selected }) => draw_notices(frame, state, *selected, now),
         Some(Modal::PendingWrites { selected }) => draw_pending_writes(frame, state, *selected),
         Some(Modal::PlayerFlags { players, selected }) => draw_player_flags(frame, state, players, *selected),
+        Some(Modal::Reassign { setup, selected }) => draw_reassign(frame, state, *setup, *selected),
         Some(Modal::Help) => draw_help(frame),
         None => {}
     }
@@ -53,7 +54,12 @@ fn draw_setup_strip(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: Un
     let mut spans = Vec::new();
     for setup in state.board.setups() {
         let selected = state.ui.selected_setup == Some(setup.id);
+        let exhausted = state.world.pool_exhausted.contains(&setup.id);
         let (label, style) = match &setup.status {
+            SetupStatus::Free if exhausted => (
+                format!("{}:done→a", setup.id.0),
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
             SetupStatus::Free => (format!("{}:free", setup.id.0), Style::new().fg(Color::Green)),
             SetupStatus::Called { bracket, set } => {
                 let age = state
@@ -544,6 +550,31 @@ fn divergence_ledger(state: &AppState) -> Vec<(BracketId, SetKey)> {
     pairs
 }
 
+fn draw_reassign(frame: &mut Frame<'_>, state: &AppState, setup: crate::config::SetupId, selected: usize) {
+    let area = centered_rect(frame.area(), 50, 40);
+    frame.render_widget(Clear, area);
+
+    let options = reassign_options(state);
+    let rows = options.iter().enumerate().map(|(ix, option)| {
+        let label = match option {
+            ReassignOption::Dedicate(bracket) => format!("only {}", short_name(bracket)),
+            ReassignOption::AllowAny => "allow any bracket".to_owned(),
+            ReassignOption::RestoreConfig => "restore config pools".to_owned(),
+        };
+        let row = Row::new([label]);
+        if ix == selected {
+            row.style(SELECTED)
+        } else {
+            row
+        }
+    });
+    let title = format!("Reassign setup {} — Enter applies, Esc cancels", setup.0);
+    frame.render_widget(
+        Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)),
+        area,
+    );
+}
+
 fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(ConflictKey, String)], selected: usize) {
     let area = centered_rect(frame.area(), 50, 40);
     frame.render_widget(Clear, area);
@@ -573,6 +604,7 @@ fn draw_help(frame: &mut Frame<'_>) {
         "r         selected setup: un-call, set returns to the queue",
         "z         snooze the highlighted queue entry (5m)",
         "d         player flags for the highlighted entry (rest/depart)",
+        "a         reassign the selected setup's pool (redeploy)",
         "i         inspect blocked sets (why not callable)",
         "n         notices page (Enter acks)",
         "w         pending writes + divergence ledger",
