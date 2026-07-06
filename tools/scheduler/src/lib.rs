@@ -14,6 +14,7 @@ pub mod simulator;
 #[doc(hidden)]
 pub mod synth;
 pub mod terminal;
+pub mod ui;
 pub mod world;
 
 pub use config::{BracketConfig, BracketMode, ConfigError, SchedulerConfig, SetupId};
