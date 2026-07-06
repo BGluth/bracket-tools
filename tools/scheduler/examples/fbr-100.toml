@@ -16,6 +16,12 @@ poll_interval_secs = 30
 no_show_secs = 300
 rest_window_secs = 300
 
+# Crash-recovery state (S4): the local overlay and the last-good snapshot.
+# Defaults land beside the working directory; point them somewhere durable
+# for the event. The single-instance lockfile lives beside the state file.
+state_file = "fbr-100-state.json"
+snapshot_file = "fbr-100-snapshot.json"
+
 # Live-observed state ints (session 14 write probe).
 known_called_state_int = 6
 known_in_progress_state_int = 2

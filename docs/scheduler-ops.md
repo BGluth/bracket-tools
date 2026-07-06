@@ -44,18 +44,26 @@ rights — the safe default for a review/rehearsal). The tool opens on the setup
 ## The calling loop (hot path)
 
 - **Digit (setup number)** → opens the call-picker for that setup, top-ranked set preselected.
-  **Enter** commits the call locally (and enqueues `markSetCalled` if writes are armed);
-  **Esc** cancels. Enter re-checks the set is still callable before committing.
+  The title says which ranking you're looking at: **rollout** (ranked by projected
+  tournament finish, freshly simulated — the normal case seconds after a setup frees) or
+  **greedy (rollout pending)** (the instant structural ranking). A cyan **HOLD** row means
+  the simulation thinks leaving the setup open beats every call — Enter on it just closes
+  the picker. **Enter** on a set commits the call locally (and enqueues `markSetCalled` if
+  writes are armed); **Esc** cancels. Enter re-checks the set is still callable first.
 - **p** — players seated → set goes In-Progress (enqueues `markSetInProgress`).
 - **f** — set finished at the desk → frees the setup immediately (players free at once; the
   result is confirmed remotely within a poll or the targeted force-poll).
 - **r** — no-show → re-queues the set locally. The site may still show it CALLED; that
   mismatch is tracked in the divergence ledger (see handover).
+- **d** — player flags for the highlighted queue entry: Enter cycles
+  resting → departed → force-available → clear. Departed players' sets leave the queue and
+  project at zero.
 - **z** snooze · **u** undo (single level) · **q** / Ctrl-C quit.
-- **a** (S4) — reassign a setup to another bracket / allow-any / restore config pool, when a
-  bracket finishes early and its setups should redeploy. **If `a` was cut:** edit the
-  bracket `pool` lists in the config and restart (the restart preserves your overlay and
-  re-runs preflight safely — see below).
+- **a** — reassign the selected setup: dedicate it to one bracket / allow any / restore the
+  config pools, for when a bracket finishes early and its setups should redeploy. Free
+  setups whose brackets all finished show **N:done→a** in the strip. (Editing the config
+  `pool` lists and restarting remains a safe fallback — the restart preserves your overlay
+  and re-runs preflight.)
 - **i** inspect (why a set is not callable) · **n** notices/log · **w** pending writes +
   divergence ledger · **?** context help.
 
