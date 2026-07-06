@@ -5,13 +5,13 @@
 //! `recompute` is synchronous and allocation-bounded; the Elm loop calls it
 //! whenever state is dirty and renders straight off the returned [`World`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
     config::{BracketMode, SetupId, SimConfig},
     conflict::{
         aggregate_remaining, callable, callable_sets, AliasMap, BlockReason, BracketView, ConflictIndex, ConflictInputs, ConflictKey,
-        PlayerFlags, SetupBoard, Tombstones, UnixMillis,
+        PlayerFlags, SetupBoard, SetupStatus, Tombstones, UnixMillis,
     },
     duration::DurationModel,
     graph::{BracketGraph, GraphWarning},
@@ -39,7 +39,7 @@ pub struct BracketState {
 /// Everything a recompute reads. All references point into app-owned state;
 /// nothing here is mutated.
 pub struct WorldInputs<'a> {
-    pub brackets: &'a [BracketState],
+    pub brackets: &'a [&'a BracketState],
     pub board: &'a SetupBoard,
     pub flags: &'a PlayerFlags,
     pub tombstones: &'a Tombstones,
@@ -151,11 +151,21 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
         })
         .collect();
     let index = ConflictIndex::build(&views, &conflict_inputs);
-    let candidates = callable_sets(&views, &index, &conflict_inputs, inputs.now_millis);
+    let mut candidates = callable_sets(&views, &index, &conflict_inputs, inputs.now_millis);
+    // The conflict predicate deliberately never self-blocks (commit-time
+    // re-verification depends on that), so a set already assigned to a setup
+    // still evaluates callable. Exclude board-assigned sets here instead —
+    // they're on a station, not in the queue.
+    let assigned = assigned_sets(inputs.board);
+    candidates.retain(|c| !assigned.contains(&(c.bracket.clone(), c.key.clone())));
 
     let mut blocked = HashMap::new();
     for (view, bracket) in views.iter().zip(inputs.brackets) {
-        for set in bracket.sets.iter().filter(|s| !s.is_completed()) {
+        for set in bracket
+            .sets
+            .iter()
+            .filter(|s| !s.is_completed() && !assigned.contains(&(bracket.id.clone(), s.key.clone())))
+        {
             if let Err(reasons) = callable(view, set, &index, &conflict_inputs, inputs.now_millis) {
                 blocked.insert((bracket.id.clone(), set.key.clone()), reasons);
             }
@@ -237,6 +247,20 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
         overall_projected_finish: (!inputs.brackets.is_empty()).then_some(outcome.overall_finish),
         graph_warnings,
     }
+}
+
+/// The sets currently assigned to a setup (Called or InProgress on the
+/// board) — excluded from ranking, and re-verified against at commit time.
+pub fn assigned_sets(board: &SetupBoard) -> HashSet<(BracketId, SetKey)> {
+    board
+        .setups()
+        .iter()
+        .filter_map(|setup| match &setup.status {
+            SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set } => Some((bracket.clone(), set.clone())),
+            SetupStatus::OccupiedExternal { set } => set.clone(),
+            SetupStatus::Free => None,
+        })
+        .collect()
 }
 
 /// Resolves a ranked candidate into a display entry. Hold actions carry no
@@ -340,8 +364,9 @@ mod tests {
             let flags = PlayerFlags::default();
             let tombstones = Tombstones::default();
             let (last_completed, snoozes, callable_since) = (HashMap::new(), HashMap::new(), HashMap::new());
+            let bracket_refs: Vec<&BracketState> = self.brackets.iter().collect();
             let inputs = WorldInputs {
-                brackets: &self.brackets,
+                brackets: &bracket_refs,
                 board: &self.board,
                 flags: &flags,
                 tombstones: &tombstones,

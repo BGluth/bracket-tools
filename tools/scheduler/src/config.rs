@@ -101,8 +101,10 @@ pub struct SchedulerConfig {
     /// Never arm writes, regardless of what the admin probe finds.
     #[serde(default)]
     pub advisor_only: bool,
-    /// State ints that never count as evidence of remote activity.
-    #[serde(default)]
+    /// State ints that never count as a deviation. Defaults to the normal
+    /// lifecycle vocabulary observed live (1=pending, 2=in-progress,
+    /// 3=completed); CALLED is pinned separately.
+    #[serde(default = "default_benign_state_ints")]
     pub known_benign_state_ints: Vec<i32>,
     /// Pinned CALLED state int (live-observed: 6). Learned from write
     /// responses when unset.
@@ -140,7 +142,7 @@ impl Default for SchedulerConfig {
             token_file: None,
             tournament_slug: None,
             advisor_only: false,
-            known_benign_state_ints: Vec::new(),
+            known_benign_state_ints: default_benign_state_ints(),
             known_called_state_int: None,
             known_in_progress_state_int: None,
             state_file: None,
@@ -325,6 +327,10 @@ fn default_stale_warn_polls() -> u32 {
 
 fn default_per_page() -> u32 {
     DEFAULT_PER_PAGE
+}
+
+fn default_benign_state_ints() -> Vec<i32> {
+    vec![1, 2, 3]
 }
 
 fn default_rest_sim_horizon_secs() -> u64 {

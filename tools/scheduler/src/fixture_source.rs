@@ -178,7 +178,7 @@ impl FixtureSource {
                 .and_then(|d| d.event)
                 .and_then(|e| e.sets)
                 .and_then(|s| s.nodes)
-                .ok_or_else(|| FixtureLoadError::EmptyEnvelope { path })?;
+                .ok_or(FixtureLoadError::EmptyEnvelope { path })?;
             sets.extend(nodes.into_iter().flatten());
         }
 
@@ -389,7 +389,7 @@ fn schema_phase_group(info: &PhaseGroupInfo) -> get_event_structure::PhaseGroup 
 
 #[cfg(test)]
 mod tests {
-    use std::{env, path::PathBuf, time::Duration};
+    use std::{env, path::PathBuf, slice::from_ref, time::Duration};
 
     use tokio::time::timeout;
 
@@ -405,7 +405,7 @@ mod tests {
     fn de_source() -> FixtureSource {
         let bracket = make_de_bracket(1001, 8);
         let mut source = FixtureSource::new();
-        source.add_synth_event(SLUG, &[bracket.info.clone()], vec![bracket.sets.clone()]);
+        source.add_synth_event(SLUG, from_ref(&bracket.info), vec![bracket.sets.clone()]);
         source
     }
 
@@ -440,7 +440,7 @@ mod tests {
     async fn swiss_structure_round_trips_num_rounds() {
         let swiss = make_swiss(2002, 8, 4);
         let mut source = FixtureSource::new();
-        source.add_synth_event("tournament/synth/event/pokemon", &[swiss.info.clone()], vec![swiss.sets]);
+        source.add_synth_event("tournament/synth/event/pokemon", from_ref(&swiss.info), vec![swiss.sets]);
 
         let structure = source.fetch_event_structure("tournament/synth/event/pokemon").await.unwrap();
         let (groups, _) = phase_groups_from_schema(&structure);
@@ -454,7 +454,7 @@ mod tests {
         complete(&mut second[0], 0, 1_751_000_100);
 
         let mut source = FixtureSource::new();
-        source.add_synth_event(SLUG, &[bracket.info.clone()], vec![bracket.sets.clone(), second.clone()]);
+        source.add_synth_event(SLUG, from_ref(&bracket.info), vec![bracket.sets.clone(), second.clone()]);
 
         let expect_completed = |sets: Vec<bracket_tools_startgg_schema::get_sets_for_event::Set>, expected: usize| {
             let (live, _, _) = live_sets_from_schema(sets);
