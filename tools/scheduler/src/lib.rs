@@ -11,6 +11,7 @@ pub mod set_source;
 pub mod simulator;
 #[doc(hidden)]
 pub mod synth;
+pub mod world;
 
 pub use config::{BracketConfig, BracketMode, ConfigError, SchedulerConfig, SetupId};
 pub use conflict::{
