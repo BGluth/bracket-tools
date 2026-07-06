@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{SchedulerConfig, SetupId},
     conflict::{
-        callable, state_deviation, AliasMap, BlockReason, BracketView, CallableSet, ConflictIndex, ConflictInputs, ConflictKey,
-        PlayerFlags, SetupBoard, SetupStatus, Tombstones, UnixMillis,
+        callable, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView, CallableSet, ConflictIndex, ConflictInputs,
+        ConflictKey, PlayerFlags, SetupBoard, SetupStatus, Tombstones, UnixMillis,
     },
     duration::{diff_snapshots, DurationModel},
     model::{BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
@@ -168,6 +168,25 @@ pub enum Modal {
     /// Candidate list for one free setup; Enter calls the selected set.
     CallPicker {
         setup: SetupId,
+        selected: usize,
+    },
+    /// Why-not-callable browser over `world.blocked` (`i`).
+    Inspection {
+        selected: usize,
+    },
+    /// Scrollable notices ring, newest first; Enter acks (`n`).
+    Notices {
+        selected: usize,
+    },
+    /// Pending/parked writes + the divergence ledger; Enter retries a parked
+    /// entry, `d` discards it (`w`).
+    PendingWrites {
+        selected: usize,
+    },
+    /// Tri-state player flags for the highlighted queue entry's players;
+    /// Enter cycles resting → departed → force-available → clear (`d`).
+    PlayerFlags {
+        players: Vec<(ConflictKey, String)>,
         selected: usize,
     },
     Help,
@@ -515,6 +534,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
         KeyCode::Char('r') => requeue_selected(state, now),
         KeyCode::Char('z') => snooze_selected(state, now),
         KeyCode::Char('u') => undo(state, now),
+        KeyCode::Char('i') => state.ui.modal = Some(Modal::Inspection { selected: 0 }),
+        KeyCode::Char('n') => state.ui.modal = Some(Modal::Notices { selected: 0 }),
+        KeyCode::Char('w') => state.ui.modal = Some(Modal::PendingWrites { selected: 0 }),
+        KeyCode::Char('d') => open_flags_modal(state, now),
         KeyCode::Up => state.ui.queue_ix = state.ui.queue_ix.saturating_sub(1),
         KeyCode::Down => {
             state.ui.queue_ix = (state.ui.queue_ix + 1).min(state.world.queue.len().saturating_sub(1));
@@ -528,27 +551,66 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
         state.ui.modal = None;
         return;
     }
-    let Some(Modal::CallPicker { setup, selected }) = state.ui.modal.clone() else {
+    match state.ui.modal.clone() {
+        Some(Modal::CallPicker { setup, selected }) => {
+            let candidates = state.world.per_setup.get(&setup).map_or(0, Vec::len);
+            match key.code {
+                KeyCode::Up => {
+                    state.ui.modal = Some(Modal::CallPicker {
+                        setup,
+                        selected: selected.saturating_sub(1),
+                    });
+                }
+                KeyCode::Down => {
+                    state.ui.modal = Some(Modal::CallPicker {
+                        setup,
+                        selected: (selected + 1).min(candidates.saturating_sub(1)),
+                    });
+                }
+                KeyCode::Enter => commit_call(state, setup, selected, now, effects),
+                _ => {}
+            }
+        }
+        Some(Modal::Inspection { selected }) => {
+            let count = blocked_entries(state).len();
+            match scroll(key.code, selected, count) {
+                Some(next) => state.ui.modal = Some(Modal::Inspection { selected: next }),
+                None => state.ui.modal = None,
+            }
+        }
+        Some(Modal::Notices { selected }) => match key.code {
+            KeyCode::Enter => ack_notice(state, selected),
+            code => match scroll(code, selected, state.notices.len()) {
+                Some(next) => state.ui.modal = Some(Modal::Notices { selected: next }),
+                None => state.ui.modal = None,
+            },
+        },
+        Some(Modal::PendingWrites { selected }) => match key.code {
+            KeyCode::Enter => retry_parked(state, selected, now, effects),
+            KeyCode::Char('d') => discard_pending(state, selected, now),
+            code => match scroll(code, selected, state.pending_writes.len()) {
+                Some(next) => state.ui.modal = Some(Modal::PendingWrites { selected: next }),
+                None => state.ui.modal = None,
+            },
+        },
+        Some(Modal::PlayerFlags { players, selected }) => match key.code {
+            KeyCode::Enter => cycle_selected_flag(state, &players, selected, now),
+            code => match scroll(code, selected, players.len()) {
+                Some(next) => state.ui.modal = Some(Modal::PlayerFlags { players, selected: next }),
+                None => state.ui.modal = None,
+            },
+        },
         // Help modal: any other key closes it too.
-        state.ui.modal = None;
-        return;
-    };
-    let candidates = state.world.per_setup.get(&setup).map_or(0, Vec::len);
-    match key.code {
-        KeyCode::Up => {
-            state.ui.modal = Some(Modal::CallPicker {
-                setup,
-                selected: selected.saturating_sub(1),
-            });
-        }
-        KeyCode::Down => {
-            state.ui.modal = Some(Modal::CallPicker {
-                setup,
-                selected: (selected + 1).min(candidates.saturating_sub(1)),
-            });
-        }
-        KeyCode::Enter => commit_call(state, setup, selected, now, effects),
-        _ => {}
+        Some(Modal::Help) | None => state.ui.modal = None,
+    }
+}
+
+/// Shared list-modal cursor: Up/Down move (clamped), anything else closes.
+fn scroll(code: KeyCode, selected: usize, count: usize) -> Option<usize> {
+    match code {
+        KeyCode::Up => Some(selected.saturating_sub(1)),
+        KeyCode::Down => Some((selected + 1).min(count.saturating_sub(1))),
+        _ => None,
     }
 }
 
@@ -768,6 +830,118 @@ fn enqueue_write(
         last_error: None,
     });
     effects.writes.push(intent);
+}
+
+/// The inspection view's row set: every blocked (bracket, set) pair in a
+/// deterministic order. Rendering and cursor bounds share this.
+pub(crate) fn blocked_entries(state: &AppState) -> Vec<(BracketId, SetKey)> {
+    let mut keys: Vec<(BracketId, SetKey)> = state.world.blocked.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+/// Acks the notice at `display_ix` in newest-first order (the notices page's
+/// presentation order).
+fn ack_notice(state: &mut AppState, display_ix: usize) {
+    let len = state.notices.len();
+    if display_ix >= len {
+        return;
+    }
+    if let Some(notice) = state.notices.get_mut(len - 1 - display_ix) {
+        notice.acked = true;
+    }
+}
+
+/// Enter on a parked write: re-queue it with a fresh attempt budget.
+fn retry_parked(state: &mut AppState, selected: usize, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(pending) = state.pending_writes.get_mut(selected) else {
+        return;
+    };
+    if pending.status != PendingStatus::Parked {
+        return;
+    }
+    pending.status = PendingStatus::Queued;
+    pending.attempts = 0;
+    let intent = pending.intent.clone();
+    state.notice(now, NoticeLevel::Info, format!("retrying write {:?} for set {}", intent.kind, intent.id));
+    effects.writes.push(intent);
+}
+
+/// `d` on a parked write: drop it for good (the TO handled it site-side).
+fn discard_pending(state: &mut AppState, selected: usize, now: UnixMillis) {
+    let Some(pending) = state.pending_writes.get(selected) else {
+        return;
+    };
+    if pending.status != PendingStatus::Parked {
+        return;
+    }
+    let intent = pending.intent.clone();
+    state.pending_writes.remove(selected);
+    state.held_writes.retain(|i| *i != intent);
+    state.notice(now, NoticeLevel::Info, format!("discarded write {:?} for set {}", intent.kind, intent.id));
+}
+
+/// `d` on the main view: tri-state flags for the highlighted queue entry's
+/// players.
+fn open_flags_modal(state: &mut AppState, now: UnixMillis) {
+    let Some(entry) = state.world.queue.get(state.ui.queue_ix) else {
+        state.notice(now, NoticeLevel::Warn, "highlight a queue entry first (Up/Down), then d");
+        return;
+    };
+    let Some(set) = state.find_set(&entry.bracket, &entry.key) else {
+        return;
+    };
+    let players: Vec<(ConflictKey, String)> = set
+        .occupants()
+        .flat_map(|o| {
+            let name = o.display_name.clone();
+            occupant_keys(o, &state.aliases).into_iter().map(move |k| (k, name.clone()))
+        })
+        .collect();
+    if players.is_empty() {
+        return;
+    }
+    state.ui.modal = Some(Modal::PlayerFlags { players, selected: 0 });
+}
+
+fn cycle_selected_flag(state: &mut AppState, players: &[(ConflictKey, String)], selected: usize, now: UnixMillis) {
+    let Some((key, name)) = players.get(selected) else {
+        return;
+    };
+    push_undo(state, format!("flag change for {name}"));
+    let label = cycle_flag(&mut state.flags, key);
+    state.dirty = true;
+    state.notice(now, NoticeLevel::Info, format!("{name}: {label}"));
+}
+
+/// resting → departed → force-available → clear. Returns the new state's
+/// label for the notice.
+fn cycle_flag(flags: &mut PlayerFlags, key: &ConflictKey) -> &'static str {
+    if flags.resting.remove(key) {
+        flags.departed.insert(key.clone());
+        "departed"
+    } else if flags.departed.remove(key) {
+        flags.force_available.insert(key.clone());
+        "force-available"
+    } else if flags.force_available.remove(key) {
+        "flags cleared"
+    } else {
+        flags.resting.insert(key.clone());
+        "resting"
+    }
+}
+
+/// The flag a key currently carries, for display.
+pub(crate) fn flag_label(flags: &PlayerFlags, key: &ConflictKey) -> &'static str {
+    if flags.resting.contains(key) {
+        "resting"
+    } else if flags.departed.contains(key) {
+        "departed"
+    } else if flags.force_available.contains(key) {
+        "force-available"
+    } else {
+        "—"
+    }
 }
 
 /// Re-runs the real conflict predicate for one set against current state.
@@ -1808,6 +1982,97 @@ mod tests {
         assert_eq!(restored.pending_writes[0].status, PendingStatus::Parked);
         // The re-ranked world matches: the called set is out of the queue.
         assert!(restored.world.queue.iter().all(|e| e.key != called));
+    }
+
+    #[test]
+    fn player_flags_modal_cycles_and_blocks() {
+        let mut state = se4_app(false);
+        assert_eq!(state.world.queue.len(), 2);
+
+        // d opens the flags modal for the highlighted entry's players.
+        update(&mut state, key(KeyCode::Char('d')), NOW);
+        let Some(Modal::PlayerFlags { ref players, .. }) = state.ui.modal else {
+            panic!("flags modal should open: {:?}", state.ui.modal);
+        };
+        assert_eq!(players.len(), 2, "singles set has two players");
+
+        // Enter: resting. The player's set leaves the queue.
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(state.flags.resting.len(), 1);
+        assert_eq!(state.world.queue.len(), 1, "resting player's set blocked");
+        assert!(state
+            .world
+            .blocked
+            .values()
+            .any(|reasons| reasons.iter().any(|r| matches!(r, BlockReason::PlayerResting { .. }))));
+
+        // Cycle on: departed → force-available → clear restores the queue.
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(state.flags.departed.len(), 1);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(state.flags.force_available.len(), 1);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert!(state.flags.force_available.is_empty());
+        assert_eq!(state.world.queue.len(), 2, "cleared flags unblock");
+
+        // Undo restores the last flag state (single level).
+        update(&mut state, key(KeyCode::Esc), NOW);
+        update(&mut state, key(KeyCode::Char('u')), NOW);
+        assert_eq!(state.flags.force_available.len(), 1, "undo restored the pre-clear flags");
+    }
+
+    #[test]
+    fn notices_page_acks_newest_first() {
+        let mut state = se4_app(false);
+        state.notice(NOW, NoticeLevel::Warn, "older warning");
+        state.notice(NOW + 1000, NoticeLevel::Error, "newest error");
+
+        update(&mut state, key(KeyCode::Char('n')), NOW + 2000);
+        assert!(matches!(state.ui.modal, Some(Modal::Notices { selected: 0 })));
+        // Selected 0 = newest.
+        update(&mut state, key(KeyCode::Enter), NOW + 2000);
+        assert!(state.notices.iter().any(|n| n.text == "newest error" && n.acked));
+        assert!(state.notices.iter().any(|n| n.text == "older warning" && !n.acked));
+    }
+
+    #[test]
+    fn pending_writes_view_retries_and_discards_parked() {
+        let mut state = se4_app(true);
+        let effects = call_top_candidate(&mut state, '1');
+        let intent = effects.writes[0].clone();
+        update(
+            &mut state,
+            Msg::Write(WriteResult {
+                intent: intent.clone(),
+                outcome: WriteOutcome::Terminal {
+                    error: "500".to_owned(),
+                },
+            }),
+            NOW + 1000,
+        );
+        assert!(state.pending_writes.iter().any(|p| p.status == PendingStatus::Parked));
+
+        // Enter re-queues the parked write with a fresh attempt budget.
+        update(&mut state, key(KeyCode::Char('w')), NOW + 2000);
+        let effects = update(&mut state, key(KeyCode::Enter), NOW + 2000);
+        assert_eq!(effects.writes, vec![intent.clone()]);
+        assert!(state.pending_writes.iter().all(|p| p.status == PendingStatus::Queued));
+
+        // Park it again and discard it (the writes modal is still open).
+        update(
+            &mut state,
+            Msg::Write(WriteResult {
+                intent,
+                outcome: WriteOutcome::Terminal {
+                    error: "500".to_owned(),
+                },
+            }),
+            NOW + 3000,
+        );
+        assert!(matches!(state.ui.modal, Some(Modal::PendingWrites { .. })));
+        update(&mut state, key(KeyCode::Char('d')), NOW + 4000);
+        assert!(state.pending_writes.is_empty());
+        assert!(state.notices.iter().any(|n| n.text.contains("discarded write")));
     }
 
     #[test]

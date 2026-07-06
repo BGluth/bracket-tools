@@ -16,9 +16,9 @@ use ratatui::{
 };
 
 use crate::{
-    app::{AppState, Modal, NoticeLevel, PendingStatus, PollHealth},
-    conflict::{SetupStatus, UnixMillis},
-    model::BracketId,
+    app::{blocked_entries, flag_label, AppState, Modal, NoticeLevel, PendingStatus, PollHealth},
+    conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
+    model::{BracketId, SetKey},
     world::QueueEntry,
 };
 
@@ -40,6 +40,10 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
 
     match &state.ui.modal {
         Some(Modal::CallPicker { setup, selected }) => draw_call_picker(frame, state, *setup, *selected),
+        Some(Modal::Inspection { selected }) => draw_inspection(frame, state, *selected),
+        Some(Modal::Notices { selected }) => draw_notices(frame, state, *selected, now),
+        Some(Modal::PendingWrites { selected }) => draw_pending_writes(frame, state, *selected),
+        Some(Modal::PlayerFlags { players, selected }) => draw_player_flags(frame, state, players, *selected),
         Some(Modal::Help) => draw_help(frame),
         None => {}
     }
@@ -132,7 +136,8 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMill
 }
 
 fn draw_summaries(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let header = Row::new(["bracket", "left", "path", "ready", "proj finish", ""]).style(Style::new().add_modifier(Modifier::BOLD));
+    let header =
+        Row::new(["bracket", "left", "path", "ready", "est set", "proj finish", ""]).style(Style::new().add_modifier(Modifier::BOLD));
     let rows = state.world.summaries.iter().map(|summary| {
         let projection = match summary.projected_finish {
             Some(at) => fmt_clock(at),
@@ -144,11 +149,16 @@ fn draw_summaries(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         } else {
             ""
         };
+        // Duration introspection: the estimate plus how much of it is still
+        // prior vs observed ("8m00s ·3" = three real samples blended in).
+        let estimate = fmt_age((state.durations.estimate_secs(&summary.id) * 1000.0) as i64);
+        let samples = state.durations.sample_count(&summary.id);
         Row::new([
             short_name(&summary.id).to_owned(),
             summary.incomplete_sets.to_string(),
             summary.critical_path.to_string(),
             summary.callable_now.to_string(),
+            format!("{estimate} ·{samples}"),
             projection,
             marker.to_owned(),
         ])
@@ -158,6 +168,7 @@ fn draw_summaries(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         Constraint::Length(5),
         Constraint::Length(5),
         Constraint::Length(5),
+        Constraint::Length(10),
         Constraint::Length(11),
         Constraint::Min(6),
     ];
@@ -231,6 +242,14 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMil
         spans.push(Span::styled(format!("│ writes {queued} pending, {parked} parked "), style));
     }
 
+    let unread = state.notices.iter().filter(|n| !n.acked && n.level != NoticeLevel::Info).count();
+    if unread > 0 {
+        spans.push(Span::styled(
+            format!("│ {unread} notices (n) "),
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if let Some(notice) = state.notices.back() {
         let style = match notice.level {
             NoticeLevel::Info => Style::new().fg(Color::Gray),
@@ -285,6 +304,264 @@ fn draw_call_picker(frame: &mut Frame<'_>, state: &AppState, setup: crate::confi
     frame.render_widget(table, area);
 }
 
+fn draw_inspection(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
+    let area = centered_rect(frame.area(), 80, 70);
+    frame.render_widget(Clear, area);
+    let [list_area, reasons_area] = Layout::vertical([Constraint::Min(5), Constraint::Length(8)]).areas(area);
+
+    let entries = blocked_entries(state);
+    let selected = selected.min(entries.len().saturating_sub(1));
+    let header = Row::new(["bracket", "round", "players", "blocked by"]).style(Style::new().add_modifier(Modifier::BOLD));
+    let rows = entries.iter().enumerate().map(|(ix, (bracket, key))| {
+        let reasons = state.world.blocked.get(&(bracket.clone(), key.clone()));
+        let summary = reasons
+            .map(|list| list.iter().map(reason_tag).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        let row = Row::new([
+            short_name(bracket).to_owned(),
+            format!("R{} {}", key.round, key.identifier),
+            players_for(state, bracket, key),
+            summary,
+        ]);
+        if ix == selected {
+            row.style(SELECTED)
+        } else {
+            row
+        }
+    });
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(8),
+        Constraint::Min(20),
+        Constraint::Min(24),
+    ];
+    let title = format!("Blocked sets ({}) — Up/Down, Esc closes", entries.len());
+    frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), list_area);
+
+    let detail: Vec<Line<'_>> = entries
+        .get(selected)
+        .and_then(|(bracket, key)| state.world.blocked.get(&(bracket.clone(), key.clone())))
+        .map(|reasons| reasons.iter().map(|r| Line::from(reason_line(state, r))).collect())
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(detail).wrap(Wrap { trim: true }).block(Block::bordered().title("Why")),
+        reasons_area,
+    );
+}
+
+/// Short tag for the row summary column.
+fn reason_tag(reason: &BlockReason) -> &'static str {
+    match reason {
+        BlockReason::ConflictOnlyBracket => "conflict-only",
+        BlockReason::Completed => "done",
+        BlockReason::RemotelyActive => "remote-active",
+        BlockReason::RemotelyCalled => "remote-called",
+        BlockReason::AwaitingRemoteCompletion => "awaiting-result",
+        BlockReason::SlotsUnresolved => "slots",
+        BlockReason::HasPlaceholder => "placeholder",
+        BlockReason::BracketHeld => "held",
+        BlockReason::BracketNotOpen { .. } => "not-open",
+        BlockReason::NoPermittedFreeSetup => "no-setup",
+        BlockReason::PlayerBusy { .. } => "busy",
+        BlockReason::PlayerResting { .. } => "resting",
+        BlockReason::PlayerDeparted { .. } => "departed",
+        BlockReason::RestWindow { .. } => "rest",
+        BlockReason::PlayerDisqualified { .. } => "dq",
+        BlockReason::Snoozed { .. } => "snoozed",
+    }
+}
+
+/// Full explanation with the correction hint inline.
+fn reason_line(state: &AppState, reason: &BlockReason) -> String {
+    match reason {
+        BlockReason::ConflictOnlyBracket => "conflict-only bracket — feeds the filter, never called from here".to_owned(),
+        BlockReason::Completed => "already completed".to_owned(),
+        BlockReason::RemotelyActive => "site shows it started — r on its setup re-queues if that's wrong".to_owned(),
+        BlockReason::RemotelyCalled => "site shows it called (someone else's call?) — d force-available overrides a player".to_owned(),
+        BlockReason::AwaitingRemoteCompletion => "desk finished it; waiting for the server to confirm".to_owned(),
+        BlockReason::SlotsUnresolved => "waiting on prerequisite sets to finish".to_owned(),
+        BlockReason::HasPlaceholder => "a slot is still a placeholder".to_owned(),
+        BlockReason::BracketHeld => "bracket is manually held".to_owned(),
+        BlockReason::BracketNotOpen { starts_at } => match starts_at {
+            Some(at) => format!("bracket not open yet (starts {})", fmt_clock(at * 1000)),
+            None => "bracket not open yet".to_owned(),
+        },
+        BlockReason::NoPermittedFreeSetup => "no free setup in this bracket's pool".to_owned(),
+        BlockReason::PlayerBusy { key, source } => format!("{} busy: {}", name_for_key(state, key), busy_source_line(source)),
+        BlockReason::PlayerResting { key } => format!("{} resting (d cycles flags)", name_for_key(state, key)),
+        BlockReason::PlayerDeparted { key } => format!("{} departed for the night", name_for_key(state, key)),
+        BlockReason::RestWindow { key, until } => {
+            format!("{} inside the rest window until {}", name_for_key(state, key), fmt_clock(*until))
+        }
+        BlockReason::PlayerDisqualified { key } => format!("{} disqualified on site", name_for_key(state, key)),
+        BlockReason::Snoozed { until } => format!("snoozed until {}", fmt_clock(*until)),
+    }
+}
+
+/// Which evidence marks a player busy, with the blocking set named.
+fn busy_source_line(source: &BusySource) -> String {
+    match source {
+        BusySource::LocalSetup { setup, bracket, set } => {
+            format!("on setup {} ({} R{} {})", setup.0, short_name(bracket), set.round, set.identifier)
+        }
+        BusySource::RemoteActive { bracket, set } => {
+            format!("started remotely in {} (R{} {})", short_name(bracket), set.round, set.identifier)
+        }
+        BusySource::RemoteCalled { bracket, set } => {
+            format!("called remotely in {} (R{} {})", short_name(bracket), set.round, set.identifier)
+        }
+        BusySource::SoftDeviation { bracket, set } => {
+            format!("unrecognized state change in {} (R{} {})", short_name(bracket), set.round, set.identifier)
+        }
+    }
+}
+
+/// Best-effort display name for a conflict key (scans current snapshots).
+fn name_for_key(state: &AppState, key: &ConflictKey) -> String {
+    state
+        .brackets
+        .iter()
+        .flat_map(|b| b.state.sets.iter())
+        .flat_map(|s| s.occupants())
+        .find(|o| occupant_keys(o, &state.aliases).contains(key))
+        .map(|o| o.display_name.clone())
+        .unwrap_or_else(|| match key {
+            ConflictKey::Player(p) => format!("player {}", p.0),
+            ConflictKey::Entrant(e) => format!("entrant {}", e.0),
+        })
+}
+
+fn draw_notices(frame: &mut Frame<'_>, state: &AppState, selected: usize, now: UnixMillis) {
+    let area = centered_rect(frame.area(), 80, 70);
+    frame.render_widget(Clear, area);
+
+    let selected = selected.min(state.notices.len().saturating_sub(1));
+    let header = Row::new(["age", "level", "", "notice"]).style(Style::new().add_modifier(Modifier::BOLD));
+    let rows = state.notices.iter().rev().enumerate().map(|(ix, notice)| {
+        let (level, style) = match notice.level {
+            NoticeLevel::Info => ("info", Style::new().fg(Color::Gray)),
+            NoticeLevel::Warn => ("warn", Style::new().fg(Color::Yellow)),
+            NoticeLevel::Error => ("ERROR", Style::new().fg(Color::Red)),
+        };
+        let ack = if notice.acked { "✓" } else { "·" };
+        let row = Row::new([fmt_age(now - notice.at), level.to_owned(), ack.to_owned(), notice.text.clone()]).style(style);
+        if ix == selected {
+            row.style(SELECTED)
+        } else {
+            row
+        }
+    });
+    let widths = [
+        Constraint::Length(7),
+        Constraint::Length(6),
+        Constraint::Length(2),
+        Constraint::Min(40),
+    ];
+    let unread = state.notices.iter().filter(|n| !n.acked && n.level != NoticeLevel::Info).count();
+    let title = format!("Notices ({unread} unread) — Enter acks, Esc closes");
+    frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), area);
+}
+
+fn draw_pending_writes(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
+    let area = centered_rect(frame.area(), 80, 70);
+    frame.render_widget(Clear, area);
+    let [writes_area, ledger_area] = Layout::vertical([Constraint::Min(5), Constraint::Length(7)]).areas(area);
+
+    let selected = selected.min(state.pending_writes.len().saturating_sub(1));
+    let header = Row::new(["write", "set", "bracket", "status", "tries", "last error"]).style(Style::new().add_modifier(Modifier::BOLD));
+    let rows = state.pending_writes.iter().enumerate().map(|(ix, pending)| {
+        let status = match pending.status {
+            PendingStatus::Queued => "queued",
+            PendingStatus::AwaitingReconnect => "awaiting reconnect",
+            PendingStatus::Parked => "PARKED",
+        };
+        let row = Row::new([
+            format!("{:?}", pending.intent.kind),
+            pending.intent.id.to_string(),
+            short_name(&pending.intent.bracket).to_owned(),
+            status.to_owned(),
+            pending.attempts.to_string(),
+            pending.last_error.clone().map(|e| truncate(&e, 40)).unwrap_or_default(),
+        ]);
+        if ix == selected {
+            row.style(SELECTED)
+        } else {
+            row
+        }
+    });
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(16),
+        Constraint::Length(18),
+        Constraint::Length(5),
+        Constraint::Min(20),
+    ];
+    let title = format!(
+        "Pending writes ({}) — Enter retries parked, d discards, Esc closes",
+        state.pending_writes.len()
+    );
+    frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), writes_area);
+
+    // The divergence ledger: sets the desk re-queued that the site still
+    // shows CALLED — the co-TO handover reconciliation script.
+    let divergent: Vec<Line<'_>> = divergence_ledger(state)
+        .into_iter()
+        .map(|(bracket, key)| {
+            Line::from(format!(
+                "{} R{} {} — {} (desk board is authoritative)",
+                short_name(&bracket),
+                key.round,
+                key.identifier,
+                players_for(state, &bracket, &key),
+            ))
+        })
+        .collect();
+    let ledger_title = format!("Remote shows called; locally re-queued ({})", divergent.len());
+    frame.render_widget(
+        Paragraph::new(divergent).wrap(Wrap { trim: true }).block(Block::bordered().title(ledger_title)),
+        ledger_area,
+    );
+}
+
+/// Re-queued sets whose remote state still carries CALLED evidence.
+fn divergence_ledger(state: &AppState) -> Vec<(BracketId, SetKey)> {
+    let mut pairs: Vec<(BracketId, SetKey)> = state
+        .tombstones
+        .suppress_remote_called
+        .iter()
+        .filter(|(bracket, key)| {
+            state
+                .brackets
+                .iter()
+                .find(|b| &b.state.id == bracket)
+                .and_then(|b| b.state.sets.iter().find(|s| &s.key == key))
+                .is_some_and(|s| !s.is_completed() && s.called_evidence(&state.called_ints))
+        })
+        .cloned()
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(ConflictKey, String)], selected: usize) {
+    let area = centered_rect(frame.area(), 50, 40);
+    frame.render_widget(Clear, area);
+
+    let header = Row::new(["player", "flag"]).style(Style::new().add_modifier(Modifier::BOLD));
+    let rows = players.iter().enumerate().map(|(ix, (key, name))| {
+        let row = Row::new([name.clone(), flag_label(&state.flags, key).to_owned()]);
+        if ix == selected {
+            row.style(SELECTED)
+        } else {
+            row
+        }
+    });
+    let widths = [Constraint::Min(20), Constraint::Length(16)];
+    let title = "Player flags — Enter cycles rest/depart/force-avail, Esc closes";
+    frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), area);
+}
+
 fn draw_help(frame: &mut Frame<'_>) {
     let area = centered_rect(frame.area(), 60, 60);
     frame.render_widget(Clear, area);
@@ -295,6 +572,10 @@ fn draw_help(frame: &mut Frame<'_>) {
         "f         selected setup: free, awaiting remote result",
         "r         selected setup: un-call, set returns to the queue",
         "z         snooze the highlighted queue entry (5m)",
+        "d         player flags for the highlighted entry (rest/depart)",
+        "i         inspect blocked sets (why not callable)",
+        "n         notices page (Enter acks)",
+        "w         pending writes + divergence ledger",
         "Up/Down   move the queue highlight",
         "u         undo the last local action (single level)",
         "q/Ctrl-C  quit",
@@ -475,6 +756,66 @@ mod tests {
         let text = render(&state);
         assert!(text.contains("Call on setup 2"), "picker title:\n{text}");
         assert!(text.contains("Enter commits"), "picker hint:\n{text}");
+    }
+
+    #[test]
+    fn inspection_view_renders_block_reasons() {
+        let mut state = test_state(false);
+        // Call R1 A: the final stays blocked on slots; the other R1 set on
+        // player-busy checks isn't (players are disjoint in an SE4).
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)), NOW);
+
+        let text = render(&state);
+        assert!(text.contains("Blocked sets"), "inspection title:\n{text}");
+        assert!(text.contains("waiting on prerequisite"), "slots reason line:\n{text}");
+    }
+
+    #[test]
+    fn notices_page_renders_with_unread_count() {
+        let mut state = test_state(false);
+        state.notice(NOW, crate::app::NoticeLevel::Warn, "wifi looked shaky");
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)), NOW);
+
+        let text = render(&state);
+        assert!(text.contains("Notices (1 unread)"), "notices title:\n{text}");
+        assert!(text.contains("wifi looked shaky"), "notice body:\n{text}");
+    }
+
+    #[test]
+    fn pending_writes_view_renders_divergence_ledger() {
+        let mut state = test_state(true);
+        // Call on setup 1, then no-show re-queue: suppress_remote_called set.
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), NOW);
+        let (bracket, set_key) = {
+            let pending = &state.pending_writes[0].intent;
+            (pending.bracket.clone(), pending.key.clone())
+        };
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)), NOW + 1000);
+
+        // The site still shows the set CALLED (state int 6).
+        let ix = state.brackets.iter().position(|b| b.state.id == bracket).unwrap();
+        let set = state.brackets[ix].state.sets.iter_mut().find(|s| s.key == set_key).unwrap();
+        set.state_int = Some(6);
+        state.called_ints = vec![6];
+
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)), NOW + 2000);
+        let text = render(&state);
+        assert!(text.contains("Pending writes"), "writes title:\n{text}");
+        assert!(
+            text.contains("Remote shows called; locally re-queued (1)"),
+            "divergence ledger:\n{text}"
+        );
+    }
+
+    #[test]
+    fn summaries_show_duration_introspection() {
+        let state = test_state(false);
+        let text = render(&state);
+        assert!(text.contains("est set"), "introspection column:\n{text}");
+        assert!(text.contains("8m00s ·0"), "pure-prior estimate with zero samples:\n{text}");
     }
 
     #[test]
