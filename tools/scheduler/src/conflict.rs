@@ -340,6 +340,13 @@ impl ConflictIndex {
     pub fn rest_expiry(&self, key: &ConflictKey) -> Option<UnixMillis> {
         self.resting_until.get(key).copied()
     }
+
+    /// Extends (never shortens) a key's rest expiry. The simulator uses this
+    /// to model resting players returning after the sim horizon.
+    pub fn extend_rest(&mut self, key: ConflictKey, until: UnixMillis) {
+        let entry = self.resting_until.entry(key).or_insert(until);
+        *entry = (*entry).max(until);
+    }
 }
 
 /// A set cleared to call, with the stations it could go on.
