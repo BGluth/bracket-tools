@@ -21,7 +21,7 @@ use crate::{
     model::{BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
     persist::{BracketSnapshot, OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     ranker::GreedyRanker,
-    world::{assigned_sets, recompute, BracketState, World, WorldInputs},
+    world::{assigned_sets, recompute, BracketState, RolloutRankings, RolloutRow, SimSnapshot, World, WorldInputs},
 };
 
 /// How long `z` parks a queue entry.
@@ -33,9 +33,21 @@ pub enum Msg {
     Key(KeyEvent),
     Poll(PollResult),
     Write(WriteResult),
+    /// A background rollout evaluation landed.
+    SimResult(RolloutRankings),
     /// 1s display tick; also re-runs the recompute so time-gated state
     /// (snoozes, rest windows, bracket open times) stays current.
     Tick,
+}
+
+/// How urgently the background simulator should re-evaluate after an update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SimUrgency {
+    /// Debounced (≥5s between evaluations): routine state drift.
+    Routine,
+    /// The decision-point exemption: a setup freed — evaluate the post-free
+    /// world immediately so the next call-picker opens on a rollout ranking.
+    Immediate,
 }
 
 #[derive(Debug)]
@@ -100,20 +112,13 @@ pub enum WriteOutcome {
         offset: Option<OffsetSample>,
     },
     /// Still being retried by the writer; informational.
-    Transient {
-        error: String,
-        attempts: u32,
-    },
+    Transient { error: String, attempts: u32 },
     /// Connectivity failure: the writer hands the intent back; the app holds
     /// it until the target event polls successfully again, then revalidates
     /// and re-sends (or drops a moot intent). Never consumes park attempts.
-    AwaitReconnect {
-        error: String,
-    },
+    AwaitReconnect { error: String },
     /// Given up; parked for the TO to retry or discard.
-    Terminal {
-        error: String,
-    },
+    Terminal { error: String },
 }
 
 /// One server-clock offset observation, bracketed from a mutation round trip
@@ -169,6 +174,9 @@ pub enum Modal {
     CallPicker {
         setup: SetupId,
         selected: usize,
+        /// One rollout refresh already entered this modal session; later
+        /// results wait until it closes ("ranking updated" flag).
+        refreshed: bool,
     },
     /// Why-not-callable browser over `world.blocked` (`i`).
     Inspection {
@@ -274,6 +282,8 @@ pub struct UpdateEffects {
     /// Events whose next poll should happen immediately (freed setups
     /// awaiting results).
     pub force_poll: Vec<BracketId>,
+    /// Ask the background simulator for a fresh rollout evaluation.
+    pub sim: Option<SimUrgency>,
     pub quit: bool,
 }
 
@@ -282,7 +292,12 @@ impl UpdateEffects {
     pub fn merge(&mut self, other: Self) {
         self.writes.extend(other.writes);
         self.force_poll.extend(other.force_poll);
+        self.sim = self.sim.max(other.sim);
         self.quit |= other.quit;
+    }
+
+    fn want_sim(&mut self, urgency: SimUrgency) {
+        self.sim = self.sim.max(Some(urgency));
     }
 }
 
@@ -336,6 +351,12 @@ pub struct AppState {
     no_show_alerted: HashSet<(BracketId, SetKey)>,
 
     pub world: World,
+    /// Latest background rollout evaluation (the call-picker's preferred
+    /// ranking source; greedy is the fallback and the permanent revert).
+    pub rollout: Option<RolloutRankings>,
+    /// A result held back by the one-refresh-per-open-modal policy; applied
+    /// when the picker closes.
+    rollout_pending: Option<RolloutRankings>,
     pub dirty: bool,
     /// Set whenever a message may have changed the persisted overlay; the main
     /// loop debounces a save and clears it.
@@ -398,6 +419,8 @@ impl AppState {
             clock_offset: None,
             no_show_alerted: HashSet::new(),
             world: World::default(),
+            rollout: None,
+            rollout_pending: None,
             dirty: false,
             overlay_dirty: false,
             snapshot_dirty: false,
@@ -536,6 +559,29 @@ impl AppState {
         }
     }
 
+    /// Clones everything a background rollout evaluation needs (the simulator
+    /// task borrows nothing from the Elm loop).
+    pub fn sim_snapshot(&self, now_millis: UnixMillis) -> SimSnapshot {
+        SimSnapshot {
+            brackets: self.brackets.iter().map(|b| b.state.clone()).collect(),
+            board: self.board.clone(),
+            flags: self.flags.clone(),
+            tombstones: self.tombstones.clone(),
+            aliases: self.aliases.clone(),
+            called_ints: self.called_ints.clone(),
+            soft_busy: self.soft_busy.clone(),
+            last_completed: self.last_completed.clone(),
+            snoozes: self.snoozes.clone(),
+            callable_since: self.callable_since.clone(),
+            pool_overrides: self.pool_overrides.clone(),
+            all_setups: self.config.setups.clone(),
+            rest_window_secs: self.config.rest_window_secs,
+            sim: self.config.sim.clone(),
+            now_millis,
+            durations: self.durations.clone(),
+        }
+    }
+
     /// All state ints we can interpret (deviation baseline).
     fn known_ints(&self) -> Vec<i32> {
         let mut known = self.config.known_benign_state_ints.clone();
@@ -558,20 +604,26 @@ pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateE
     let mut effects = UpdateEffects::default();
     // Key/Poll/Write can all touch the persisted overlay; a bare Tick only
     // does when it fires a no-show alert (scan_no_shows marks it), so an idle
-    // desk never churns saves.
+    // desk never churns saves. The same three ask the simulator to
+    // re-evaluate (routine unless a handler escalated to the decision-point
+    // exemption).
     match msg {
         Msg::Key(key) => {
             handle_key(state, key, now_millis, &mut effects);
             state.overlay_dirty = true;
+            effects.want_sim(SimUrgency::Routine);
         }
         Msg::Poll(poll) => {
             handle_poll(state, poll, now_millis, &mut effects);
             state.overlay_dirty = true;
+            effects.want_sim(SimUrgency::Routine);
         }
         Msg::Write(result) => {
             handle_write_result(state, result, now_millis);
             state.overlay_dirty = true;
+            effects.want_sim(SimUrgency::Routine);
         }
+        Msg::SimResult(rankings) => apply_sim_result(state, rankings),
         Msg::Tick => {
             scan_no_shows(state, now_millis);
             state.dirty = true;
@@ -583,6 +635,32 @@ pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateE
         state.dirty = false;
     }
     effects
+}
+
+/// The one-refresh-per-modal-session policy: an open picker takes at most one
+/// marked update ("ranking updated"); later results wait for the next
+/// session. Everything else applies immediately.
+fn apply_sim_result(state: &mut AppState, rankings: RolloutRankings) {
+    match state.ui.modal.clone() {
+        Some(Modal::CallPicker {
+            setup,
+            selected,
+            refreshed,
+        }) => {
+            if refreshed {
+                state.rollout_pending = Some(rankings);
+            } else {
+                state.rollout = Some(rankings);
+                state.ui.modal = Some(Modal::CallPicker {
+                    setup,
+                    // The list may have reordered; clamp rather than chase.
+                    selected: selected.min(picker_rows(state, setup).0.len().saturating_sub(1)),
+                    refreshed: true,
+                });
+            }
+        }
+        _ => state.rollout = Some(rankings),
+    }
 }
 
 // --- keys
@@ -602,7 +680,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
         KeyCode::Char(c @ '0'..='9') => select_setup(state, c, now),
         KeyCode::Char('p') => progress_selected(state, now, effects),
         KeyCode::Char('f') => free_selected(state, now, effects),
-        KeyCode::Char('r') => requeue_selected(state, now),
+        KeyCode::Char('r') => requeue_selected(state, now, effects),
         KeyCode::Char('z') => snooze_selected(state, now),
         KeyCode::Char('u') => undo(state, now),
         KeyCode::Char('i') => state.ui.modal = Some(Modal::Inspection { selected: 0 }),
@@ -620,23 +698,29 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
 
 fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mut UpdateEffects) {
     if key.code == KeyCode::Esc {
-        state.ui.modal = None;
+        close_modal(state);
         return;
     }
     match state.ui.modal.clone() {
-        Some(Modal::CallPicker { setup, selected }) => {
-            let candidates = state.world.per_setup.get(&setup).map_or(0, Vec::len);
+        Some(Modal::CallPicker {
+            setup,
+            selected,
+            refreshed,
+        }) => {
+            let (rows, _) = picker_rows(state, setup);
             match key.code {
                 KeyCode::Up => {
                     state.ui.modal = Some(Modal::CallPicker {
                         setup,
                         selected: selected.saturating_sub(1),
+                        refreshed,
                     });
                 }
                 KeyCode::Down => {
                     state.ui.modal = Some(Modal::CallPicker {
                         setup,
-                        selected: (selected + 1).min(candidates.saturating_sub(1)),
+                        selected: (selected + 1).min(rows.len().saturating_sub(1)),
+                        refreshed,
                     });
                 }
                 KeyCode::Enter => commit_call(state, setup, selected, now, effects),
@@ -696,6 +780,33 @@ fn scroll(code: KeyCode, selected: usize, count: usize) -> Option<usize> {
     }
 }
 
+/// Closing any modal ends the picker's modal session: a rollout result held
+/// back by the one-refresh policy applies now.
+fn close_modal(state: &mut AppState) {
+    state.ui.modal = None;
+    if let Some(pending) = state.rollout_pending.take() {
+        state.rollout = Some(pending);
+    }
+}
+
+/// The rows the call-picker shows and commits against: the rollout ranking
+/// when one is available for the setup, else the greedy world ranking.
+/// Returns `(rows, from_rollout)`.
+pub(crate) fn picker_rows(state: &AppState, setup: SetupId) -> (Vec<RolloutRow>, bool) {
+    if let Some(rows) = state.rollout.as_ref().and_then(|r| r.per_setup.get(&setup)) {
+        if !rows.is_empty() {
+            return (rows.clone(), true);
+        }
+    }
+    let greedy = state
+        .world
+        .per_setup
+        .get(&setup)
+        .map(|entries| entries.iter().cloned().map(|e| RolloutRow::Call(Box::new(e))).collect())
+        .unwrap_or_default();
+    (greedy, false)
+}
+
 /// Digits map straight to the TO's setup numbering (`SetupId(d)`, `0` = 10).
 fn select_setup(state: &mut AppState, digit: char, now: UnixMillis) {
     let number = digit.to_digit(10).map(|d| if d == 0 { 10 } else { d }).unwrap_or(0);
@@ -707,7 +818,15 @@ fn select_setup(state: &mut AppState, digit: char, now: UnixMillis) {
     match status {
         SetupStatus::Free => {
             state.ui.selected_setup = Some(setup);
-            state.ui.modal = Some(Modal::CallPicker { setup, selected: 0 });
+            // A fresh modal session starts on the freshest ranking.
+            if let Some(pending) = state.rollout_pending.take() {
+                state.rollout = Some(pending);
+            }
+            state.ui.modal = Some(Modal::CallPicker {
+                setup,
+                selected: 0,
+                refreshed: false,
+            });
         }
         _ => {
             state.ui.selected_setup = Some(setup);
@@ -716,10 +835,18 @@ fn select_setup(state: &mut AppState, digit: char, now: UnixMillis) {
 }
 
 fn commit_call(state: &mut AppState, setup: SetupId, selected: usize, now: UnixMillis, effects: &mut UpdateEffects) {
-    state.ui.modal = None;
-    let Some(entry) = state.world.per_setup.get(&setup).and_then(|list| list.get(selected)).cloned() else {
-        state.notice(now, NoticeLevel::Warn, "no candidate selected");
-        return;
+    let (rows, _) = picker_rows(state, setup);
+    close_modal(state);
+    let entry = match rows.get(selected) {
+        Some(RolloutRow::Call(entry)) => (**entry).clone(),
+        Some(RolloutRow::Hold { .. }) => {
+            state.notice(now, NoticeLevel::Info, format!("holding setup {} open", setup.0));
+            return;
+        }
+        None => {
+            state.notice(now, NoticeLevel::Warn, "no candidate selected");
+            return;
+        }
     };
 
     // Re-verify against *current* state: the world snapshot may predate a
@@ -799,11 +926,13 @@ fn free_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffe
     state.tombstones.awaiting_remote_completion.insert((bracket.clone(), set.clone()));
     state.no_show_alerted.remove(&(bracket.clone(), set.clone()));
     effects.force_poll.push(bracket.clone());
+    // Decision-point exemption: evaluate the post-free world immediately.
+    effects.want_sim(SimUrgency::Immediate);
     state.dirty = true;
     state.notice(now, NoticeLevel::Info, format!("setup {} freed, awaiting result", setup.0));
 }
 
-fn requeue_selected(state: &mut AppState, now: UnixMillis) {
+fn requeue_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffects) {
     let Some((setup, status)) = selected_assignment(state) else {
         state.notice(now, NoticeLevel::Warn, "select a setup first (digit), then r");
         return;
@@ -821,6 +950,7 @@ fn requeue_selected(state: &mut AppState, now: UnixMillis) {
     state.tombstones.suppress_remote_active.insert(pair.clone());
     state.called_at.remove(&pair);
     state.no_show_alerted.remove(&pair);
+    effects.want_sim(SimUrgency::Immediate);
     state.dirty = true;
     state.notice(now, NoticeLevel::Info, format!("setup {} re-queued its set", setup.0));
 }
@@ -947,7 +1077,11 @@ fn retry_parked(state: &mut AppState, selected: usize, now: UnixMillis, effects:
     pending.status = PendingStatus::Queued;
     pending.attempts = 0;
     let intent = pending.intent.clone();
-    state.notice(now, NoticeLevel::Info, format!("retrying write {:?} for set {}", intent.kind, intent.id));
+    state.notice(
+        now,
+        NoticeLevel::Info,
+        format!("retrying write {:?} for set {}", intent.kind, intent.id),
+    );
     effects.writes.push(intent);
 }
 
@@ -962,7 +1096,11 @@ fn discard_pending(state: &mut AppState, selected: usize, now: UnixMillis) {
     let intent = pending.intent.clone();
     state.pending_writes.remove(selected);
     state.held_writes.retain(|i| *i != intent);
-    state.notice(now, NoticeLevel::Info, format!("discarded write {:?} for set {}", intent.kind, intent.id));
+    state.notice(
+        now,
+        NoticeLevel::Info,
+        format!("discarded write {:?} for set {}", intent.kind, intent.id),
+    );
 }
 
 /// `d` on the main view: tri-state flags for the highlighted queue entry's
@@ -1211,7 +1349,9 @@ fn apply_snapshot(
         state.snoozes.remove(&pair);
         state.called_at.remove(&pair);
         state.no_show_alerted.remove(&pair);
-        free_setups_holding(state, &pair, now);
+        if free_setups_holding(state, &pair, now) > 0 {
+            effects.want_sim(SimUrgency::Immediate);
+        }
     }
 
     ingest_deviations(state, ix, &prev, now);
@@ -1278,7 +1418,8 @@ fn apply_tearing_guard(runtime: &mut BracketRuntime, sets: &mut Vec<LiveSet>) ->
 }
 
 /// A set the server reports finished releases its station automatically.
-fn free_setups_holding(state: &mut AppState, pair: &(BracketId, SetKey), now: UnixMillis) {
+/// Returns how many setups freed (a freed setup is a decision point).
+fn free_setups_holding(state: &mut AppState, pair: &(BracketId, SetKey), now: UnixMillis) -> usize {
     let held: Vec<SetupId> = state
         .board
         .setups()
@@ -1289,10 +1430,12 @@ fn free_setups_holding(state: &mut AppState, pair: &(BracketId, SetKey), now: Un
         })
         .map(|s| s.id)
         .collect();
+    let freed = held.len();
     for setup in held {
         state.board.set_status(setup, SetupStatus::Free);
         state.notice(now, NoticeLevel::Info, format!("setup {} free (result arrived)", setup.0));
     }
+    freed
 }
 
 /// Unknown state-int transitions: always advisory, optionally escalated to
@@ -2019,7 +2162,10 @@ mod tests {
 
         // Two consecutive absences drop it for real, with one aggregate notice.
         update(&mut state, snapshot_msg("ultimate", 3, torn.clone()), NOW + 90_000);
-        assert!(state.brackets[0].state.sets.iter().any(|s| s.key == victim), "first absence: suspect");
+        assert!(
+            state.brackets[0].state.sets.iter().any(|s| s.key == victim),
+            "first absence: suspect"
+        );
         update(&mut state, snapshot_msg("ultimate", 4, torn), NOW + 120_000);
         assert!(
             !state.brackets[0].state.sets.iter().any(|s| s.key == victim),
@@ -2047,10 +2193,7 @@ mod tests {
             NOW + 1000,
         );
         assert_eq!(state.held_writes.len(), 1);
-        assert!(state
-            .pending_writes
-            .iter()
-            .any(|p| p.status == PendingStatus::AwaitingReconnect));
+        assert!(state.pending_writes.iter().any(|p| p.status == PendingStatus::AwaitingReconnect));
 
         // A successful poll of the target's event (newer than the intent)
         // revalidates and re-releases it to the writer.
@@ -2149,6 +2292,87 @@ mod tests {
     }
 
     #[test]
+    fn sim_results_follow_the_one_refresh_modal_policy() {
+        let mut state = se4_app(false);
+        let rankings_at = |at: i64, state: &AppState| crate::world::RolloutRankings {
+            per_setup: state
+                .world
+                .per_setup
+                .iter()
+                .map(|(setup, entries)| {
+                    (
+                        *setup,
+                        entries
+                            .iter()
+                            .cloned()
+                            .map(|e| crate::world::RolloutRow::Call(Box::new(e)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            computed_at: at,
+        };
+
+        // No modal open: applies directly and drives the picker + effects.
+        let first = rankings_at(NOW, &state);
+        update(&mut state, Msg::SimResult(first.clone()), NOW);
+        assert_eq!(state.rollout.as_ref().map(|r| r.computed_at), Some(NOW));
+
+        // Open the picker: it consumes ONE refresh (marked), then holds back.
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        assert!(matches!(state.ui.modal, Some(Modal::CallPicker { refreshed: false, .. })));
+        let second = rankings_at(NOW + 1000, &state);
+        update(&mut state, Msg::SimResult(second), NOW + 1000);
+        assert!(matches!(state.ui.modal, Some(Modal::CallPicker { refreshed: true, .. })));
+        assert_eq!(state.rollout.as_ref().map(|r| r.computed_at), Some(NOW + 1000));
+        let third = rankings_at(NOW + 2000, &state);
+        update(&mut state, Msg::SimResult(third), NOW + 2000);
+        assert_eq!(
+            state.rollout.as_ref().map(|r| r.computed_at),
+            Some(NOW + 1000),
+            "second result waits for the next modal session"
+        );
+
+        // Closing applies the held-back result.
+        update(&mut state, key(KeyCode::Esc), NOW + 3000);
+        assert_eq!(state.rollout.as_ref().map(|r| r.computed_at), Some(NOW + 2000));
+
+        // Enter commits the rollout-ranked candidate (rows come from picker_rows).
+        update(&mut state, key(KeyCode::Char('1')), NOW + 4000);
+        let effects = update(&mut state, key(KeyCode::Enter), NOW + 4000);
+        assert!(matches!(state.board.setups()[0].status, SetupStatus::Called { .. }));
+        assert!(effects.writes.is_empty(), "writes disarmed in this fixture");
+    }
+
+    #[test]
+    fn setup_freeing_requests_an_immediate_rollout() {
+        let mut state = se4_app(false);
+        let effects = call_top_candidate(&mut state, '1');
+        assert_eq!(effects.sim, Some(super::SimUrgency::Routine), "a call is routine");
+
+        // f frees the setup: the decision-point exemption fires.
+        let effects = update(&mut state, key(KeyCode::Char('f')), NOW + 1000);
+        assert_eq!(effects.sim, Some(super::SimUrgency::Immediate));
+
+        // A poll applying a snapshot is routine…
+        let sets = state.brackets[0].state.sets.clone();
+        let effects = update(&mut state, snapshot_msg("ultimate", 1, sets.clone()), NOW + 2000);
+        assert_eq!(effects.sim, Some(super::SimUrgency::Routine));
+
+        // …unless its result arrival auto-frees a setup.
+        call_top_candidate(&mut state, '1');
+        let called = match state.board.setups()[0].status.clone() {
+            SetupStatus::Called { set, .. } => set,
+            other => panic!("expected Called, got {other:?}"),
+        };
+        let mut next = sets;
+        let ix = next.iter().position(|s| s.key == called).unwrap();
+        complete(&mut next[ix], 0, NOW / 1000 + 900);
+        let effects = update(&mut state, snapshot_msg("ultimate", 2, next), NOW + 3000);
+        assert_eq!(effects.sim, Some(super::SimUrgency::Immediate), "auto-free is a decision point");
+    }
+
+    #[test]
     fn reassign_modal_writes_a_persisted_undoable_override() {
         // Two brackets sharing two setups, disjoint players.
         let players_a: Vec<SynthPlayer> = (1..=4)
@@ -2237,9 +2461,7 @@ mod tests {
             &mut state,
             Msg::Write(WriteResult {
                 intent: intent.clone(),
-                outcome: WriteOutcome::Terminal {
-                    error: "500".to_owned(),
-                },
+                outcome: WriteOutcome::Terminal { error: "500".to_owned() },
             }),
             NOW + 1000,
         );
@@ -2256,9 +2478,7 @@ mod tests {
             &mut state,
             Msg::Write(WriteResult {
                 intent,
-                outcome: WriteOutcome::Terminal {
-                    error: "500".to_owned(),
-                },
+                outcome: WriteOutcome::Terminal { error: "500".to_owned() },
             }),
             NOW + 3000,
         );

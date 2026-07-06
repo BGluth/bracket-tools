@@ -143,7 +143,10 @@ where
     F: Fn(&S::Error) -> PollFailure,
 {
     let Some((raw_id, _)) = tournament else {
-        return (true, Some("no tournament id available — armed on the fetch-success proxy".to_owned()));
+        return (
+            true,
+            Some("no tournament id available — armed on the fetch-success proxy".to_owned()),
+        );
     };
     let Ok(id) = raw_id.parse::<StartGgId>() else {
         return (

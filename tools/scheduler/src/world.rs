@@ -16,9 +16,14 @@ use crate::{
     duration::DurationModel,
     graph::{BracketGraph, GraphWarning},
     model::{BracketId, LiveSet, PhaseGroupInfo, SetId, SetKey},
-    ranker::{RankContext, RankedAction, RankedCandidate, Ranker},
+    ranker::{GreedyRanker, RankContext, RankedAction, RankedCandidate, Ranker},
+    rollout::RolloutRanker,
     simulator::{simulate, SimBracket, SimWorld},
 };
+
+/// How many greedy-leading candidates the decision-point rollout simulates
+/// per setup (each costs one full forward simulation).
+pub const ROLLOUT_TOP_K: usize = 8;
 
 /// One bracket's inputs to a recompute: the latest remote snapshot plus the
 /// per-bracket config the pipeline reads. The app owns these per event and
@@ -290,6 +295,164 @@ fn exhausted_setups(inputs: &WorldInputs<'_>, pools: &[Vec<SetupId>]) -> Vec<Set
         .collect()
 }
 
+/// An owned copy of everything a background rollout evaluation reads —
+/// cloned off the app state so the simulator task borrows nothing.
+#[derive(Debug, Clone)]
+pub struct SimSnapshot {
+    pub brackets: Vec<BracketState>,
+    pub board: SetupBoard,
+    pub flags: PlayerFlags,
+    pub tombstones: Tombstones,
+    pub aliases: AliasMap,
+    pub called_ints: Vec<i32>,
+    pub soft_busy: Vec<(BracketId, SetKey)>,
+    pub last_completed: HashMap<ConflictKey, UnixMillis>,
+    pub snoozes: HashMap<(BracketId, SetKey), UnixMillis>,
+    pub callable_since: HashMap<SetKey, UnixMillis>,
+    pub pool_overrides: HashMap<SetupId, PoolOverride>,
+    pub all_setups: Vec<SetupId>,
+    pub rest_window_secs: u64,
+    pub sim: SimConfig,
+    pub now_millis: UnixMillis,
+    pub durations: DurationModel,
+}
+
+/// One row of a rollout-ranked picker list: a call, or the epsilon-gated
+/// HOLD with what it waits for. (Boxed: QueueEntry dwarfs the Hold variant.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum RolloutRow {
+    Call(Box<QueueEntry>),
+    Hold {
+        waiting_for: Option<SetKey>,
+        projected_finish: Option<UnixMillis>,
+    },
+}
+
+/// A background rollout evaluation's output, stamped with the world time it
+/// was computed against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolloutRankings {
+    pub per_setup: BTreeMap<SetupId, Vec<RolloutRow>>,
+    pub computed_at: UnixMillis,
+}
+
+/// The decision-point rollout: per free setup, greedy-order the candidates,
+/// truncate to `top_k` (each costs a forward simulation), and rank those by
+/// projected makespan via [`RolloutRanker`]. Pure and owned — built to run on
+/// a blocking task off the Elm thread.
+pub fn rollout_rankings(s: &SimSnapshot, top_k: usize) -> RolloutRankings {
+    let mut graphs = HashMap::new();
+    for bracket in &s.brackets {
+        let (graph, _warnings) = BracketGraph::build(&bracket.sets, &bracket.groups);
+        graphs.insert(bracket.id.clone(), graph);
+    }
+
+    let conflict_inputs = ConflictInputs {
+        aliases: &s.aliases,
+        board: &s.board,
+        flags: &s.flags,
+        tombstones: &s.tombstones,
+        called_ints: &s.called_ints,
+        soft_busy: &s.soft_busy,
+        last_completed: &s.last_completed,
+        rest_window_secs: s.rest_window_secs,
+        snoozes: &s.snoozes,
+    };
+    let pools: Vec<Vec<SetupId>> = s
+        .brackets
+        .iter()
+        .map(|bracket| effective_pool(&bracket.id, &bracket.pool, &s.all_setups, &s.pool_overrides))
+        .collect();
+    let views: Vec<BracketView<'_>> = s
+        .brackets
+        .iter()
+        .zip(&pools)
+        .map(|(bracket, pool)| BracketView {
+            id: &bracket.id,
+            sets: &bracket.sets,
+            mode: bracket.mode,
+            start_at: bracket.start_at,
+            held: bracket.held,
+            pool,
+        })
+        .collect();
+    let index = ConflictIndex::build(&views, &conflict_inputs);
+    let mut candidates = callable_sets(&views, &index, &conflict_inputs, s.now_millis);
+    let assigned = assigned_sets(&s.board);
+    candidates.retain(|c| !assigned.contains(&(c.bracket.clone(), c.key.clone())));
+
+    let graph_refs: Vec<_> = graphs.iter().collect();
+    let remaining = aggregate_remaining(&graph_refs, &s.aliases);
+    let ctx = RankContext {
+        graphs: &graphs,
+        remaining: &remaining,
+        aliases: &s.aliases,
+        callable_since: &s.callable_since,
+        now_millis: s.now_millis,
+    };
+
+    let sim_world = SimWorld {
+        brackets: s
+            .brackets
+            .iter()
+            .zip(&pools)
+            .map(|(bracket, pool)| SimBracket {
+                id: bracket.id.clone(),
+                sets: bracket.sets.clone(),
+                groups: bracket.groups.clone(),
+                mode: bracket.mode,
+                start_at: bracket.start_at,
+                held: bracket.held,
+                pool: pool.clone(),
+            })
+            .collect(),
+        board: s.board.clone(),
+        flags: s.flags.clone(),
+        tombstones: s.tombstones.clone(),
+        called_ints: s.called_ints.clone(),
+        aliases: s.aliases.clone(),
+        soft_busy: s.soft_busy.clone(),
+        last_completed: s.last_completed.clone(),
+        rest_window_secs: s.rest_window_secs,
+        sim: s.sim.clone(),
+        now_millis: s.now_millis,
+    };
+    let rollout = RolloutRanker {
+        world: &sim_world,
+        durations: &s.durations,
+    };
+
+    let mut per_setup = BTreeMap::new();
+    for setup in s.board.free_ids() {
+        let top: Vec<_> = GreedyRanker
+            .rank(setup, &candidates, &ctx)
+            .into_iter()
+            .take(top_k)
+            .filter_map(|entry| match entry.action {
+                RankedAction::Call(callable) => Some(callable),
+                RankedAction::Hold { .. } => None,
+            })
+            .collect();
+        let rows: Vec<RolloutRow> = rollout
+            .rank(setup, &top, &ctx)
+            .into_iter()
+            .filter_map(|candidate| match &candidate.action {
+                RankedAction::Call(_) => queue_entry(candidate, &graphs).map(|e| RolloutRow::Call(Box::new(e))),
+                RankedAction::Hold { waiting_for } => Some(RolloutRow::Hold {
+                    waiting_for: waiting_for.clone(),
+                    projected_finish: candidate.components.projected_finish,
+                }),
+            })
+            .collect();
+        per_setup.insert(setup, rows);
+    }
+
+    RolloutRankings {
+        per_setup,
+        computed_at: s.now_millis,
+    }
+}
+
 /// The sets currently assigned to a setup (Called or InProgress on the
 /// board) — excluded from ranking, and re-verified against at commit time.
 pub fn assigned_sets(board: &SetupBoard) -> HashSet<(BracketId, SetKey)> {
@@ -434,6 +597,68 @@ mod tests {
 
     fn sets_mut(fixture: &mut Fixture, bracket: usize) -> &mut Vec<LiveSet> {
         &mut fixture.brackets[bracket].sets
+    }
+
+    #[test]
+    fn rollout_rankings_project_and_gate_hold() {
+        use super::{rollout_rankings, RolloutRow, SimSnapshot};
+        use crate::duration::CompletedSet;
+
+        let fixture = Fixture::new(vec![("ultimate", make_de_bracket(1001, 8))], vec![SetupId(1), SetupId(2)]);
+        let snapshot = |durations: DurationModel| SimSnapshot {
+            brackets: fixture.brackets.clone(),
+            board: fixture.board.clone(),
+            flags: PlayerFlags::default(),
+            tombstones: Tombstones::default(),
+            aliases: AliasMap::default(),
+            called_ints: vec![6],
+            soft_busy: Vec::new(),
+            last_completed: HashMap::new(),
+            snoozes: HashMap::new(),
+            callable_since: HashMap::new(),
+            pool_overrides: HashMap::new(),
+            all_setups: vec![SetupId(1), SetupId(2)],
+            rest_window_secs: 0,
+            sim: SimConfig::default(),
+            now_millis: NOW,
+            durations,
+        };
+
+        // Pure priors: rollout ranks calls with projections, but never HOLD.
+        let rankings = rollout_rankings(&snapshot(DurationModel::new()), 3);
+        let rows = &rankings.per_setup[&SetupId(1)];
+        assert!(!rows.is_empty() && rows.len() <= 3, "top-k bounded: {}", rows.len());
+        for row in rows {
+            match row {
+                RolloutRow::Call(entry) => {
+                    assert!(entry.candidate.components.projected_finish.is_some(), "projection carried");
+                }
+                RolloutRow::Hold { .. } => panic!("HOLD must not appear on pure priors"),
+            }
+        }
+
+        // With a real observed sample, HOLD appears (epsilon-gated to last
+        // place unless it genuinely wins).
+        let mut durations = DurationModel::new();
+        durations.ingest(
+            &BracketId("ultimate".to_owned()),
+            &CompletedSet {
+                key: fixture.brackets[0].sets[0].key.clone(),
+                id: fixture.brackets[0].sets[0].id.clone(),
+                started_at: Some(NOW / 1000),
+                completed_at: NOW / 1000 + 600,
+            },
+            Some(3),
+            None,
+            0,
+        );
+        let rankings = rollout_rankings(&snapshot(durations), 3);
+        let rows = &rankings.per_setup[&SetupId(1)];
+        assert!(
+            rows.iter().any(|r| matches!(r, RolloutRow::Hold { .. })),
+            "HOLD offered once samples exist: {rows:?}"
+        );
+        assert_eq!(rankings.computed_at, NOW);
     }
 
     #[test]

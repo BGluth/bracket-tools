@@ -268,7 +268,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{load_overlay, save_overlay, Load, Lockfile, OverlayDoc, OVERLAY_VERSION};
-    use crate::{conflict::SetupBoard, config::SetupId, duration::DurationModel};
+    use crate::{config::SetupId, conflict::SetupBoard, duration::DurationModel};
 
     fn scratch(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();

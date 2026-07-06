@@ -16,10 +16,12 @@ use ratatui::{
 };
 
 use crate::{
-    app::{blocked_entries, flag_label, reassign_options, AppState, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption},
+    app::{
+        blocked_entries, flag_label, picker_rows, reassign_options, AppState, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption,
+    },
     conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
     model::{BracketId, SetKey},
-    world::QueueEntry,
+    world::RolloutRow,
 };
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
@@ -39,7 +41,11 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
     draw_status(frame, status_area, state, now);
 
     match &state.ui.modal {
-        Some(Modal::CallPicker { setup, selected }) => draw_call_picker(frame, state, *setup, *selected),
+        Some(Modal::CallPicker {
+            setup,
+            selected,
+            refreshed,
+        }) => draw_call_picker(frame, state, *setup, *selected, *refreshed, now),
         Some(Modal::Inspection { selected }) => draw_inspection(frame, state, *selected),
         Some(Modal::Notices { selected }) => draw_notices(frame, state, *selected, now),
         Some(Modal::PendingWrites { selected }) => draw_pending_writes(frame, state, *selected),
@@ -269,26 +275,58 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMil
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_call_picker(frame: &mut Frame<'_>, state: &AppState, setup: crate::config::SetupId, selected: usize) {
+fn draw_call_picker(
+    frame: &mut Frame<'_>,
+    state: &AppState,
+    setup: crate::config::SetupId,
+    selected: usize,
+    refreshed: bool,
+    now: UnixMillis,
+) {
     let area = centered_rect(frame.area(), 70, 60);
     frame.render_widget(Clear, area);
 
-    let empty = Vec::new();
-    let candidates: &Vec<QueueEntry> = state.world.per_setup.get(&setup).unwrap_or(&empty);
-    let header =
-        Row::new(["#", "bracket", "round", "players", "depth", "iron", "unblk", "wait"]).style(Style::new().add_modifier(Modifier::BOLD));
-    let rows = candidates.iter().enumerate().map(|(ix, entry)| {
-        let components = &entry.candidate.components;
-        let row = Row::new([
-            format!("{}", ix + 1),
-            short_name(&entry.bracket).to_owned(),
-            entry.round_text.clone(),
-            entry.players.clone(),
-            components.depth.to_string(),
-            components.ironman.to_string(),
-            components.unblock.to_string(),
-            fmt_age(components.wait_secs * 1000),
-        ]);
+    let (rows, from_rollout) = picker_rows(state, setup);
+    let header = Row::new(["#", "bracket", "round", "players", "depth", "iron", "unblk", "wait", "proj"])
+        .style(Style::new().add_modifier(Modifier::BOLD));
+    let table_rows = rows.iter().enumerate().map(|(ix, picker_row)| {
+        let row = match picker_row {
+            RolloutRow::Call(entry) => {
+                let components = &entry.candidate.components;
+                Row::new([
+                    format!("{}", ix + 1),
+                    short_name(&entry.bracket).to_owned(),
+                    entry.round_text.clone(),
+                    entry.players.clone(),
+                    components.depth.to_string(),
+                    components.ironman.to_string(),
+                    components.unblock.to_string(),
+                    fmt_age(components.wait_secs * 1000),
+                    components.projected_finish.map(fmt_clock).unwrap_or_default(),
+                ])
+            }
+            RolloutRow::Hold {
+                waiting_for,
+                projected_finish,
+            } => {
+                let waiting = waiting_for
+                    .as_ref()
+                    .map(|key| format!("waiting for R{} {}", key.round, key.identifier))
+                    .unwrap_or_else(|| "waiting".to_owned());
+                Row::new([
+                    format!("{}", ix + 1),
+                    "HOLD".to_owned(),
+                    String::new(),
+                    waiting,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    projected_finish.map(fmt_clock).unwrap_or_default(),
+                ])
+                .style(Style::new().fg(Color::Cyan))
+            }
+        };
         if ix == selected {
             row.style(SELECTED)
         } else {
@@ -298,15 +336,23 @@ fn draw_call_picker(frame: &mut Frame<'_>, state: &AppState, setup: crate::confi
     let widths = [
         Constraint::Length(3),
         Constraint::Length(14),
-        Constraint::Length(18),
-        Constraint::Min(24),
+        Constraint::Length(16),
+        Constraint::Min(22),
         Constraint::Length(5),
         Constraint::Length(4),
         Constraint::Length(5),
         Constraint::Length(7),
+        Constraint::Length(6),
     ];
-    let title = format!("Call on setup {} — Enter commits, Esc cancels", setup.0);
-    let table = Table::new(rows, widths).header(header).block(Block::bordered().title(title));
+    let ranking = if from_rollout {
+        let age = state.rollout.as_ref().map(|r| fmt_age(now - r.computed_at)).unwrap_or_default();
+        let updated = if refreshed { ", ranking updated" } else { "" };
+        format!("rollout {age} old{updated}")
+    } else {
+        "greedy (rollout pending)".to_owned()
+    };
+    let title = format!("Call on setup {} [{ranking}] — Enter commits, Esc cancels", setup.0);
+    let table = Table::new(table_rows, widths).header(header).block(Block::bordered().title(title));
     frame.render_widget(table, area);
 }
 
@@ -342,7 +388,10 @@ fn draw_inspection(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
         Constraint::Min(24),
     ];
     let title = format!("Blocked sets ({}) — Up/Down, Esc closes", entries.len());
-    frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), list_area);
+    frame.render_widget(
+        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+        list_area,
+    );
 
     let detail: Vec<Line<'_>> = entries
         .get(selected)
@@ -350,7 +399,9 @@ fn draw_inspection(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
         .map(|reasons| reasons.iter().map(|r| Line::from(reason_line(state, r))).collect())
         .unwrap_or_default();
     frame.render_widget(
-        Paragraph::new(detail).wrap(Wrap { trim: true }).block(Block::bordered().title("Why")),
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: true })
+            .block(Block::bordered().title("Why")),
         reasons_area,
     );
 }
@@ -417,7 +468,12 @@ fn busy_source_line(source: &BusySource) -> String {
             format!("called remotely in {} (R{} {})", short_name(bracket), set.round, set.identifier)
         }
         BusySource::SoftDeviation { bracket, set } => {
-            format!("unrecognized state change in {} (R{} {})", short_name(bracket), set.round, set.identifier)
+            format!(
+                "unrecognized state change in {} (R{} {})",
+                short_name(bracket),
+                set.round,
+                set.identifier
+            )
         }
     }
 }
@@ -507,7 +563,10 @@ fn draw_pending_writes(frame: &mut Frame<'_>, state: &AppState, selected: usize)
         "Pending writes ({}) — Enter retries parked, d discards, Esc closes",
         state.pending_writes.len()
     );
-    frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), writes_area);
+    frame.render_widget(
+        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+        writes_area,
+    );
 
     // The divergence ledger: sets the desk re-queued that the site still
     // shows CALLED — the co-TO handover reconciliation script.
@@ -525,7 +584,9 @@ fn draw_pending_writes(frame: &mut Frame<'_>, state: &AppState, selected: usize)
         .collect();
     let ledger_title = format!("Remote shows called; locally re-queued ({})", divergent.len());
     frame.render_widget(
-        Paragraph::new(divergent).wrap(Wrap { trim: true }).block(Block::bordered().title(ledger_title)),
+        Paragraph::new(divergent)
+            .wrap(Wrap { trim: true })
+            .block(Block::bordered().title(ledger_title)),
         ledger_area,
     );
 }
@@ -569,10 +630,7 @@ fn draw_reassign(frame: &mut Frame<'_>, state: &AppState, setup: crate::config::
         }
     });
     let title = format!("Reassign setup {} — Enter applies, Esc cancels", setup.0);
-    frame.render_widget(
-        Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)),
-        area,
-    );
+    frame.render_widget(Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)), area);
 }
 
 fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(ConflictKey, String)], selected: usize) {
@@ -788,6 +846,43 @@ mod tests {
         let text = render(&state);
         assert!(text.contains("Call on setup 2"), "picker title:\n{text}");
         assert!(text.contains("Enter commits"), "picker hint:\n{text}");
+        assert!(text.contains("greedy (rollout pending)"), "greedy fallback labeled:\n{text}");
+    }
+
+    #[test]
+    fn call_picker_labels_rollout_and_renders_hold() {
+        let mut state = test_state(false);
+        let per_setup = state
+            .world
+            .per_setup
+            .iter()
+            .map(|(setup, entries)| {
+                let mut rows: Vec<crate::world::RolloutRow> = entries
+                    .iter()
+                    .cloned()
+                    .map(|e| crate::world::RolloutRow::Call(Box::new(e)))
+                    .collect();
+                rows.push(crate::world::RolloutRow::Hold {
+                    waiting_for: None,
+                    projected_finish: Some(NOW + 3_600_000),
+                });
+                (*setup, rows)
+            })
+            .collect();
+        update(
+            &mut state,
+            Msg::SimResult(crate::world::RolloutRankings {
+                per_setup,
+                computed_at: NOW,
+            }),
+            NOW,
+        );
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)), NOW);
+
+        let text = render(&state);
+        assert!(text.contains("[rollout"), "rollout-labeled title:\n{text}");
+        assert!(text.contains("HOLD"), "hold row renders:\n{text}");
+        assert!(text.contains("proj"), "projection column:\n{text}");
     }
 
     #[test]
@@ -825,7 +920,11 @@ mod tests {
             let pending = &state.pending_writes[0].intent;
             (pending.bracket.clone(), pending.key.clone())
         };
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)), NOW + 1000);
+        update(
+            &mut state,
+            Msg::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            NOW + 1000,
+        );
 
         // The site still shows the set CALLED (state int 6).
         let ix = state.brackets.iter().position(|b| b.state.id == bracket).unwrap();
@@ -833,7 +932,11 @@ mod tests {
         set.state_int = Some(6);
         state.called_ints = vec![6];
 
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)), NOW + 2000);
+        update(
+            &mut state,
+            Msg::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            NOW + 2000,
+        );
         let text = render(&state);
         assert!(text.contains("Pending writes"), "writes title:\n{text}");
         assert!(

@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
-    app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, UpdateEffects, WriteIntent},
+    app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
     cli::{build_live_source, resolve_token, Cli},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
@@ -25,6 +25,7 @@ use bracket_tools_scheduler::{
     set_source::SetSource,
     terminal::{install_panic_hook, TerminalGuard},
     ui,
+    world::{rollout_rankings, SimSnapshot, ROLLOUT_TOP_K},
     writer::{run_writer, WriterConfig},
     SchedulerConfig,
 };
@@ -40,6 +41,9 @@ const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 const SAVE_DEBOUNCE_MS: i64 = 2000;
 const DEFAULT_STATE_FILE: &str = "scheduler-state.json";
 const DEFAULT_SNAPSHOT_FILE: &str = "scheduler-snapshot.json";
+/// Routine rollout evaluations run at most this often; the decision-point
+/// exemption (setup freed) bypasses it.
+const SIM_DEBOUNCE_MS: i64 = 5000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -171,7 +175,10 @@ fn restore_overlay(state: &mut AppState, path: &Path) {
             state.notice(now, NoticeLevel::Info, format!("restored session state from {}", path.display()));
         }
         Ok(Load::Recovered(backup)) => {
-            let text = format!("state file was corrupt or from another version; backed up to {} — starting fresh", backup.display());
+            let text = format!(
+                "state file was corrupt or from another version; backed up to {} — starting fresh",
+                backup.display()
+            );
             state.notice(now, NoticeLevel::Warn, text);
         }
         Ok(Load::None) => {}
@@ -226,6 +233,8 @@ where
     F: Fn(&S::Error) -> PollFailure + Send + Sync + Clone + 'static,
 {
     let mut last_save: UnixMillis = 0;
+    let mut last_sim_dispatch: UnixMillis = 0;
+    let mut sim_pending = false;
     loop {
         let mut effects = UpdateEffects::default();
         tokio::select! {
@@ -254,6 +263,18 @@ where
         }
         if effects.quit {
             break;
+        }
+        // Rollout triggers: Immediate (setup freed) bypasses the debounce;
+        // Routine coalesces to one evaluation per window (the 1s tick keeps
+        // this loop spinning, so pending requests flush on time).
+        if effects.sim == Some(SimUrgency::Routine) {
+            sim_pending = true;
+        }
+        let now = now_millis();
+        if effects.sim == Some(SimUrgency::Immediate) || (sim_pending && now - last_sim_dispatch >= SIM_DEBOUNCE_MS) {
+            let _ = tasks.sim_tx.send(state.sim_snapshot(now));
+            last_sim_dispatch = now;
+            sim_pending = false;
         }
         if (state.overlay_dirty || state.snapshot_dirty) && now_millis() - last_save >= SAVE_DEBOUNCE_MS {
             if state.overlay_dirty {
@@ -286,6 +307,7 @@ where
     join_set: JoinSet<&'static str>,
     force_tx: UnboundedSender<BracketId>,
     write_tx: UnboundedSender<WriteIntent>,
+    sim_tx: UnboundedSender<SimSnapshot>,
     source: Arc<S>,
     poller_config: PollerConfig,
     events: Vec<BracketId>,
@@ -301,10 +323,12 @@ where
     fn new(source: Arc<S>, poller_config: PollerConfig, events: Vec<BracketId>, classify: F, tx: UnboundedSender<Msg>) -> Self {
         let (force_tx, _unused_force) = unbounded_channel();
         let (write_tx, _unused_write) = unbounded_channel();
+        let (sim_tx, _unused_sim) = unbounded_channel();
         let mut tasks = Self {
             join_set: JoinSet::new(),
             force_tx,
             write_tx,
+            sim_tx,
             source,
             poller_config,
             events,
@@ -314,6 +338,7 @@ where
         tasks.spawn_poller();
         tasks.spawn_writer();
         tasks.spawn_tick();
+        tasks.spawn_simulator();
         tasks
     }
 
@@ -357,6 +382,29 @@ where
         });
     }
 
+    /// The background rollout evaluator: drains to the newest snapshot (only
+    /// the latest world matters), evaluates on a blocking thread (N+1 forward
+    /// simulations), and publishes the ranking as a [`Msg::SimResult`].
+    fn spawn_simulator(&mut self) {
+        let (sim_tx, mut sim_rx) = unbounded_channel::<SimSnapshot>();
+        self.sim_tx = sim_tx;
+        let tx = self.tx.clone();
+        self.join_set.spawn(async move {
+            while let Some(mut snapshot) = sim_rx.recv().await {
+                while let Ok(newer) = sim_rx.try_recv() {
+                    snapshot = newer;
+                }
+                let Ok(rankings) = tokio::task::spawn_blocking(move || rollout_rankings(&snapshot, ROLLOUT_TOP_K)).await else {
+                    return "simulator";
+                };
+                if tx.send(Msg::SimResult(rankings)).is_err() {
+                    return "simulator";
+                }
+            }
+            "simulator"
+        });
+    }
+
     /// Respawns whichever supervised task ended; returns its name for the
     /// banner. A panic (Err) can't name its task; the poller is the likely
     /// culprit (the tick task's only fallible operation is a channel send
@@ -367,6 +415,7 @@ where
         match name {
             "tick" => self.spawn_tick(),
             "writer" => self.spawn_writer(),
+            "simulator" => self.spawn_simulator(),
             _ => self.spawn_poller(),
         }
         name

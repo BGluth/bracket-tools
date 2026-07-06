@@ -177,11 +177,7 @@ pub fn effective_pool(
     all_setups: &[SetupId],
     overrides: &HashMap<SetupId, PoolOverride>,
 ) -> Vec<SetupId> {
-    let mut pool: Vec<SetupId> = config_pool
-        .iter()
-        .filter(|s| !overrides.contains_key(s))
-        .copied()
-        .collect();
+    let mut pool: Vec<SetupId> = config_pool.iter().filter(|s| !overrides.contains_key(s)).copied().collect();
     for setup in all_setups {
         let extra = match overrides.get(setup) {
             Some(PoolOverride::Dedicated(b)) => b == bracket,
