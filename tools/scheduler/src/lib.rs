@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod conflict;
 pub mod duration;
+pub mod fixture_source;
 pub mod graph;
 pub mod model;
 pub mod ranker;
