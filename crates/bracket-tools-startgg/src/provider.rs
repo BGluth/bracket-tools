@@ -10,6 +10,7 @@ use bracket_tools_cache::{
     storage::{Storage, StorageError},
 };
 use bracket_tools_startgg_schema::{
+    admin_probe::{AdminProbe, AdminProbeVariables},
     get_event_structure::{self, GetEventStructure, GetEventStructureVariables},
     get_games_for_set::{GetGamesOfSet, GetGamesOfSetVariables},
     get_player_for_player_id::{GetPlayerForPlayerId, GetPlayerForPlayerIdVariables},
@@ -32,9 +33,9 @@ use thiserror::Error;
 
 use crate::{
     conversions::{
-        extract_event_sets_page, extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress,
-        extract_tournament_participants_page, tournament_name, GgConversionError, Page, PlayerQueryResult, SetMutationResult,
-        SetQueryResult,
+        extract_admin_probe, extract_event_sets_page, extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress,
+        extract_tournament_participants_page, tournament_name, AdminProbeResult, GgConversionError, Page, PlayerQueryResult,
+        SetMutationResult, SetQueryResult,
     },
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
     types::GGRestToken,
@@ -358,6 +359,19 @@ impl<S: Storage> GGProvider<S> {
             .await?;
 
         Ok(extract_event_structure(data)?)
+    }
+
+    /// Probes whether the current token administers a tournament: one query
+    /// answering `currentUser` and the admin-only `Tournament.admins` field
+    /// (hidden for non-admin tokens — absence is signal, not an error).
+    /// Bypasses the cache entirely.
+    pub async fn fetch_admin_probe(&self, tournament_id: StartGgId) -> Result<AdminProbeResult, GGProviderError> {
+        let gg_id = gg_id(tournament_id);
+        let data = self
+            .run_query(AdminProbe::build(AdminProbeVariables { tournament_id: &gg_id }))
+            .await?;
+
+        Ok(extract_admin_probe(data))
     }
 
     /// Marks a set as called (players summoned to their station).

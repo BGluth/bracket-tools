@@ -1,4 +1,5 @@
 use bracket_tools_startgg_schema::{
+    admin_probe::{self, AdminProbe},
     get_event_structure::{self, GetEventStructure},
     get_games_for_set::{self, GetGamesOfSet},
     get_player_for_player_id::GetPlayerForPlayerId,
@@ -161,6 +162,39 @@ pub fn extract_mark_set_in_progress(response: MarkSetInProgress) -> Result<SetMu
         .mark_set_in_progress
         .required("MarkSetInProgress", "markSetInProgress")
         .map(Into::into)
+}
+
+/// What the admin probe learned about the current token.
+///
+/// `admins` is start.gg's admin-only field: `None` means the server hid it
+/// from this token — itself evidence of a non-admin. Non-numeric ids are
+/// skipped rather than erroring (the probe is advisory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminProbeResult {
+    pub current_user: Option<StartGgId>,
+    pub admins: Option<Vec<StartGgId>>,
+}
+
+impl AdminProbeResult {
+    /// True only when both halves resolved and the token's user is listed.
+    pub fn is_admin(&self) -> bool {
+        match (&self.current_user, &self.admins) {
+            (Some(me), Some(admins)) => admins.contains(me),
+            _ => false,
+        }
+    }
+}
+
+/// Flattens an admin-probe response; infallible by design (absence is signal).
+pub fn extract_admin_probe(response: AdminProbe) -> AdminProbeResult {
+    let parse = |id: admin_probe::User| id.id.and_then(|id| id.inner().parse::<u64>().ok());
+    AdminProbeResult {
+        current_user: response.current_user.and_then(parse),
+        admins: response
+            .tournament
+            .and_then(|t| t.admins)
+            .map(|admins| admins.into_iter().flatten().filter_map(parse).collect()),
+    }
 }
 
 impl TryFrom<PlayerQueryResult> for HydratedGgPlayer {
