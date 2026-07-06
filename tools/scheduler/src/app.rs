@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use bracket_tools_startgg::{SetMutationResult, StartGgId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{SchedulerConfig, SetupId},
@@ -18,6 +19,7 @@ use crate::{
     },
     duration::{diff_snapshots, DurationModel},
     model::{BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
+    persist::{OverlayDoc, OVERLAY_VERSION},
     ranker::GreedyRanker,
     world::{assigned_sets, recompute, BracketState, World, WorldInputs},
 };
@@ -66,7 +68,7 @@ pub enum PollFailure {
     Persistent(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteKind {
     Called,
     InProgress,
@@ -74,7 +76,7 @@ pub enum WriteKind {
 
 /// A mutation the update loop wants performed. The writer task owns retries;
 /// the intent is immutable once issued.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WriteIntent {
     pub bracket: BracketId,
     pub key: SetKey,
@@ -103,14 +105,14 @@ pub enum WriteOutcome {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingStatus {
     Queued,
     Parked,
 }
 
 /// A write the TO committed locally that hasn't been confirmed remotely.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingWrite {
     pub intent: WriteIntent,
     pub status: PendingStatus,
@@ -118,18 +120,22 @@ pub struct PendingWrite {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NoticeLevel {
     Info,
     Warn,
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Notice {
     pub at: UnixMillis,
     pub level: NoticeLevel,
     pub text: String,
+    /// Cleared by the notices page (`n`). Unacked `Warn`/`Error` notices are
+    /// the correctness-relevant ones persisted across a restart.
+    #[serde(default)]
+    pub acked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,6 +249,12 @@ pub struct AppState {
 
     pub world: World,
     pub dirty: bool,
+    /// Set whenever a message may have changed the persisted overlay; the main
+    /// loop debounces a save and clears it.
+    pub overlay_dirty: bool,
+    /// The last overlay save failed (state file unwritable) — drives the
+    /// "STATE NOT PERSISTING" badge.
+    pub persist_failed: bool,
     pub ui: UiState,
     undo: Option<UndoSnapshot>,
 }
@@ -292,6 +304,8 @@ impl AppState {
             no_show_alerted: HashSet::new(),
             world: World::default(),
             dirty: false,
+            overlay_dirty: false,
+            persist_failed: false,
             ui: UiState::default(),
             undo: None,
             config,
@@ -308,10 +322,87 @@ impl AppState {
             at,
             level,
             text: text.into(),
+            acked: false,
         });
         if self.notices.len() > NOTICE_CAP {
             self.notices.pop_front();
         }
+    }
+
+    /// Snapshots the persisted overlay. Only unacked `Warn`/`Error` notices
+    /// survive — `Info` chatter ("called X", "freed Y") is transient, not
+    /// correctness state worth rehydrating.
+    pub fn to_overlay(&self) -> OverlayDoc {
+        OverlayDoc {
+            version: OVERLAY_VERSION,
+            board: self.board.clone(),
+            flags: self.flags.clone(),
+            tombstones: self.tombstones.clone(),
+            snoozes: flatten_pair_map(&self.snoozes),
+            last_completed: self.last_completed.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            callable_since: self.callable_since.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            called_at: flatten_pair_map(&self.called_at),
+            called_ints: self.called_ints.clone(),
+            in_progress_ints: self.in_progress_ints.clone(),
+            soft_busy: self.soft_busy.clone(),
+            durations: self.durations.clone(),
+            pending_writes: self.pending_writes.clone(),
+            notices: self
+                .notices
+                .iter()
+                .filter(|n| !n.acked && n.level != NoticeLevel::Info)
+                .cloned()
+                .collect(),
+            no_show_alerted: self.no_show_alerted.iter().cloned().collect(),
+        }
+    }
+
+    /// Rehydrates a persisted overlay over a freshly-bootstrapped state,
+    /// reconciling against the current config (the setup inventory and known
+    /// state ints stay config-authoritative) and recomputing the world.
+    pub fn apply_overlay(&mut self, doc: OverlayDoc, now_millis: UnixMillis) {
+        let mut board = SetupBoard::new(&self.config.setups);
+        for setup in doc.board.setups() {
+            if self.config.setups.contains(&setup.id) {
+                board.set_status(setup.id, setup.status.clone());
+            } else {
+                self.notice(
+                    now_millis,
+                    NoticeLevel::Warn,
+                    format!("dropped persisted state for setup {} (not in config)", setup.id.0),
+                );
+            }
+        }
+        self.board = board;
+        self.flags = doc.flags;
+        self.tombstones = doc.tombstones;
+        self.snoozes = doc.snoozes.into_iter().map(|(b, k, v)| ((b, k), v)).collect();
+        self.last_completed = doc.last_completed.into_iter().collect();
+        self.callable_since = doc.callable_since.into_iter().collect();
+        self.called_at = doc.called_at.into_iter().map(|(b, k, v)| ((b, k), v)).collect();
+        // Union so a config pin added since the last run is never dropped.
+        merge_ints(&mut self.called_ints, doc.called_ints);
+        merge_ints(&mut self.in_progress_ints, doc.in_progress_ints);
+        self.soft_busy = doc.soft_busy;
+        self.durations.restore(doc.durations);
+        // A write left in flight when we crashed has an uncertain fate; park it
+        // for the TO rather than silently re-sending (avoids a duplicate) or
+        // leaving a Queued entry that suppresses a fresh enqueue.
+        self.pending_writes = doc
+            .pending_writes
+            .into_iter()
+            .map(|mut p| {
+                if p.status == PendingStatus::Queued {
+                    p.status = PendingStatus::Parked;
+                }
+                p
+            })
+            .collect();
+        for notice in doc.notices {
+            self.notices.push_back(notice);
+        }
+        self.no_show_alerted = doc.no_show_alerted.into_iter().collect();
+        self.world = recompute_world(self, now_millis);
     }
 
     /// All state ints we can interpret (deviation baseline).
@@ -334,10 +425,22 @@ impl AppState {
 
 pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateEffects {
     let mut effects = UpdateEffects::default();
+    // Key/Poll/Write can all touch the persisted overlay; a bare Tick only
+    // does when it fires a no-show alert (scan_no_shows marks it), so an idle
+    // desk never churns saves.
     match msg {
-        Msg::Key(key) => handle_key(state, key, now_millis, &mut effects),
-        Msg::Poll(poll) => handle_poll(state, poll, now_millis, &mut effects),
-        Msg::Write(result) => handle_write_result(state, result, now_millis),
+        Msg::Key(key) => {
+            handle_key(state, key, now_millis, &mut effects);
+            state.overlay_dirty = true;
+        }
+        Msg::Poll(poll) => {
+            handle_poll(state, poll, now_millis, &mut effects);
+            state.overlay_dirty = true;
+        }
+        Msg::Write(result) => {
+            handle_write_result(state, result, now_millis);
+            state.overlay_dirty = true;
+        }
         Msg::Tick => {
             scan_no_shows(state, now_millis);
             state.dirty = true;
@@ -907,6 +1010,7 @@ fn scan_no_shows(state: &mut AppState, now: UnixMillis) {
         let text = format!("no-show timer expired: {players} ({})", pair.0 .0);
         state.notice(now, NoticeLevel::Warn, text);
         state.no_show_alerted.insert(pair);
+        state.overlay_dirty = true;
     }
 }
 
@@ -930,6 +1034,21 @@ fn recompute_world(state: &AppState, now: UnixMillis) -> World {
         now_millis: now,
     };
     recompute(&inputs, &state.durations, &GreedyRanker)
+}
+
+/// Flattens a `(bracket, set) → millis` map to the vec-of-pairs the JSON
+/// overlay stores (JSON object keys must be strings).
+fn flatten_pair_map(map: &HashMap<(BracketId, SetKey), UnixMillis>) -> Vec<(BracketId, SetKey, UnixMillis)> {
+    map.iter().map(|((b, k), v)| (b.clone(), k.clone(), *v)).collect()
+}
+
+/// Unions persisted state ints into the config-seeded list without duplicates.
+fn merge_ints(into: &mut Vec<i32>, from: Vec<i32>) {
+    for value in from {
+        if !into.contains(&value) {
+            into.push(value);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1442,6 +1561,35 @@ mod tests {
         assert_eq!(state.board.setups()[0].status, SetupStatus::Free, "result arrival frees the setup");
         assert_eq!(state.durations.sample_count(&BracketId(slug.to_owned())), 1);
         assert_eq!(state.world.queue.len(), 1, "B still callable; the final waits on B");
+    }
+
+    #[test]
+    fn overlay_round_trip_restores_local_state() {
+        let mut state = se4_app(true);
+        call_top_candidate(&mut state, '1');
+        let called = match state.board.setups().iter().find(|s| s.id == SetupId(1)).unwrap().status.clone() {
+            SetupStatus::Called { set, .. } => set,
+            other => panic!("setup 1 should be Called, got {other:?}"),
+        };
+        assert_eq!(state.pending_writes.len(), 1);
+
+        // Snapshot, then rehydrate onto a fresh (all-Free) instance.
+        let doc = state.to_overlay();
+        let mut restored = se4_app(true);
+        assert_eq!(restored.board.setups()[0].status, SetupStatus::Free);
+        restored.apply_overlay(doc, NOW);
+
+        match restored.board.setups().iter().find(|s| s.id == SetupId(1)).unwrap().status.clone() {
+            SetupStatus::Called { set, .. } => assert_eq!(set, called),
+            other => panic!("restored setup 1 should be Called, got {other:?}"),
+        }
+        assert!(restored.called_at.keys().any(|(_, k)| k == &called), "called_at restored");
+        assert!(restored.called_ints.contains(&6), "config-pinned int survives");
+        // The in-flight write is parked for the TO, not silently re-queued.
+        assert_eq!(restored.pending_writes.len(), 1);
+        assert_eq!(restored.pending_writes[0].status, PendingStatus::Parked);
+        // The re-ranked world matches: the called set is out of the queue.
+        assert!(restored.world.queue.iter().all(|e| e.key != called));
     }
 
     #[test]

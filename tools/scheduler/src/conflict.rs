@@ -8,6 +8,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     config::{BracketMode, SetupId},
     graph::BracketGraph,
@@ -18,7 +20,7 @@ pub type UnixMillis = i64;
 
 /// Who a busy/blocked check is about: a canonical (alias-merged) player, or
 /// the entrant-scoped fallback for identity-degraded occupants.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ConflictKey {
     Player(PlayerId),
     Entrant(EntrantId),
@@ -110,7 +112,7 @@ pub fn occupant_keys(occupant: &SlotOccupant, aliases: &AliasMap) -> Vec<Conflic
 /// What a station is doing right now. `Called`/`InProgress` are our own
 /// (local-overlay) actions; `OccupiedExternal` is someone else using the
 /// setup, optionally tied to a tracked set that will free it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetupStatus {
     Free,
     Called { bracket: BracketId, set: SetKey },
@@ -118,13 +120,13 @@ pub enum SetupStatus {
     OccupiedExternal { set: Option<(BracketId, SetKey)> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Setup {
     pub id: SetupId,
     pub status: SetupStatus,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SetupBoard {
     setups: Vec<Setup>,
 }
@@ -158,7 +160,7 @@ impl SetupBoard {
 }
 
 /// TO-set player state, keyed by canonical conflict key.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlayerFlags {
     pub resting: HashSet<ConflictKey>,
     pub departed: HashSet<ConflictKey>,
@@ -169,7 +171,7 @@ pub struct PlayerFlags {
 
 /// Per-set local knowledge that outlives a poll, keyed by (bracket, SetKey)
 /// so it survives the preview→numeric id swap.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Tombstones {
     /// We reported/observed a finish locally; the server hasn't confirmed.
     pub awaiting_remote_completion: HashSet<(BracketId, SetKey)>,

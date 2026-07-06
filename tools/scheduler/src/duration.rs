@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     config::{DEFAULT_DURATION_PRIOR_SECS, DEFAULT_PRIOR_WEIGHT},
     conflict::{occupant_keys, AliasMap, ConflictKey, UnixMillis},
@@ -83,7 +85,7 @@ pub fn diff_snapshots(prev: &[LiveSet], next: &[LiveSet], aliases: &AliasMap) ->
     diff
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Sample {
     /// bo3-normalized seconds.
     duration_secs: f64,
@@ -92,7 +94,7 @@ struct Sample {
     fingerprint: (Option<i64>, i64, Option<UnixMillis>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BracketDurations {
     prior_secs: f64,
     prior_weight: f64,
@@ -108,7 +110,7 @@ impl BracketDurations {
 
 /// Per-bracket duration estimates: prior-seeded weighted mean over observed
 /// samples.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DurationModel {
     brackets: HashMap<BracketId, BracketDurations>,
 }
@@ -190,6 +192,17 @@ impl DurationModel {
     /// True once any bracket has a real observation — the rollout HOLD gate.
     pub fn has_samples(&self) -> bool {
         self.brackets.values().any(|b| !b.samples.is_empty())
+    }
+
+    /// Restores persisted samples after a restart, keeping each bracket's
+    /// *current* prior (config may have changed between runs) and discarding
+    /// samples for brackets no longer configured.
+    pub fn restore(&mut self, saved: DurationModel) {
+        for (bracket, saved_dur) in saved.brackets {
+            if let Some(current) = self.brackets.get_mut(&bracket) {
+                current.samples = saved_dur.samples;
+            }
+        }
     }
 }
 
