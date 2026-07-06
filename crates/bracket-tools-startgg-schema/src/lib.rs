@@ -2,6 +2,7 @@ pub mod enums;
 pub mod scalars;
 pub mod schema;
 
+pub mod admin_probe;
 pub mod get_event_structure;
 pub mod get_games_for_set;
 pub mod get_num_players_in_tournament;
