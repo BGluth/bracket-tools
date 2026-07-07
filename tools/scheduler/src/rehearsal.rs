@@ -11,18 +11,20 @@
 //! roughly in step; deviations surface as ordinary no-shows and deviation
 //! notices — themselves worth rehearsing.
 
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Write as _,
+};
 
 use bracket_tools_startgg_schema::get_sets_for_event;
 use thiserror::Error;
 
 use crate::{
-    conflict::{AliasMap, PlayerFlags, SetupBoard, Tombstones, UnixMillis},
     config::SchedulerConfig,
+    conflict::{AliasMap, PlayerFlags, SetupBoard, Tombstones, UnixMillis},
     duration::DurationModel,
     fixture_source::{schema_set_from_live, FixtureError, FixtureSource},
-    model::{live_sets_from_schema, phase_groups_from_schema, BracketId, LiveSet, Prereq, SetId},
+    model::{live_sets_from_schema, phase_groups_from_schema, BracketId, EntrantId, LiveSet, PlayerId, Prereq, SetId, SlotOccupant},
     set_source::SetSource,
     simulator::{simulate_recorded, ScriptFrame, SimBracket, SimWorld},
 };
@@ -31,6 +33,8 @@ use crate::{
 /// numeric (the writer only arms mutations for numeric ids).
 const REHEARSAL_ID_BASE: u64 = 9_900_000_000;
 const REHEARSAL_IDS_PER_EVENT: u64 = 1_000_000;
+/// Synthetic drop-in entrant/player ids (see [`fill_dangling_slots`]).
+const DROP_IN_ID_BASE: u64 = 9_890_000_000;
 /// Live-observed COMPLETED state (ActivityState ordinal 3).
 const COMPLETED_STATE_INT: i32 = 3;
 
@@ -56,7 +60,8 @@ pub struct RehearsalReport {
     pub finishes_at: UnixMillis,
     /// Frames installed per bracket (initial world included).
     pub frames: Vec<(BracketId, usize)>,
-    /// Brackets the sim starved: their timelines stop at the initial world.
+    /// Brackets the sim could not play to completion: their timelines end
+    /// with sets still open.
     pub blocked: Vec<BracketId>,
 }
 
@@ -76,7 +81,11 @@ impl RehearsalReport {
             wall_mins,
         );
         for id in &self.blocked {
-            let _ = writeln!(out, "  WARNING {}: simulation starved — its timeline never advances", id.0);
+            let _ = writeln!(
+                out,
+                "  WARNING {}: could not script to completion — its timeline ends with open sets",
+                id.0
+            );
         }
         out
     }
@@ -97,6 +106,9 @@ pub async fn install_rehearsal(
 
     let (initial, world, durations) = load_world(source, config, now_millis).await?;
     let (outcome, frames) = simulate_recorded(&world, &durations);
+    // Not overall_finish: blocked brackets have no finish entry, but their
+    // frames still play out.
+    let last_frame_at = frames.iter().map(|f| f.at).max().unwrap_or(now_millis);
 
     let mut by_bracket: HashMap<BracketId, Vec<ScriptFrame>> = HashMap::new();
     for frame in frames {
@@ -119,7 +131,7 @@ pub async fn install_rehearsal(
     Ok(RehearsalReport {
         speed,
         started_at: now_millis,
-        finishes_at: now_millis + wall_offset(outcome.overall_finish, now_millis, speed),
+        finishes_at: now_millis + wall_offset(last_frame_at, now_millis, speed),
         frames: report_frames,
         blocked: outcome.blocked,
     })
@@ -136,6 +148,7 @@ async fn load_world(
     let mut durations = DurationModel::new();
     let mut initial = Vec::new();
     let mut brackets = Vec::new();
+    let mut drop_ins = DROP_IN_ID_BASE;
     for (ix, bracket) in config.brackets.iter().enumerate() {
         let missing = |source| RehearsalError::MissingEvent {
             slug: bracket.slug.clone(),
@@ -145,7 +158,8 @@ async fn load_world(
         let structure = source.fetch_event_structure(&bracket.slug).await.map_err(missing)?;
         let (live, _warnings, _skipped) = live_sets_from_schema(sets);
         let (groups, _) = phase_groups_from_schema(&structure);
-        let live = ensure_numeric_ids(live, ix);
+        let mut live = ensure_numeric_ids(live, ix);
+        fill_dangling_slots(&mut live, &mut drop_ins);
 
         durations.configure_bracket(bracket.id(), bracket.duration_prior_secs, bracket.prior_weight);
         brackets.push(SimBracket {
@@ -208,6 +222,42 @@ fn ensure_numeric_ids(sets: Vec<LiveSet>, event_ix: usize) -> Vec<LiveSet> {
             set
         })
         .collect()
+}
+
+/// Live brackets omit degenerate (bye-heavy) sets while other sets still
+/// reference them as prereqs — the server fills those slots itself, so the
+/// script has to stand in for it: each empty slot whose prereq points at an
+/// omitted set gets a synthetic drop-in occupant. Without this the losers
+/// side starves and the timeline stops mid-bracket. Ids and names are unique
+/// across the whole rehearsal so the conflict index and the preflight
+/// identity scan stay quiet.
+fn fill_dangling_slots(sets: &mut [LiveSet], next_id: &mut u64) {
+    let mut dangling = Vec::new();
+    {
+        let known: HashSet<&str> = sets.iter().map(|s| s.id.0.as_str()).collect();
+        for (s, set) in sets.iter().enumerate() {
+            for (i, slot) in set.slots.iter().enumerate() {
+                let unresolvable = matches!(&slot.prereq, Some(Prereq::Set { id, .. }) if !known.contains(id.0.as_str()));
+                if unresolvable && slot.occupant.is_none() {
+                    dangling.push((s, i));
+                }
+            }
+        }
+    }
+
+    for (s, i) in dangling {
+        let id = *next_id;
+        *next_id += 1;
+        sets[s].slots[i].occupant = Some(SlotOccupant {
+            entrant_id: EntrantId(id.to_string()),
+            display_name: format!("drop-in {}", id - DROP_IN_ID_BASE + 1),
+            is_disqualified: false,
+            player_ids: vec![PlayerId(id.to_string())],
+        });
+        if sets[s].has_placeholder && sets[s].all_slots_occupied() {
+            sets[s].has_placeholder = false;
+        }
+    }
 }
 
 /// Cascade frames share a timestamp; only the last one per instant matters.
