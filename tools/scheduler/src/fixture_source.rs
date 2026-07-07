@@ -14,6 +14,7 @@ use std::{
     future::pending,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use bracket_tools_startgg::{AdminProbeResult, SetMutationResult, StartGgId};
@@ -83,6 +84,10 @@ struct EventFixture {
     /// last snapshot once the script runs out.
     snapshots: Vec<Vec<get_sets_for_event::Set>>,
     cursor: usize,
+    /// Paced mode: wall-millisecond release offsets parallel to `snapshots`.
+    /// When set, fetches select by elapsed time on the source's shared clock
+    /// instead of advancing the cursor.
+    offsets: Option<Vec<i64>>,
     /// When set, fetches for this event never resolve (wedged-host fixture).
     hang: bool,
 }
@@ -94,6 +99,9 @@ pub struct FixtureSource {
     /// Scripted admin-probe answer; unset answers as a full admin (id 1) so
     /// writes-armed fixtures keep working.
     admin_probe: Mutex<Option<AdminProbeResult>>,
+    /// The shared rehearsal clock, armed by the first paced fetch. One clock
+    /// across all events keeps their timelines in lockstep.
+    clock: Mutex<Option<Instant>>,
 }
 
 impl FixtureSource {
@@ -148,9 +156,39 @@ impl FixtureSource {
                 structure,
                 snapshots,
                 cursor: 0,
+                offsets: None,
                 hang: false,
             },
         );
+    }
+
+    /// Switches a registered event to paced replay: each `(offset_ms, sets)`
+    /// entry releases once that much wall time has elapsed on the shared
+    /// clock. Also clears the structure's `start_at` — a paced world is live
+    /// *now*, not at the captured start time.
+    pub fn set_timeline(&mut self, slug: &str, timeline: Vec<(i64, Vec<get_sets_for_event::Set>)>) {
+        assert!(!timeline.is_empty(), "a timeline needs at least one frame");
+        let events = self.events.get_mut().unwrap();
+        let fixture = events.get_mut(&capture_key(slug)).expect("timeline target must be registered");
+        fixture.structure.start_at = None;
+        let (offsets, snapshots) = timeline.into_iter().unzip();
+        fixture.offsets = Some(offsets);
+        fixture.snapshots = snapshots;
+        fixture.cursor = 0;
+    }
+
+    /// Moves the shared clock so `elapsed` has already passed — tests and
+    /// rehearsal dry-runs fast-forward without sleeping.
+    #[doc(hidden)]
+    pub fn rewind_clock(&self, elapsed: Duration) {
+        let started = Instant::now().checked_sub(elapsed).expect("rewind within the process epoch");
+        *self.clock.lock().unwrap() = Some(started);
+    }
+
+    /// Elapsed wall milliseconds on the shared clock, arming it on first use.
+    fn elapsed_ms(&self) -> i64 {
+        let mut clock = self.clock.lock().unwrap();
+        clock.get_or_insert_with(Instant::now).elapsed().as_millis() as i64
     }
 
     /// Makes every fetch for `slug` hang forever (wedged-host fixture).
@@ -223,6 +261,10 @@ impl SetSource for FixtureSource {
                 .ok_or_else(|| FixtureError::UnknownEvent(event_slug.to_owned()))?;
             if fixture.hang {
                 None
+            } else if let Some(offsets) = &fixture.offsets {
+                let elapsed = self.elapsed_ms();
+                let due = offsets.iter().rposition(|&o| o <= elapsed).unwrap_or(0);
+                Some(fixture.snapshots[due].clone())
             } else {
                 let snapshot = fixture.snapshots[fixture.cursor].clone();
                 fixture.cursor = (fixture.cursor + 1).min(fixture.snapshots.len() - 1);
@@ -424,11 +466,12 @@ fn schema_phase_group(info: &PhaseGroupInfo) -> get_event_structure::PhaseGroup 
 mod tests {
     use std::{env, path::PathBuf, slice::from_ref, time::Duration};
 
+    use bracket_tools_startgg_schema::{get_sets_for_event, scalars::Timestamp};
     use tokio::time::timeout;
 
-    use super::{FixtureSource, MutationKind, MutationRecord, FIXTURE_CALLED_INT};
+    use super::{schema_set_from_live, FixtureSource, MutationKind, MutationRecord, FIXTURE_CALLED_INT};
     use crate::{
-        model::{live_sets_from_schema, phase_groups_from_schema},
+        model::{live_sets_from_schema, phase_groups_from_schema, LiveSet},
         set_source::SetSource,
         synth::{complete, make_de_bracket, make_swiss},
     };
@@ -498,6 +541,64 @@ mod tests {
         expect_completed(source.fetch_event_sets(SLUG).await.unwrap(), 1);
         // Script exhausted: the last snapshot repeats.
         expect_completed(source.fetch_event_sets(SLUG).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn paced_timeline_releases_by_elapsed_wall_time() {
+        let bracket = make_de_bracket(1001, 4);
+        let mut second = bracket.sets.clone();
+        complete(&mut second[0], 0, 1_751_000_100);
+        let mut third = second.clone();
+        complete(&mut third[1], 0, 1_751_000_200);
+
+        let to_schema = |sets: &[LiveSet]| sets.iter().map(schema_set_from_live).collect::<Vec<_>>();
+        let mut source = FixtureSource::new();
+        source.add_synth_event(SLUG, from_ref(&bracket.info), vec![bracket.sets.clone()]);
+        source.set_timeline(
+            SLUG,
+            vec![
+                (0, to_schema(&bracket.sets)),
+                (60_000, to_schema(&second)),
+                (120_000, to_schema(&third)),
+            ],
+        );
+
+        let completed = |sets: Vec<get_sets_for_event::Set>| {
+            let (live, _, _) = live_sets_from_schema(sets);
+            live.iter().filter(|s| s.is_completed()).count()
+        };
+
+        // Before the first offset elapses, every fetch serves frame 0.
+        assert_eq!(completed(source.fetch_event_sets(SLUG).await.unwrap()), 0);
+        assert_eq!(completed(source.fetch_event_sets(SLUG).await.unwrap()), 0);
+
+        source.rewind_clock(Duration::from_secs(61));
+        assert_eq!(completed(source.fetch_event_sets(SLUG).await.unwrap()), 1);
+
+        // Past the end of the script, the last frame repeats.
+        source.rewind_clock(Duration::from_secs(600));
+        assert_eq!(completed(source.fetch_event_sets(SLUG).await.unwrap()), 2);
+        assert_eq!(completed(source.fetch_event_sets(SLUG).await.unwrap()), 2);
+    }
+
+    #[tokio::test]
+    async fn paced_timeline_clears_structure_start() {
+        let bracket = make_de_bracket(1001, 4);
+        let mut source = FixtureSource::new();
+        source.add_synth_event(SLUG, from_ref(&bracket.info), vec![bracket.sets.clone()]);
+        source
+            .events
+            .get_mut()
+            .unwrap()
+            .get_mut(&super::capture_key(SLUG))
+            .unwrap()
+            .structure
+            .start_at = Some(Timestamp(1_800_000_000));
+
+        source.set_timeline(SLUG, vec![(0, bracket.sets.iter().map(schema_set_from_live).collect())]);
+
+        let structure = source.fetch_event_structure(SLUG).await.unwrap();
+        assert_eq!(structure.start_at, None, "a paced world is live now");
     }
 
     #[tokio::test]
