@@ -484,6 +484,7 @@ impl SimState {
                     _ => winner.clone(),
                 };
             }
+            clear_resolved_placeholder(other);
         }
 
         if self.brackets[b].mode == BracketMode::Full {
@@ -627,6 +628,7 @@ impl SimState {
                     slot.occupant = Some(qualifier);
                     changed = true;
                 }
+                clear_resolved_placeholder(set);
             }
         }
         changed
@@ -668,6 +670,16 @@ impl SimState {
             blocked,
             includes_unstarted,
         }
+    }
+}
+
+/// The sim stands in for the server when it fills slots, so it also clears
+/// `hasPlaceholder` the way the server does once a set's slots resolve —
+/// otherwise a placeholder-flagged cut is never callable and the projection
+/// starves.
+fn clear_resolved_placeholder(set: &mut LiveSet) {
+    if set.has_placeholder && set.all_slots_occupied() {
+        set.has_placeholder = false;
     }
 }
 
@@ -942,6 +954,32 @@ mod tests {
         // final 480.
         assert_eq!(outcome.overall_finish, NOW + 2 * 2 * SET_MS + 2 * SET_MS);
         assert!(outcome.blocked.is_empty());
+    }
+
+    /// Live cut sets carry `hasPlaceholder` until the server fills their
+    /// slots (observed on the FBR Pokemon capture). When the sim's own fills
+    /// resolve the slots it must clear the flag too, or the cut is never
+    /// callable and the projection starves.
+    #[test]
+    fn placeholder_flags_clear_when_the_sim_fills_slots() {
+        let setups = [SetupId(1), SetupId(2)];
+        let swiss = make_swiss(9, 8, 2);
+        let mut cut = make_unseeded_se(10, 4);
+        for set in &mut cut.sets {
+            set.has_placeholder = true;
+        }
+        let bracket = SimBracket {
+            id: BracketId("pokemon".to_owned()),
+            sets: swiss.sets.into_iter().chain(cut.sets).collect(),
+            groups: vec![swiss.info, cut.info],
+            mode: BracketMode::Full,
+            start_at: None,
+            held: false,
+            pool: setups.to_vec(),
+        };
+        let outcome = simulate(&world(vec![bracket], &setups), &DurationModel::new());
+        assert!(outcome.blocked.is_empty(), "placeholder cut starved: {:?}", outcome.blocked);
+        assert_eq!(outcome.overall_finish, NOW + 2 * 2 * SET_MS + 2 * SET_MS);
     }
 
     #[test]
