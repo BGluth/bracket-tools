@@ -70,6 +70,33 @@ rights — the safe default for a review/rehearsal). The tool opens on the setup
 Calls happen by **voice**; the start.gg writes are bookkeeping and never block advising. If
 writes are parked (non-admin, or a mutation failed), keep calling — the queue keeps working.
 
+## Dress rehearsal (`--simulate` + `--pace`)
+
+Drill the whole calling loop against the capture corpus, no network, no live tournament:
+
+```
+scheduler --config examples/fbr-100.toml \
+          --simulate ~/work/personal/bracket-tools-captures/2026-07-05_s1_smoke \
+          --pace 8
+```
+
+- `--pace FACTOR` scripts the captured world forward (a full simulated run using the
+  config's own setups and duration priors) and plays it back at FACTOR× real time. The FBR
+  corpus is ~6½ hours of tournament: `--pace 8` compresses it into ~50 minutes, `--pace 1`
+  replays at live speed. Without `--pace`, `--simulate` serves the captures as a static
+  (never-changing) world.
+- The launch banner reports the script: bracket count, frame count, playback length, and a
+  warning for any bracket the simulation could not play to completion.
+- Results arrive **on the script's schedule**, standing in for desk web-UI entry. Follow the
+  tool's recommendations and your calls stay in step with the script; deviate and you get
+  no-shows/deviation notices — drill those flows too, they're real.
+- Preview ids are materialized to numeric up front and "drop-in N" placeholder players fill
+  the bye-degenerate slots the server would fill live — both expected, not bugs.
+- A simulate run persists to `.sim` sibling state files, so a rehearsal never touches (or
+  races) live desk state. Writes go to the fixture recorder, never the network; to drill the
+  writes-armed flow, use a config without `advisor_only = true` (the fixture answers as a
+  full admin).
+
 ## Restart to reconfigure (the config-edit fallback for everything)
 
 Config changes take effect on **restart only**. A restart is safe mid-event:
