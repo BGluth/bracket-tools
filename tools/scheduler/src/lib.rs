@@ -29,4 +29,4 @@ pub use graph::{BracketGraph, GraphWarning};
 pub use model::{BracketId, LiveSet, PhaseGroupInfo, SetId, SetKey};
 pub use ranker::{GreedyRanker, RankedAction, RankedCandidate, Ranker};
 pub use rollout::RolloutRanker;
-pub use simulator::{simulate, simulate_action, Action, SimBracket, SimOutcome, SimWorld};
+pub use simulator::{simulate, simulate_action, simulate_recorded, Action, ScriptFrame, SimBracket, SimOutcome, SimWorld};

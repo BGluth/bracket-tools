@@ -84,16 +84,36 @@ pub struct SimOutcome {
     pub includes_unstarted: Vec<BracketId>,
 }
 
+/// One recorded step of a simulated run: the full set table of the bracket
+/// that just changed, stamped with the sim clock. A frame sequence is a
+/// scripted timeline of the tournament — the paced `--simulate` rehearsal
+/// replays it through [`crate::fixture_source::FixtureSource`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScriptFrame {
+    pub at: UnixMillis,
+    pub bracket: BracketId,
+    pub sets: Vec<LiveSet>,
+}
+
 pub fn simulate(world: &SimWorld, durations: &DurationModel) -> SimOutcome {
-    simulate_inner(world, durations, None)
+    simulate_inner(world, durations, None, false).0
 }
 
 pub fn simulate_action(world: &SimWorld, durations: &DurationModel, action: &Action) -> SimOutcome {
-    simulate_inner(world, durations, Some(action))
+    simulate_inner(world, durations, Some(action), false).0
 }
 
-fn simulate_inner(world: &SimWorld, durations: &DurationModel, action: Option<&Action>) -> SimOutcome {
+/// [`simulate`], additionally recording a [`ScriptFrame`] per completion (in
+/// sim-time order; cascades yield several frames at one timestamp).
+pub fn simulate_recorded(world: &SimWorld, durations: &DurationModel) -> (SimOutcome, Vec<ScriptFrame>) {
+    simulate_inner(world, durations, None, true)
+}
+
+fn simulate_inner(world: &SimWorld, durations: &DurationModel, action: Option<&Action>, record: bool) -> (SimOutcome, Vec<ScriptFrame>) {
     let mut state = SimState::init(world, durations);
+    if record {
+        state.recorder = Some(Vec::new());
+    }
     if let Some(action) = action {
         state.apply_action(action);
     }
@@ -111,7 +131,8 @@ fn simulate_inner(world: &SimWorld, durations: &DurationModel, action: Option<&A
             state.apply_completion(&bracket, &key);
         }
     }
-    state.outcome(world)
+    let outcome = state.outcome(world);
+    (outcome, state.recorder.take().unwrap_or_default())
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +169,7 @@ struct SimState {
     finish_by_bracket: HashMap<BracketId, UnixMillis>,
     no_snoozes: HashMap<(BracketId, SetKey), UnixMillis>,
     no_callable_since: HashMap<SetKey, UnixMillis>,
+    recorder: Option<Vec<ScriptFrame>>,
 }
 
 impl SimState {
@@ -177,6 +199,7 @@ impl SimState {
             finish_by_bracket: HashMap::new(),
             no_snoozes: HashMap::new(),
             no_callable_since: HashMap::new(),
+            recorder: None,
         };
         for bracket in &state.brackets {
             let (graph, _) = BracketGraph::build(&bracket.sets, &bracket.groups);
@@ -506,6 +529,14 @@ impl SimState {
         let bracket = &self.brackets[b];
         let (graph, _) = BracketGraph::build(&bracket.sets, &bracket.groups);
         self.graphs.insert(bracket_id.clone(), graph);
+
+        if let Some(frames) = &mut self.recorder {
+            frames.push(ScriptFrame {
+                at: clock,
+                bracket: bracket_id.clone(),
+                sets: self.brackets[b].sets.clone(),
+            });
+        }
     }
 
     /// Live swiss only materializes the current round; once it fully
@@ -705,7 +736,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{simulate, simulate_action, Action, SimBracket, SimWorld};
+    use super::{simulate, simulate_action, simulate_recorded, Action, SimBracket, SimWorld};
     use crate::{
         config::{BracketMode, SetupId, SimConfig},
         conflict::{AliasMap, ConflictKey, PlayerFlags, SetupBoard, SetupStatus, Tombstones},
@@ -960,6 +991,46 @@ mod tests {
         assert_eq!(outcome.overall_finish, NOW + 5 * SET_MS);
         assert_eq!(outcome.per_bracket_finish.len(), 1, "conflict-only brackets have no finish entry");
         assert!(outcome.blocked.is_empty(), "conflict-only brackets are never 'blocked'");
+    }
+
+    #[test]
+    fn recorded_frames_replay_to_full_completion() {
+        let (outcome, frames) = simulate_recorded(&de4_world(), &DurationModel::new());
+        assert_eq!(
+            outcome,
+            simulate(&de4_world(), &DurationModel::new()),
+            "recording never changes the outcome"
+        );
+
+        // 6 real sets complete (the reset never fires), in sim-time order.
+        assert_eq!(frames.len(), 6);
+        assert!(frames.windows(2).all(|w| w[0].at <= w[1].at));
+        let last = frames.last().unwrap();
+        assert_eq!(last.at, outcome.overall_finish);
+        assert_eq!(last.sets.iter().filter(|s| s.is_completed()).count(), 6);
+    }
+
+    #[test]
+    fn recorded_frames_carry_the_changed_brackets_full_table() {
+        let setups = [SetupId(1), SetupId(2)];
+        let w = world(
+            vec![
+                full_bracket("melee", make_de_bracket(9, 4), &setups),
+                full_bracket("ult", make_de_bracket(30, 4), &setups),
+            ],
+            &setups,
+        );
+        let (outcome, frames) = simulate_recorded(&w, &DurationModel::new());
+
+        assert!(outcome.blocked.is_empty());
+        for frame in &frames {
+            let source = w.brackets.iter().find(|b| b.id == frame.bracket).unwrap();
+            assert_eq!(frame.sets.len(), source.sets.len(), "a frame is the whole bracket table");
+        }
+        for bracket in ["melee", "ult"] {
+            let id = BracketId(bracket.to_owned());
+            assert!(frames.iter().any(|f| f.bracket == id), "{bracket} never recorded");
+        }
     }
 
     #[test]
