@@ -10,6 +10,7 @@ pub mod persist;
 pub mod poller;
 pub mod preflight;
 pub mod ranker;
+pub mod rehearsal;
 pub mod rollout;
 pub mod set_source;
 pub mod simulator;
