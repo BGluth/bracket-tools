@@ -30,6 +30,12 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub simulate: Option<PathBuf>,
 
+    /// Rehearsal mode for --simulate: script the captured world forward and
+    /// play it back at FACTOR x real time (1 = live pace). Without it,
+    /// --simulate serves the captures statically.
+    #[arg(long, value_name = "FACTOR", requires = "simulate")]
+    pub pace: Option<f64>,
+
     /// Disable the capture journal. TODO(S4): the journal itself lands with
     /// persistence; the flag is parsed now so scripts stay stable.
     #[arg(long)]
@@ -132,6 +138,8 @@ mod tests {
             "fbr.toml",
             "--simulate",
             "captures/",
+            "--pace",
+            "8",
             "--advisor-only",
             "--preflight-only",
             "-t",
@@ -141,6 +149,7 @@ mod tests {
 
         assert_eq!(cli.config, PathBuf::from("fbr.toml"));
         assert_eq!(cli.simulate, Some(PathBuf::from("captures/")));
+        assert_eq!(cli.pace, Some(8.0));
         assert!(cli.advisor_only);
         assert!(cli.preflight_only);
         assert_eq!(cli.token.as_deref(), Some("abc123"));
@@ -148,10 +157,16 @@ mod tests {
     }
 
     #[test]
+    fn pace_requires_simulate() {
+        assert!(Cli::try_parse_from(["scheduler", "--pace", "8"]).is_err());
+    }
+
+    #[test]
     fn cli_defaults() {
         let cli = Cli::try_parse_from(["scheduler"]).unwrap();
         assert_eq!(cli.config, PathBuf::from("scheduler.toml"));
         assert!(cli.simulate.is_none());
+        assert!(cli.pace.is_none());
         assert!(!cli.advisor_only);
         assert!(!cli.preflight_only);
     }

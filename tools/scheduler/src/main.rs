@@ -22,6 +22,7 @@ use bracket_tools_scheduler::{
     persist::{load_overlay, load_snapshot, save_overlay, save_snapshot, sibling_with_suffix, Load, Lockfile},
     poller::{classify_provider_error, run_poller, PollerConfig},
     preflight::preflight,
+    rehearsal::install_rehearsal,
     set_source::SetSource,
     terminal::{install_panic_hook, TerminalGuard},
     ui,
@@ -51,8 +52,14 @@ async fn main() -> anyhow::Result<()> {
     let config = SchedulerConfig::load(&cli.config)?;
 
     if let Some(dir) = cli.simulate.clone() {
-        let source = Arc::new(FixtureSource::from_captures(&dir).context("loading --simulate fixtures")?);
-        run(cli, config, source, classify_fixture_error).await
+        let mut source = FixtureSource::from_captures(&dir).context("loading --simulate fixtures")?;
+        if let Some(speed) = cli.pace {
+            let report = install_rehearsal(&mut source, &config, speed, now_millis())
+                .await
+                .context("building the --pace rehearsal")?;
+            print!("{}", report.render());
+        }
+        run(cli, config, Arc::new(source), classify_fixture_error).await
     } else {
         let token = resolve_token(cli.token.as_deref(), &config)?;
         let source = Arc::new(build_live_source(token)?);
