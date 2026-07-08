@@ -317,6 +317,12 @@ impl FixtureSource {
         self.reports.lock().unwrap().clone()
     }
 
+    /// True when `slug` names a registered event (live form or capture-dir
+    /// name — the same keys fetches accept).
+    pub fn has_event(&self, slug: &str) -> bool {
+        self.events.lock().unwrap().contains_key(&capture_key(slug))
+    }
+
     /// Registered event slugs in live form (`tournament/x/event/y`), sorted.
     pub fn event_slugs(&self) -> Vec<String> {
         let mut slugs: Vec<String> = self.events.lock().unwrap().keys().map(|key| live_slug(key)).collect();
@@ -752,7 +758,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::{
-        live_slug, schema_set_from_live, FixtureSource, MutationKind, MutationRecord, SynthSpecError, FIXTURE_CALLED_INT,
+        capture_key, live_slug, schema_set_from_live, FixtureSource, MutationKind, MutationRecord, SynthSpecError, FIXTURE_CALLED_INT,
         FIXTURE_IN_PROGRESS_INT, SIM_SETUP_COUNT,
     };
     use crate::{
@@ -946,6 +952,14 @@ mod tests {
     fn event_slugs_are_live_form_and_sorted() {
         let source = de_source();
         assert_eq!(source.event_slugs(), vec![SLUG.to_owned()]);
+    }
+
+    #[test]
+    fn has_event_accepts_live_slugs_and_capture_keys() {
+        let source = de_source();
+        assert!(source.has_event(SLUG));
+        assert!(source.has_event(&capture_key(SLUG)));
+        assert!(!source.has_event("tournament/your-tournament/event/your-main-event"));
     }
 
     #[test]

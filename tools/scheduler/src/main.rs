@@ -59,10 +59,7 @@ async fn main() -> anyhow::Result<()> {
 
     if cli.offline() {
         let mut source = build_offline_source(&cli)?;
-        let config = match SchedulerConfig::load_if_present(&config_path)? {
-            Some(config) => config,
-            None => derive_offline_config(&config_path, &source),
-        };
+        let config = offline_config(&cli, &config_path, &source)?;
         if cli.autoplay {
             return autoplay(&cli, &config, &source).await;
         }
@@ -92,12 +89,33 @@ fn build_offline_source(cli: &Cli) -> anyhow::Result<FixtureSource> {
     }
 }
 
+/// Picks the offline run's config. A *discovered* config (no `--config`
+/// flag) whose brackets name no event in the offline world is ignored in
+/// favor of a derived one — the live starter template or a real tournament's
+/// config would otherwise fail every preflight against a world that cannot
+/// contain its slugs. An explicit `--config` is always honored.
+fn offline_config(cli: &Cli, config_path: &Path, source: &FixtureSource) -> anyhow::Result<SchedulerConfig> {
+    match SchedulerConfig::load_if_present(config_path)? {
+        Some(config) if cli.config.is_some() || config.brackets.iter().any(|b| source.has_event(&b.slug)) => Ok(config),
+        Some(_) => {
+            println!(
+                "config at {} names no event in this offline world — ignoring it (pass --config to force it)",
+                config_path.display()
+            );
+            Ok(derive_offline_config(source))
+        }
+        None => {
+            println!("no config at {}", config_path.display());
+            Ok(derive_offline_config(source))
+        }
+    }
+}
+
 /// Zero-config offline runs derive their config from the world itself.
-fn derive_offline_config(config_path: &Path, source: &FixtureSource) -> SchedulerConfig {
+fn derive_offline_config(source: &FixtureSource) -> SchedulerConfig {
     let (config, skipped) = source.derived_config();
     println!(
-        "no config at {} — derived one: {} event(s), {} shared setups, writes fixture-armed",
-        config_path.display(),
+        "derived config: {} event(s), {} shared setups, writes fixture-armed",
         config.brackets.len(),
         config.setups.len(),
     );
@@ -526,4 +544,63 @@ fn spawn_input_thread(tx: UnboundedSender<Msg>) {
 
 fn now_millis() -> UnixMillis {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, fs, path::PathBuf, process};
+
+    use bracket_tools_scheduler::fixture_source::FixtureSource;
+    use clap::Parser;
+
+    use crate::{offline_config, Cli};
+
+    const WORLD_SLUG: &str = "tournament/synth/event/de8-1";
+
+    fn synth_source() -> FixtureSource {
+        FixtureSource::from_synth_spec("de:8").unwrap()
+    }
+
+    fn synth_cli(extra: &[&str]) -> Cli {
+        let mut argv = vec!["scheduler", "--synth", "de:8"];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv).unwrap()
+    }
+
+    fn write_config(name: &str, slug: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!("scheduler-main-test-{}-{name}.toml", process::id()));
+        fs::write(&path, format!("setups = [1, 2]\n\n[[brackets]]\nslug = {slug:?}\npool = [1, 2]\n")).unwrap();
+        path
+    }
+
+    #[test]
+    fn missing_config_derives_from_the_world() {
+        let path = env::temp_dir().join(format!("scheduler-main-test-{}-absent.toml", process::id()));
+        let config = offline_config(&synth_cli(&[]), &path, &synth_source()).unwrap();
+        assert_eq!(config.brackets[0].slug, WORLD_SLUG);
+    }
+
+    #[test]
+    fn discovered_config_outside_the_world_is_ignored() {
+        // The live starter template's placeholder slugs can never exist in a
+        // synth or capture world; discovering one must not poison the run.
+        let path = write_config("starter", "tournament/your-tournament/event/your-main-event");
+        let config = offline_config(&synth_cli(&[]), &path, &synth_source()).unwrap();
+        assert_eq!(config.brackets[0].slug, WORLD_SLUG);
+    }
+
+    #[test]
+    fn discovered_config_naming_a_world_event_is_honored() {
+        let path = write_config("matching", WORLD_SLUG);
+        let config = offline_config(&synth_cli(&[]), &path, &synth_source()).unwrap();
+        assert_eq!(config.setups.len(), 2, "the discovered config itself must be used, not a derived one");
+    }
+
+    #[test]
+    fn explicit_config_is_honored_even_outside_the_world() {
+        let path = write_config("explicit", "tournament/real/event/main");
+        let cli = synth_cli(&["--config", path.to_str().unwrap()]);
+        let config = offline_config(&cli, &path, &synth_source()).unwrap();
+        assert_eq!(config.brackets[0].slug, "tournament/real/event/main");
+    }
 }

@@ -2,6 +2,7 @@ use bracket_tools_startgg_schema::{
     admin_probe::{self, AdminProbe},
     get_event_characters::GetEventCharacters,
     get_event_structure::{self, GetEventStructure},
+    get_events_for_tournament::GetEventsForTournament,
     get_games_for_set::{self, GetGamesOfSet},
     get_player_for_player_id::GetPlayerForPlayerId,
     get_sets_for_event::{self, GetSetsForEvent},
@@ -209,6 +210,27 @@ pub fn extract_event_characters(response: GetEventCharacters) -> Vec<CharacterIn
                 name: c.name?,
             })
         })
+        .collect()
+}
+
+/// One event listed by a tournament: the full event slug (the form every
+/// per-event query takes) plus its display name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventInfo {
+    pub slug: String,
+    pub name: Option<String>,
+}
+
+/// Flattens a tournament-events response; infallible by design (an unknown
+/// tournament simply yields no events).
+pub fn extract_tournament_events(response: GetEventsForTournament) -> Vec<EventInfo> {
+    response
+        .tournament
+        .and_then(|t| t.events)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some(EventInfo { slug: e.slug?, name: e.name }))
         .collect()
 }
 

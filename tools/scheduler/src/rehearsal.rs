@@ -40,7 +40,7 @@ const COMPLETED_STATE_INT: i32 = 3;
 
 #[derive(Debug, Error)]
 pub enum RehearsalError {
-    #[error("config bracket {slug:?} is not in the capture dir: {source}")]
+    #[error("config bracket {slug:?} is not in the offline world: {source}")]
     MissingEvent {
         slug: String,
         #[source]

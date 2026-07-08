@@ -13,6 +13,7 @@ use bracket_tools_startgg_schema::{
     admin_probe::{AdminProbe, AdminProbeVariables},
     get_event_characters::{GetEventCharacters, GetEventCharactersVariables},
     get_event_structure::{self, GetEventStructure, GetEventStructureVariables},
+    get_events_for_tournament::{GetEventsForTournament, GetEventsForTournamentVariables},
     get_games_for_set::{GetGamesOfSet, GetGamesOfSetVariables},
     get_player_for_player_id::{GetPlayerForPlayerId, GetPlayerForPlayerIdVariables},
     get_sets_for_event::{self, GetSetsForEvent, GetSetsForEventVariables},
@@ -36,8 +37,9 @@ use thiserror::Error;
 use crate::{
     conversions::{
         extract_admin_probe, extract_event_characters, extract_event_sets_page, extract_event_structure, extract_mark_set_called,
-        extract_mark_set_in_progress, extract_report_bracket_set, extract_tournament_participants_page, tournament_name, AdminProbeResult,
-        CharacterInfo, GgConversionError, Page, PlayerQueryResult, SetMutationResult, SetQueryResult,
+        extract_mark_set_in_progress, extract_report_bracket_set, extract_tournament_events, extract_tournament_participants_page,
+        tournament_name, AdminProbeResult, CharacterInfo, EventInfo, GgConversionError, Page, PlayerQueryResult, SetMutationResult,
+        SetQueryResult,
     },
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
     types::GGRestToken,
@@ -374,6 +376,18 @@ impl<S: Storage> GGProvider<S> {
             .await?;
 
         Ok(extract_admin_probe(data))
+    }
+
+    /// Lists a tournament's events from its tournament slug (either form:
+    /// `tournament/foo` or bare `foo`) — the expansion step for tools that
+    /// take a whole tournament instead of per-event slugs. Bypasses the cache
+    /// entirely; an unknown tournament yields an empty list.
+    pub async fn fetch_tournament_events(&self, slug: &str) -> Result<Vec<EventInfo>, GGProviderError> {
+        let data = self
+            .run_query(GetEventsForTournament::build(GetEventsForTournamentVariables { slug }))
+            .await?;
+
+        Ok(extract_tournament_events(data))
     }
 
     /// Fetches an event's videogame character roster (the vocabulary for

@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bracket_tools_cache::null_storage::NullStorage;
 use bracket_tools_startgg::{conversions::extract_event_sets_page, types::GGRestToken, GGProvider, STARTGG_API_URL};
 use bracket_tools_startgg_schema::{
@@ -50,8 +50,13 @@ struct SmokeArgs {
     token_file: Option<PathBuf>,
 
     /// Event slug (repeatable): tournament/<tourney>/event/<event>
-    #[arg(long = "event", required = true)]
+    #[arg(long = "event", required_unless_present = "tournaments")]
     events: Vec<String>,
+
+    /// Tournament slug (repeatable): captures EVERY event of
+    /// tournament/<tourney>; combines with --event
+    #[arg(long = "tournament")]
+    tournaments: Vec<String>,
 
     /// Sets per page (drop to 25 if complexity errors appear)
     #[arg(long, default_value_t = 50)]
@@ -148,16 +153,17 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&args.out).with_context(|| format!("creating {}", args.out.display()))?;
 
     let started = Instant::now();
+    let event_slugs = expand_events(&provider, &args).await?;
     let mut cx = Capture {
         provider: &provider,
         raw_client: &raw_client,
         per_page: args.per_page,
         raw_requests: 0,
-        provider_requests: 0,
+        provider_requests: args.tournaments.len(),
     };
 
     let mut events = Vec::new();
-    for slug in &args.events {
+    for slug in &event_slugs {
         println!("== capturing {slug}");
         let event_dir = args.out.join(slug.replace('/', "_"));
         fs::create_dir_all(&event_dir).with_context(|| format!("creating {}", event_dir.display()))?;
@@ -184,6 +190,30 @@ async fn main() -> Result<()> {
     println!("\n{md}");
 
     Ok(())
+}
+
+/// The capture list: explicit `--event` slugs plus every event of each
+/// `--tournament`, deduplicated in arrival order.
+async fn expand_events(provider: &GGProvider<NullStorage>, args: &SmokeArgs) -> Result<Vec<String>> {
+    let mut slugs = args.events.clone();
+    for tournament in &args.tournaments {
+        let events = provider
+            .fetch_tournament_events(tournament)
+            .await
+            .with_context(|| format!("listing events for {tournament}"))?;
+        if events.is_empty() {
+            bail!("tournament {tournament:?} answered no events (slug typo, or a hidden/unpublished tournament?)");
+        }
+        println!("== {tournament}: {} event(s)", events.len());
+        for event in &events {
+            println!("   {} — {}", event.slug, event.name.as_deref().unwrap_or("<unnamed>"));
+        }
+        slugs.extend(events.into_iter().map(|e| e.slug));
+    }
+
+    let mut seen = BTreeSet::new();
+    slugs.retain(|slug| seen.insert(slug.clone()));
+    Ok(slugs)
 }
 
 fn resolve_token(args: &SmokeArgs) -> Result<GGRestToken> {

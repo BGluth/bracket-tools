@@ -111,6 +111,17 @@ scheduler --config examples/fbr-100.toml \
   races) live desk state. Writes go to the fixture recorder, never the network; to drill the
   writes-armed flow, use a config without `advisor_only = true` (the fixture answers as a
   full admin).
+- Need a fresh corpus (e.g. this week's unstarted brackets)? The smoke bin captures a whole
+  tournament in one flag — every event, no per-event slugs:
+
+  ```
+  cargo run -p bracket-tools-scheduler --bin smoke -- \
+      --token-file ~/work/tokens/scraper_gg.token \
+      --tournament tournament/<tourney-slug> --out <captures-dir>
+  ```
+
+  (`--event` still works for cherry-picking, and combines with `--tournament`.) Unstarted
+  published brackets capture as full preview skeletons — exactly what `--pace` rehearses.
 
 ## Autoplay replay (`--autoplay` / `--replay`) and synthetic worlds (`--synth`)
 
@@ -138,7 +149,10 @@ scheduler --replay scheduler-replay.txt                 # watch it animated (--f
   cross-bracket conflicts are real. Works with everything `--simulate` does: zero-config,
   `--pace`, `--autoplay`, or just poking at the TUI on a world that costs nothing.
 - All offline modes derive a ready-to-run config when none exists (largest captured
-  tournament, 8 shared setups, writes fixture-armed, state pinned to `.sim` files).
+  tournament, 8 shared setups, writes fixture-armed, state pinned to `.sim` files). A
+  *discovered* config (`./scheduler.toml` or the XDG path) naming no event in the offline
+  world — the live starter template, say — is ignored with a notice in favor of a derived
+  one; an explicit `--config` is always honored.
 
 ## Restart to reconfigure (the config-edit fallback for everything)
 
