@@ -25,6 +25,7 @@ use bracket_tools_scheduler::{
     poller::{classify_provider_error, run_poller, PollerConfig},
     preflight::preflight,
     rehearsal::install_rehearsal,
+    replay::{generate_replay, play_replay, render_replay},
     set_source::SetSource,
     terminal::{install_panic_hook, TerminalGuard},
     ui,
@@ -51,6 +52,9 @@ const SIM_DEBOUNCE_MS: i64 = 5000;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if let Some(path) = &cli.replay {
+        return play_replay(path, cli.frame_ms).with_context(|| format!("playing {}", path.display()));
+    }
     let config_path = cli.config_path();
 
     if cli.offline() {
@@ -59,6 +63,9 @@ async fn main() -> anyhow::Result<()> {
             Some(config) => config,
             None => derive_offline_config(&config_path, &source),
         };
+        if cli.autoplay {
+            return autoplay(&cli, &config, &source).await;
+        }
         if let Some(speed) = cli.pace {
             let report = install_rehearsal(&mut source, &config, speed, now_millis())
                 .await
@@ -99,6 +106,23 @@ fn derive_offline_config(config_path: &Path, source: &FixtureSource) -> Schedule
     }
     println!("  write a config file to pin real setups and pools");
     config
+}
+
+/// `--autoplay`: the sim plays the whole offline world, the replay lands in
+/// a file, and the decision summary prints — no TUI, no lockfile.
+async fn autoplay(cli: &Cli, config: &SchedulerConfig, source: &FixtureSource) -> anyhow::Result<()> {
+    let replay = generate_replay(source, config, now_millis())
+        .await
+        .context("generating the autoplay replay")?;
+    let text = render_replay(&replay);
+    fs::write(&cli.replay_out, &text).with_context(|| format!("writing {}", cli.replay_out.display()))?;
+    print!("{}", replay.summary());
+    println!(
+        "replay written to {} — watch it: scheduler --replay {}",
+        cli.replay_out.display(),
+        cli.replay_out.display()
+    );
+    Ok(())
 }
 
 /// No config in live mode: write the commented starter and exit so the user

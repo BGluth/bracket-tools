@@ -1,3 +1,6 @@
 /target
 scraper_gg/target
 web/edmonton-smash/target
+# Autoplay replays carry real player names from captures — never commit.
+scheduler-replay.txt
+*-replay.txt

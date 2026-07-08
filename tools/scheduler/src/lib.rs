@@ -11,6 +11,7 @@ pub mod poller;
 pub mod preflight;
 pub mod ranker;
 pub mod rehearsal;
+pub mod replay;
 pub mod rollout;
 pub mod set_source;
 pub mod simulator;
@@ -30,4 +31,6 @@ pub use graph::{BracketGraph, GraphWarning};
 pub use model::{BracketId, LiveSet, PhaseGroupInfo, SetId, SetKey};
 pub use ranker::{GreedyRanker, RankedAction, RankedCandidate, Ranker};
 pub use rollout::RolloutRanker;
-pub use simulator::{simulate, simulate_action, simulate_recorded, Action, ScriptFrame, SimBracket, SimOutcome, SimWorld};
+pub use simulator::{
+    simulate, simulate_action, simulate_autoplay, simulate_recorded, Action, ReplayEvent, ScriptFrame, SimBracket, SimOutcome, SimWorld,
+};

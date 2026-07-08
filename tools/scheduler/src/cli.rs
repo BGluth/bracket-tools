@@ -47,6 +47,25 @@ pub struct Cli {
     #[arg(long, value_name = "FACTOR", requires = "offline")]
     pub pace: Option<f64>,
 
+    /// Auto-play the offline world headlessly: the sim makes every call
+    /// itself and writes an ASCII replay + decision log instead of running
+    /// the TUI.
+    #[arg(long, requires = "offline", conflicts_with = "pace")]
+    pub autoplay: bool,
+
+    /// Where --autoplay writes the replay.
+    #[arg(long, value_name = "FILE", default_value = "scheduler-replay.txt")]
+    pub replay_out: PathBuf,
+
+    /// Play back a replay file written by --autoplay (animated, frame by
+    /// frame; Ctrl-C stops).
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "preflight_only"])]
+    pub replay: Option<PathBuf>,
+
+    /// Frame cadence for --replay playback, in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 400)]
+    pub frame_ms: u64,
+
     /// Disable the capture journal. TODO(S4): the journal itself lands with
     /// persistence; the flag is parsed now so scripts stay stable.
     #[arg(long)]

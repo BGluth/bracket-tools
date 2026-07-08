@@ -19,7 +19,7 @@ use crate::{
     duration::DurationModel,
     graph::BracketGraph,
     model::{BracketId, EntrantId, GroupKind, LiveSet, PhaseGroupInfo, Prereq, SetId, SetKey, Slot, SlotOccupant},
-    ranker::{GreedyRanker, RankContext, RankedAction, Ranker},
+    ranker::{GreedyRanker, RankContext, RankedAction, Ranker, ScoreComponents},
 };
 
 /// A remotely-active set never finishes sooner than this from "now" — we
@@ -95,31 +95,75 @@ pub struct ScriptFrame {
     pub sets: Vec<LiveSet>,
 }
 
+/// One auto-played step for the `--autoplay` replay: every greedy call the
+/// sim commits (with its score ingredients — the "why") and every completion.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplayEvent {
+    Call {
+        at: UnixMillis,
+        setup: SetupId,
+        bracket: BracketId,
+        key: SetKey,
+        players: String,
+        round_text: String,
+        components: ScoreComponents,
+        /// When the sim expects the set to finish.
+        est_finish: UnixMillis,
+    },
+    Complete {
+        at: UnixMillis,
+        bracket: BracketId,
+        key: SetKey,
+        players: String,
+        winner: String,
+        /// Incomplete sets left in the bracket after this result.
+        remaining: usize,
+    },
+}
+
 pub fn simulate(world: &SimWorld, durations: &DurationModel) -> SimOutcome {
-    simulate_inner(world, durations, None, false).0
+    simulate_inner(world, durations, None, false, false).0
 }
 
 pub fn simulate_action(world: &SimWorld, durations: &DurationModel, action: &Action) -> SimOutcome {
-    simulate_inner(world, durations, Some(action), false).0
+    simulate_inner(world, durations, Some(action), false, false).0
 }
 
 /// [`simulate`], additionally recording a [`ScriptFrame`] per completion (in
 /// sim-time order; cascades yield several frames at one timestamp).
 pub fn simulate_recorded(world: &SimWorld, durations: &DurationModel) -> (SimOutcome, Vec<ScriptFrame>) {
-    simulate_inner(world, durations, None, true)
+    let (outcome, frames, _) = simulate_inner(world, durations, None, true, false);
+    (outcome, frames)
 }
 
-fn simulate_inner(world: &SimWorld, durations: &DurationModel, action: Option<&Action>, record: bool) -> (SimOutcome, Vec<ScriptFrame>) {
+/// [`simulate`], additionally recording every greedy call (with score
+/// ingredients) and every completion — the `--autoplay` replay material.
+pub fn simulate_autoplay(world: &SimWorld, durations: &DurationModel) -> (SimOutcome, Vec<ReplayEvent>) {
+    let (outcome, _, events) = simulate_inner(world, durations, None, false, true);
+    (outcome, events)
+}
+
+fn simulate_inner(
+    world: &SimWorld,
+    durations: &DurationModel,
+    action: Option<&Action>,
+    record: bool,
+    replay: bool,
+) -> (SimOutcome, Vec<ScriptFrame>, Vec<ReplayEvent>) {
     let mut state = SimState::init(world, durations);
     if record {
         state.recorder = Some(Vec::new());
+    }
+    if replay {
+        state.replay = Some(Vec::new());
     }
     if let Some(action) = action {
         state.apply_action(action);
     }
     loop {
         state.auto_complete_walkovers();
-        while let Some((bracket, key, setup)) = state.next_assignment() {
+        while let Some((bracket, key, setup, components)) = state.next_assignment() {
+            state.record_call(&bracket, &key, setup, components);
             state.assign(&bracket, &key, setup);
         }
         let Some(((t, _), event)) = state.events.pop_first() else {
@@ -132,7 +176,9 @@ fn simulate_inner(world: &SimWorld, durations: &DurationModel, action: Option<&A
         }
     }
     let outcome = state.outcome(world);
-    (outcome, state.recorder.take().unwrap_or_default())
+    let frames = state.recorder.take().unwrap_or_default();
+    let events = state.replay.take().unwrap_or_default();
+    (outcome, frames, events)
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +216,7 @@ struct SimState {
     no_snoozes: HashMap<(BracketId, SetKey), UnixMillis>,
     no_callable_since: HashMap<SetKey, UnixMillis>,
     recorder: Option<Vec<ScriptFrame>>,
+    replay: Option<Vec<ReplayEvent>>,
 }
 
 impl SimState {
@@ -200,6 +247,7 @@ impl SimState {
             no_snoozes: HashMap::new(),
             no_callable_since: HashMap::new(),
             recorder: None,
+            replay: None,
         };
         for bracket in &state.brackets {
             let (graph, _) = BracketGraph::build(&bracket.sets, &bracket.groups);
@@ -332,7 +380,7 @@ impl SimState {
 
     /// One greedy decision: the first free setup (board order, holds
     /// skipped) with a non-empty ranking takes its top candidate.
-    fn next_assignment(&self) -> Option<(BracketId, SetKey, SetupId)> {
+    fn next_assignment(&self) -> Option<(BracketId, SetKey, SetupId, ScoreComponents)> {
         let views = self.views();
         let inputs = self.inputs();
         let index = self.conflict_index(&views, &inputs);
@@ -359,10 +407,40 @@ impl SimState {
                 let RankedAction::Call(callable) = &top.action else {
                     continue;
                 };
-                return Some((callable.bracket.clone(), callable.key.clone(), setup));
+                return Some((callable.bracket.clone(), callable.key.clone(), setup, top.components.clone()));
             }
         }
         None
+    }
+
+    /// Feeds the `--autoplay` replay log; a no-op unless armed.
+    fn record_call(&mut self, bracket_id: &BracketId, key: &SetKey, setup: SetupId, components: ScoreComponents) {
+        if self.replay.is_none() {
+            return;
+        }
+        let Some(b) = self.bracket_index(bracket_id) else {
+            return;
+        };
+        let est_finish = self.clock + self.estimate_ms(&self.brackets[b], key);
+        let (players, round_text) = self.brackets[b]
+            .sets
+            .iter()
+            .find(|s| &s.key == key)
+            .map(|s| (join_players(s), s.full_round_text.clone().unwrap_or_default()))
+            .unwrap_or_default();
+        let event = ReplayEvent::Call {
+            at: self.clock,
+            setup,
+            bracket: bracket_id.clone(),
+            key: key.clone(),
+            players,
+            round_text,
+            components,
+            est_finish,
+        };
+        if let Some(events) = &mut self.replay {
+            events.push(event);
+        }
     }
 
     /// Starts a set on a setup now (sim treats call→start as instant).
@@ -538,6 +616,21 @@ impl SimState {
                 sets: self.brackets[b].sets.clone(),
             });
         }
+        if self.replay.is_some() {
+            let remaining = self.brackets[b].sets.iter().filter(|s| !s.is_completed()).count();
+            let players = occupants.iter().map(|o| o.display_name.as_str()).collect::<Vec<_>>().join(" vs ");
+            let event = ReplayEvent::Complete {
+                at: clock,
+                bracket: bracket_id.clone(),
+                key: key.clone(),
+                players,
+                winner: winner.map(|o| o.display_name).unwrap_or_default(),
+                remaining,
+            };
+            if let Some(events) = &mut self.replay {
+                events.push(event);
+            }
+        }
     }
 
     /// Live swiss only materializes the current round; once it fully
@@ -677,6 +770,11 @@ impl SimState {
 /// `hasPlaceholder` the way the server does once a set's slots resolve —
 /// otherwise a placeholder-flagged cut is never callable and the projection
 /// starves.
+/// "A vs B" from a set's occupants (replay labels).
+fn join_players(set: &LiveSet) -> String {
+    set.occupants().map(|o| o.display_name.as_str()).collect::<Vec<_>>().join(" vs ")
+}
+
 fn clear_resolved_placeholder(set: &mut LiveSet) {
     if set.has_placeholder && set.all_slots_occupied() {
         set.has_placeholder = false;
