@@ -6,6 +6,7 @@
 //! so tests drive it without a terminal or network.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -15,7 +16,8 @@ use std::{
 use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
     app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
-    cli::{build_live_source, resolve_token, Cli},
+    cli::{build_live_source, default_data_dir, resolve_token, Cli},
+    config::write_starter_template,
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
     model::BracketId,
@@ -49,10 +51,14 @@ const SIM_DEBOUNCE_MS: i64 = 5000;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let config = SchedulerConfig::load(&cli.config)?;
+    let config_path = cli.config_path();
 
-    if let Some(dir) = cli.simulate.clone() {
-        let mut source = FixtureSource::from_captures(&dir).context("loading --simulate fixtures")?;
+    if cli.offline() {
+        let mut source = build_offline_source(&cli)?;
+        let config = match SchedulerConfig::load_if_present(&config_path)? {
+            Some(config) => config,
+            None => derive_offline_config(&config_path, &source),
+        };
         if let Some(speed) = cli.pace {
             let report = install_rehearsal(&mut source, &config, speed, now_millis())
                 .await
@@ -61,10 +67,54 @@ async fn main() -> anyhow::Result<()> {
         }
         run(cli, config, Arc::new(source), classify_fixture_error).await
     } else {
+        let Some(config) = SchedulerConfig::load_if_present(&config_path)? else {
+            return bootstrap_starter_config(&config_path);
+        };
         let token = resolve_token(cli.token.as_deref(), &config)?;
         let source = Arc::new(build_live_source(token)?);
         run(cli, config, source, classify_provider_error).await
     }
+}
+
+fn build_offline_source(cli: &Cli) -> anyhow::Result<FixtureSource> {
+    if let Some(dir) = &cli.simulate {
+        FixtureSource::from_captures(dir).context("loading --simulate fixtures")
+    } else {
+        let spec = cli.synth.as_deref().expect("offline() implies a synth spec");
+        FixtureSource::from_synth_spec(spec).context("building the --synth world")
+    }
+}
+
+/// Zero-config offline runs derive their config from the world itself.
+fn derive_offline_config(config_path: &Path, source: &FixtureSource) -> SchedulerConfig {
+    let (config, skipped) = source.derived_config();
+    println!(
+        "no config at {} — derived one: {} event(s), {} shared setups, writes fixture-armed",
+        config_path.display(),
+        config.brackets.len(),
+        config.setups.len(),
+    );
+    if !skipped.is_empty() {
+        println!("  skipped (a different tournament than the largest): {}", skipped.join(", "));
+    }
+    println!("  write a config file to pin real setups and pools");
+    config
+}
+
+/// No config in live mode: write the commented starter and exit so the user
+/// reviews it before the tool ever talks to start.gg.
+fn bootstrap_starter_config(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    write_starter_template(path).with_context(|| format!("writing the starter config to {}", path.display()))?;
+    println!(
+        "No config found — created a starter at {}.\n\
+         Fill in your tournament's events and setups, then rerun.\n\
+         (Tip: --simulate <captures-dir> and --synth de:32,rr:8 run with no config at all.)",
+        path.display()
+    );
+    Ok(())
 }
 
 async fn run<S, F>(cli: Cli, mut config: SchedulerConfig, source: Arc<S>, classify: F) -> anyhow::Result<()>
@@ -72,10 +122,13 @@ where
     S: SetSource + Send + Sync + 'static,
     F: Fn(&S::Error) -> PollFailure + Send + Sync + Clone + 'static,
 {
-    // Single-instance guard, held for the process lifetime. A simulate run
+    // Single-instance guard, held for the process lifetime. An offline run
     // uses sibling paths so a rehearsal never touches (or races) live state.
-    let state_path = persisted_path(config.state_file.as_deref(), DEFAULT_STATE_FILE, cli.simulate.is_some());
-    let snapshot_path = persisted_path(config.snapshot_file.as_deref(), DEFAULT_SNAPSHOT_FILE, cli.simulate.is_some());
+    let state_path = persisted_path(config.state_file.as_deref(), DEFAULT_STATE_FILE, cli.offline());
+    let snapshot_path = persisted_path(config.snapshot_file.as_deref(), DEFAULT_SNAPSHOT_FILE, cli.offline());
+    if let Some(parent) = state_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
     let _lock = Lockfile::acquire(&sibling_with_suffix(&state_path, "lock"))?;
 
     let arm_writes = !(cli.advisor_only || config.advisor_only);
@@ -120,10 +173,12 @@ where
 }
 
 /// Where a persisted document lives: the configured path, else the default
-/// beside the working directory. Simulate runs get a `.sim` sibling.
-fn persisted_path(configured: Option<&Path>, default: &str, simulate: bool) -> PathBuf {
-    let base = configured.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(default));
-    if simulate {
+/// name under the XDG data dir. Offline runs get a `.sim` sibling.
+fn persisted_path(configured: Option<&Path>, default: &str, offline: bool) -> PathBuf {
+    let base = configured
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_data_dir().join(default));
+    if offline {
         sibling_with_suffix(&base, "sim")
     } else {
         base

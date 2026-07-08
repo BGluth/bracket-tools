@@ -43,6 +43,8 @@ crossterm = "0.29"
 toml = "1"
 # Advisory flock for the scheduler's single-instance lockfile.
 fs2 = "0.4"
+# XDG default locations for the scheduler's config and state files.
+directories = "6"
 
 [profile.release]
 opt-level = 3

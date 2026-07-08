@@ -13,6 +13,7 @@ use std::{
     fs,
     future::pending,
     path::{Path, PathBuf},
+    slice::from_ref,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -27,14 +28,27 @@ use cynic::GraphQlResponse;
 use thiserror::Error;
 
 use crate::{
+    config::{BracketConfig, SchedulerConfig, SetupId},
     model::{GroupKind, LiveSet, PhaseGroupInfo, Prereq, Slot, PREREQ_TYPE_SEED, PREREQ_TYPE_SET},
     set_source::SetSource,
+    synth::{
+        default_players, make_de_bracket_with, make_fbr_world, make_rr_pool_with, make_se_bracket_with, make_swiss_with, materialize_ids,
+    },
 };
 
 /// The state ints the fixture answers mutations with, matching live
 /// observations (CALLED=6, IN_PROGRESS=2).
 pub const FIXTURE_CALLED_INT: i32 = 6;
 pub const FIXTURE_IN_PROGRESS_INT: i32 = 2;
+/// Setup pool size for a derived offline config.
+pub const SIM_SETUP_COUNT: u32 = 8;
+/// `--synth` worlds get numeric ids from the start (calls exercise the full
+/// write path); below the rehearsal's 9_900_000_000 base so a later `--pace`
+/// materialization pass keeps them.
+const SYNTH_ID_BASE: u64 = 9_000_000_000;
+const SYNTH_ID_STRIDE: u64 = 1_000_000;
+const SYNTH_PG_BASE: u64 = 2001;
+const SYNTH_TOURNAMENT: &str = "tournament/synth";
 
 #[derive(Debug, Error)]
 pub enum FixtureError {
@@ -63,6 +77,15 @@ pub enum FixtureLoadError {
 
     #[error("no capture events under {dir}")]
     NoEvents { dir: PathBuf },
+}
+
+#[derive(Debug, Error)]
+pub enum SynthSpecError {
+    #[error("empty --synth spec")]
+    Empty,
+
+    #[error("bad --synth entry {entry:?}: {reason} (expected kind:entrants with kind de|se|rr|swiss, e.g. de:32, or the literal `fbr`)")]
+    Bad { entry: String, reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +152,62 @@ impl FixtureSource {
         }
         if loaded == 0 {
             return Err(FixtureLoadError::NoEvents { dir: dir.to_owned() });
+        }
+        Ok(source)
+    }
+
+    /// Builds a purely synthetic world from a `--synth` spec: comma-separated
+    /// `kind:entrants` entries (`de:32`, `se:16`, `rr:8`, `swiss:16` — swiss
+    /// takes an optional `:rounds`), or the literal `fbr` for the shipped
+    /// 7-event FBR-shaped world. Adjacent events share ~half their players,
+    /// so cross-event conflicts are real. Set ids are numeric from the start,
+    /// so calls exercise the full write path even without `--pace`.
+    pub fn from_synth_spec(spec: &str) -> Result<Self, SynthSpecError> {
+        let mut source = Self::new();
+        if spec.trim() == "fbr" {
+            for (index, event) in make_fbr_world().into_iter().enumerate() {
+                let name = event.id.0.strip_prefix("synth/").unwrap_or(&event.id.0).to_owned();
+                let slug = format!("{SYNTH_TOURNAMENT}-fbr/event/{name}");
+                let sets = materialize_ids(&event.sets, SYNTH_ID_BASE + index as u64 * SYNTH_ID_STRIDE);
+                source.add_synth_event(&slug, &event.groups, vec![sets]);
+            }
+            return Ok(source);
+        }
+
+        let entries: Vec<SynthEntry> = spec
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(parse_synth_entry)
+            .collect::<Result<_, _>>()?;
+        if entries.is_empty() {
+            return Err(SynthSpecError::Empty);
+        }
+
+        // One shared pool, each event's slice starting halfway into its
+        // predecessor's.
+        let mut starts = Vec::with_capacity(entries.len());
+        let mut next_start = 0usize;
+        let mut pool_len = 0usize;
+        for entry in &entries {
+            starts.push(next_start);
+            pool_len = pool_len.max(next_start + entry.entrants);
+            next_start += entry.entrants.div_ceil(2);
+        }
+        let pool = default_players(pool_len);
+
+        for (index, entry) in entries.iter().enumerate() {
+            let players = &pool[starts[index]..starts[index] + entry.entrants];
+            let pg = SYNTH_PG_BASE + index as u64;
+            let bracket = match entry.kind {
+                SynthKind::De => make_de_bracket_with(pg, players),
+                SynthKind::Se => make_se_bracket_with(pg, players),
+                SynthKind::Rr => make_rr_pool_with(pg, players),
+                SynthKind::Swiss => make_swiss_with(pg, players, entry.rounds),
+            };
+            let slug = format!("{SYNTH_TOURNAMENT}/event/{}{}-{}", entry.kind.token(), entry.entrants, index + 1);
+            let sets = materialize_ids(&bracket.sets, SYNTH_ID_BASE + index as u64 * SYNTH_ID_STRIDE);
+            source.add_synth_event(&slug, from_ref(&bracket.info), vec![sets]);
         }
         Ok(source)
     }
@@ -204,6 +283,43 @@ impl FixtureSource {
     /// Every write answered so far, in arrival order.
     pub fn mutation_log(&self) -> Vec<MutationRecord> {
         self.mutations.lock().unwrap().clone()
+    }
+
+    /// Registered event slugs in live form (`tournament/x/event/y`), sorted.
+    pub fn event_slugs(&self) -> Vec<String> {
+        let mut slugs: Vec<String> = self.events.lock().unwrap().keys().map(|key| live_slug(key)).collect();
+        slugs.sort();
+        slugs
+    }
+
+    /// A ready-to-run config for a zero-config `--simulate` run: the largest
+    /// captured tournament's events sharing a synthetic setup pool, writes
+    /// left armed (this source answers mutations), state ints pinned to the
+    /// fixture's answers. Returns the config plus the events skipped for
+    /// belonging to other tournaments (preflight's identity assertion allows
+    /// only one).
+    pub fn derived_config(&self) -> (SchedulerConfig, Vec<String>) {
+        let slugs = self.event_slugs();
+        let chosen_tournament = largest_tournament(&slugs);
+        let (chosen, skipped): (Vec<String>, Vec<String>) =
+            slugs.into_iter().partition(|slug| tournament_prefix(slug) == chosen_tournament);
+
+        let setups: Vec<SetupId> = (1..=SIM_SETUP_COUNT).map(SetupId).collect();
+        let brackets = chosen
+            .iter()
+            .map(|slug: &String| BracketConfig {
+                pool: setups.clone(),
+                ..BracketConfig::new(slug.clone())
+            })
+            .collect();
+        let config = SchedulerConfig {
+            brackets,
+            setups,
+            known_called_state_int: Some(FIXTURE_CALLED_INT),
+            known_in_progress_state_int: Some(FIXTURE_IN_PROGRESS_INT),
+            ..SchedulerConfig::default()
+        };
+        (config, skipped)
     }
 
     /// Scripts the admin probe's answer (e.g. a non-admin token).
@@ -321,6 +437,104 @@ pub fn classify_fixture_error(error: &FixtureError) -> crate::app::PollFailure {
 /// and the capture directory's `tournament_x_event_y`.
 fn capture_key(slug: &str) -> String {
     slug.replace('/', "_")
+}
+
+/// Inverse of [`capture_key`]: reconstructs the live slug from a capture key.
+/// Underscores *inside* the tournament or event slug survive (only the two
+/// separators convert), keyed on the first `_event_` occurrence. Keys that
+/// don't match the pattern pass through untouched.
+fn live_slug(capture_key: &str) -> String {
+    let Some(rest) = capture_key.strip_prefix("tournament_") else {
+        return capture_key.to_owned();
+    };
+    match rest.split_once("_event_") {
+        Some((tournament, event)) => format!("tournament/{tournament}/event/{event}"),
+        None => capture_key.to_owned(),
+    }
+}
+
+/// The `tournament/<t>` prefix of a live event slug.
+fn tournament_prefix(slug: &str) -> &str {
+    slug.split("/event/").next().unwrap_or(slug)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SynthKind {
+    De,
+    Se,
+    Rr,
+    Swiss,
+}
+
+impl SynthKind {
+    fn token(self) -> &'static str {
+        match self {
+            Self::De => "de",
+            Self::Se => "se",
+            Self::Rr => "rr",
+            Self::Swiss => "swiss",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SynthEntry {
+    kind: SynthKind,
+    entrants: usize,
+    /// Swiss only; other kinds derive their own round structure.
+    rounds: i32,
+}
+
+fn parse_synth_entry(entry: &str) -> Result<SynthEntry, SynthSpecError> {
+    let bad = |reason: &str| SynthSpecError::Bad {
+        entry: entry.to_owned(),
+        reason: reason.to_owned(),
+    };
+
+    let mut parts = entry.split(':');
+    let kind = match parts.next() {
+        Some("de") => SynthKind::De,
+        Some("se") => SynthKind::Se,
+        Some("rr") => SynthKind::Rr,
+        Some("swiss") => SynthKind::Swiss,
+        _ => return Err(bad("unknown kind")),
+    };
+    let entrants: usize = parts
+        .next()
+        .ok_or_else(|| bad("missing entrant count"))?
+        .parse()
+        .map_err(|_| bad("entrant count is not a number"))?;
+    if entrants < 2 {
+        return Err(bad("needs at least 2 entrants"));
+    }
+    let rounds = match (parts.next(), kind) {
+        (None, _) => default_swiss_rounds(entrants),
+        (Some(raw), SynthKind::Swiss) => raw.parse().map_err(|_| bad("rounds is not a number"))?,
+        (Some(_), _) => return Err(bad("only swiss takes a :rounds part")),
+    };
+    if parts.next().is_some() {
+        return Err(bad("too many parts"));
+    }
+    Ok(SynthEntry { kind, entrants, rounds })
+}
+
+/// The usual swiss schedule: enough rounds to separate the field.
+fn default_swiss_rounds(entrants: usize) -> i32 {
+    (usize::BITS - entrants.next_power_of_two().leading_zeros() - 1).max(1) as i32
+}
+
+/// The tournament with the most events; ties break lexicographically so the
+/// derived config is deterministic.
+fn largest_tournament(slugs: &[String]) -> String {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for slug in slugs {
+        *counts.entry(tournament_prefix(slug)).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|(a_name, a_count), (b_name, b_count)| a_count.cmp(b_count).then(b_name.cmp(a_name)))
+        .map(|(name, _)| name.to_owned())
+        .unwrap_or_default()
 }
 
 fn read_envelope<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, FixtureLoadError> {
@@ -469,7 +683,10 @@ mod tests {
     use bracket_tools_startgg_schema::{get_sets_for_event, scalars::Timestamp};
     use tokio::time::timeout;
 
-    use super::{schema_set_from_live, FixtureSource, MutationKind, MutationRecord, FIXTURE_CALLED_INT};
+    use super::{
+        live_slug, schema_set_from_live, FixtureSource, MutationKind, MutationRecord, SynthSpecError, FIXTURE_CALLED_INT,
+        FIXTURE_IN_PROGRESS_INT, SIM_SETUP_COUNT,
+    };
     use crate::{
         model::{live_sets_from_schema, phase_groups_from_schema, LiveSet},
         set_source::SetSource,
@@ -641,6 +858,89 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn live_slug_round_trips_capture_keys() {
+        assert_eq!(
+            live_slug("tournament_french-bread-rumble-100_event_ultimate-singles"),
+            "tournament/french-bread-rumble-100/event/ultimate-singles"
+        );
+        // Underscores inside the tournament slug survive.
+        assert_eq!(
+            live_slug("tournament_rust_vitational_mk_xiii_event_ultimate-singles"),
+            "tournament/rust_vitational_mk_xiii/event/ultimate-singles"
+        );
+        assert_eq!(live_slug("not-a-capture-key"), "not-a-capture-key");
+    }
+
+    #[test]
+    fn event_slugs_are_live_form_and_sorted() {
+        let source = de_source();
+        assert_eq!(source.event_slugs(), vec![SLUG.to_owned()]);
+    }
+
+    #[test]
+    fn synth_spec_builds_a_world_with_numeric_ids() {
+        let source = FixtureSource::from_synth_spec("de:8, rr:4, swiss:8:3").unwrap();
+        assert_eq!(
+            source.event_slugs(),
+            vec![
+                "tournament/synth/event/de8-1",
+                "tournament/synth/event/rr4-2",
+                "tournament/synth/event/swiss8-3",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn synth_spec_sets_convert_cleanly() {
+        let source = FixtureSource::from_synth_spec("de:8").unwrap();
+        let sets = source.fetch_event_sets("tournament/synth/event/de8-1").await.unwrap();
+        let (live, warnings, skipped) = live_sets_from_schema(sets);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!live.is_empty());
+        assert!(live.iter().all(|set| set.id.0.parse::<u64>().is_ok()), "synth ids are numeric");
+    }
+
+    #[test]
+    fn synth_spec_fbr_is_one_tournament() {
+        let source = FixtureSource::from_synth_spec("fbr").unwrap();
+        let (config, skipped) = source.derived_config();
+        assert_eq!(config.brackets.len(), 7);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn synth_spec_rejects_garbage() {
+        for bad in ["", "  ,  ", "melee:8", "de:one", "de:1", "de:8:3", "swiss:8:x"] {
+            assert!(matches!(
+                FixtureSource::from_synth_spec(bad),
+                Err(SynthSpecError::Empty | SynthSpecError::Bad { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn derived_config_picks_the_largest_tournament() {
+        let de = make_de_bracket(1001, 4);
+        let mut source = FixtureSource::new();
+        source.add_synth_event("tournament/big/event/melee", from_ref(&de.info), vec![de.sets.clone()]);
+        source.add_synth_event("tournament/big/event/ultimate", from_ref(&de.info), vec![de.sets.clone()]);
+        source.add_synth_event("tournament/small/event/rivals", from_ref(&de.info), vec![de.sets.clone()]);
+
+        let (config, skipped) = source.derived_config();
+        config.validate().unwrap();
+        let slugs: Vec<_> = config.brackets.iter().map(|b| b.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["tournament/big/event/melee", "tournament/big/event/ultimate"]);
+        assert_eq!(skipped, vec!["tournament/small/event/rivals".to_owned()]);
+        assert_eq!(config.setups.len(), SIM_SETUP_COUNT as usize);
+        assert!(config.brackets.iter().all(|b| b.pool == config.setups));
+        assert_eq!(config.known_called_state_int, Some(FIXTURE_CALLED_INT));
+        assert_eq!(config.known_in_progress_state_int, Some(FIXTURE_IN_PROGRESS_INT));
+        assert!(!config.advisor_only, "derived sim sessions arm writes");
     }
 
     /// Env-gated like tests/fixture_replay.rs: exercises the capture loader

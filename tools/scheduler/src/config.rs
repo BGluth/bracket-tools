@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashSet,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -11,6 +11,73 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{BracketId, GroupKind, PlayerId};
+
+/// The commented starter config written when live mode finds no config file.
+/// Parses and validates as-is, so an edited copy runs immediately.
+pub const STARTER_TEMPLATE: &str = r#"# scheduler — starter config (auto-created because none was found).
+#
+# Fill in your tournament's events and setups, then rerun:
+#
+#   scheduler --config <this file>
+#
+# Tip: `scheduler --simulate <captures-dir>` and `--synth <spec>` need no
+# config at all — they derive one (add --pace N to play a rehearsal).
+
+# Safety pin: keep true until you trust the tool with writes. Advisor-only
+# sessions never mutate start.gg regardless of token permissions.
+advisor_only = true
+
+# Every station at the desk's disposal, in the TO's numbering.
+setups = [1, 2, 3, 4]
+
+# Seconds between full poll cycles; don't go below ~15 with several events.
+poll_interval_secs = 30
+
+# Seconds a called set may sit unstarted before the no-show alert.
+no_show_secs = 300
+
+# Minimum seconds a player rests after finishing a set before being callable.
+rest_window_secs = 300
+
+# Asserted against every event's owning tournament during preflight.
+#tournament_slug = "tournament/your-tournament"
+
+# File containing the start.gg API token (the --token flag and STARTGG_TOKEN
+# environment variable both override this).
+#token_file = "~/path/to/token"
+
+# Crash-recovery state: the local overlay and the last-good snapshot. They
+# default beside the working directory; the single-instance lockfile lives
+# beside the state file.
+#state_file = "scheduler-state.json"
+#snapshot_file = "scheduler-snapshot.json"
+
+# Live-observed start.gg state ints; leave pinned unless start.gg changes.
+known_called_state_int = 6
+known_in_progress_state_int = 2
+
+# Same-human links across events, by player id: fill from the preflight
+# identity-split report.
+#player_aliases = [["1234567", "7654321"]]
+
+# One [[brackets]] block per event at the desk.
+[[brackets]]
+slug = "tournament/your-tournament/event/your-main-event"
+# Preflight warns if the live bracket isn't this shape:
+# "elimination" | "round_robin" | "swiss"
+expected_kind = "elimination"
+# Setups this event may be called on (a subset of `setups` above).
+pool = [1, 2, 3, 4]
+# Prior mean bo3 set duration in seconds, blended with observed samples.
+#duration_prior_secs = 480
+
+# A second event: mode = "conflict_only" tracks its players as busy but never
+# calls or ranks its sets.
+#[[brackets]]
+#slug = "tournament/your-tournament/event/your-side-event"
+#expected_kind = "swiss"
+#mode = "conflict_only"
+"#;
 
 pub const DEFAULT_DURATION_PRIOR_SECS: u64 = 480;
 pub const DEFAULT_PRIOR_WEIGHT: f64 = 4.0;
@@ -158,6 +225,16 @@ impl Default for SchedulerConfig {
 }
 
 impl SchedulerConfig {
+    /// Like [`Self::load`], but a missing file is `None` instead of an error
+    /// (the caller decides how to bootstrap one).
+    pub fn load_if_present(path: &Path) -> Result<Option<Self>, ConfigError> {
+        match Self::load(path) {
+            Ok(config) => Ok(Some(config)),
+            Err(ConfigError::Read { ref source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Reads, parses, and validates a TOML config file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -206,6 +283,11 @@ impl SchedulerConfig {
 
         Ok(())
     }
+}
+
+/// Writes [`STARTER_TEMPLATE`] to `path` for the user to edit.
+pub fn write_starter_template(path: &Path) -> io::Result<()> {
+    fs::write(path, STARTER_TEMPLATE)
 }
 
 /// One scheduled bracket (a start.gg event).
@@ -343,13 +425,13 @@ fn default_rest_sim_horizon_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{env, fs, path::PathBuf, process};
 
     use serde_json::json;
 
     use super::{
-        BracketConfig, BracketMode, ConfigError, ExpectedKind, SchedulerConfig, SetupId, DEFAULT_DURATION_PRIOR_SECS, DEFAULT_PER_PAGE,
-        DEFAULT_POLL_INTERVAL_SECS, DEFAULT_REST_SIM_HORIZON_SECS,
+        write_starter_template, BracketConfig, BracketMode, ConfigError, ExpectedKind, SchedulerConfig, SetupId,
+        DEFAULT_DURATION_PRIOR_SECS, DEFAULT_PER_PAGE, DEFAULT_POLL_INTERVAL_SECS, DEFAULT_REST_SIM_HORIZON_SECS, STARTER_TEMPLATE,
     };
     use crate::model::GroupKind;
 
@@ -485,6 +567,34 @@ mod tests {
             config.validate(),
             Err(ConfigError::UnknownSetupInPool { setup: SetupId(99), .. })
         ));
+    }
+
+    #[test]
+    fn starter_template_parses_and_validates() {
+        let config: SchedulerConfig = toml::from_str(STARTER_TEMPLATE).unwrap();
+        config.validate().unwrap();
+        assert!(config.advisor_only, "the template is safe by default");
+        assert_eq!(config.known_called_state_int, Some(6));
+    }
+
+    #[test]
+    fn load_if_present_distinguishes_missing_from_broken() {
+        assert!(matches!(
+            SchedulerConfig::load_if_present(&PathBuf::from("/nonexistent/scheduler.toml")),
+            Ok(None)
+        ));
+
+        let dir = env::temp_dir().join(format!("scheduler-config-test-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.toml");
+        write_starter_template(&good).unwrap();
+        assert!(matches!(SchedulerConfig::load_if_present(&good), Ok(Some(_))));
+
+        let broken = dir.join("broken.toml");
+        fs::write(&broken, "not = valid = toml").unwrap();
+        assert!(matches!(SchedulerConfig::load_if_present(&broken), Err(ConfigError::Parse { .. })));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

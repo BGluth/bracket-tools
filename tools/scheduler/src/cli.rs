@@ -11,29 +11,40 @@ use bracket_tools_startgg::{
     types::{GGRestToken, GGRestTokenParseError},
     GGProvider,
 };
-use clap::Parser;
+use clap::{ArgGroup, Parser};
+use directories::ProjectDirs;
 use thiserror::Error;
 
 use crate::{config::SchedulerConfig, set_source::StartggSource};
 
 pub const STARTGG_TOKEN_ENV: &str = "STARTGG_TOKEN";
 pub const DEFAULT_TOKEN_PATH: &str = "~/work/tokens/scraper_gg.token";
+pub const CONFIG_FILE: &str = "scheduler.toml";
 
 #[derive(Debug, Parser)]
 #[command(name = "scheduler", about = "Multi-bracket calling tool for the TO desk")]
+#[command(group = ArgGroup::new("offline").args(["simulate", "synth"]))]
 pub struct Cli {
-    /// Path to the TOML config file.
-    #[arg(long, default_value = "scheduler.toml")]
-    pub config: PathBuf,
+    /// Path to the TOML config file. Defaults to ./scheduler.toml when
+    /// present, else the XDG config dir. A missing config writes a starter
+    /// template (live mode) or derives one (offline modes).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
 
     /// Replay a fixture directory instead of hitting live start.gg.
     #[arg(long, value_name = "DIR")]
     pub simulate: Option<PathBuf>,
 
-    /// Rehearsal mode for --simulate: script the captured world forward and
-    /// play it back at FACTOR x real time (1 = live pace). Without it,
-    /// --simulate serves the captures statically.
-    #[arg(long, value_name = "FACTOR", requires = "simulate")]
+    /// Build a synthetic tournament instead of hitting live start.gg:
+    /// comma-separated kind:entrants entries (de|se|rr|swiss; swiss takes an
+    /// optional :rounds), e.g. `de:32,rr:8`, or the literal `fbr`.
+    #[arg(long, value_name = "SPEC")]
+    pub synth: Option<String>,
+
+    /// Rehearsal mode for --simulate/--synth: script the offline world
+    /// forward and play it back at FACTOR x real time (1 = live pace).
+    /// Without it, the offline world is served statically.
+    #[arg(long, value_name = "FACTOR", requires = "offline")]
     pub pace: Option<f64>,
 
     /// Disable the capture journal. TODO(S4): the journal itself lands with
@@ -54,6 +65,43 @@ pub struct Cli {
     /// Run the startup preflight, print its report, and exit.
     #[arg(long)]
     pub preflight_only: bool,
+}
+
+impl Cli {
+    /// True when the session runs against a fixture world (`--simulate` or
+    /// `--synth`) rather than live start.gg.
+    pub fn offline(&self) -> bool {
+        self.simulate.is_some() || self.synth.is_some()
+    }
+
+    /// Where the config lives: the explicit flag, else `./scheduler.toml`
+    /// when present (venue-local), else the XDG config dir.
+    pub fn config_path(&self) -> PathBuf {
+        if let Some(path) = &self.config {
+            return path.clone();
+        }
+        let local = PathBuf::from(CONFIG_FILE);
+        if local.exists() {
+            return local;
+        }
+        match project_dirs() {
+            Some(dirs) => dirs.config_dir().join(CONFIG_FILE),
+            None => local,
+        }
+    }
+}
+
+/// XDG data dir for default state/snapshot files; the working directory
+/// stands in when no home exists.
+pub fn default_data_dir() -> PathBuf {
+    match project_dirs() {
+        Some(dirs) => dirs.data_dir().to_path_buf(),
+        None => PathBuf::from("."),
+    }
+}
+
+fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("", "", "bracket-tools")
 }
 
 #[derive(Debug, Error)]
@@ -147,9 +195,11 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(cli.config, PathBuf::from("fbr.toml"));
+        assert_eq!(cli.config, Some(PathBuf::from("fbr.toml")));
+        assert_eq!(cli.config_path(), PathBuf::from("fbr.toml"));
         assert_eq!(cli.simulate, Some(PathBuf::from("captures/")));
         assert_eq!(cli.pace, Some(8.0));
+        assert!(cli.offline());
         assert!(cli.advisor_only);
         assert!(cli.preflight_only);
         assert_eq!(cli.token.as_deref(), Some("abc123"));
@@ -157,16 +207,25 @@ mod tests {
     }
 
     #[test]
-    fn pace_requires_simulate() {
+    fn pace_requires_an_offline_world() {
         assert!(Cli::try_parse_from(["scheduler", "--pace", "8"]).is_err());
+        assert!(Cli::try_parse_from(["scheduler", "--synth", "de:8", "--pace", "8"]).is_ok());
+        assert!(Cli::try_parse_from(["scheduler", "--simulate", "caps/", "--pace", "8"]).is_ok());
+    }
+
+    #[test]
+    fn simulate_and_synth_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["scheduler", "--simulate", "caps/", "--synth", "de:8"]).is_err());
     }
 
     #[test]
     fn cli_defaults() {
         let cli = Cli::try_parse_from(["scheduler"]).unwrap();
-        assert_eq!(cli.config, PathBuf::from("scheduler.toml"));
+        assert_eq!(cli.config, None);
         assert!(cli.simulate.is_none());
+        assert!(cli.synth.is_none());
         assert!(cli.pace.is_none());
+        assert!(!cli.offline());
         assert!(!cli.advisor_only);
         assert!(!cli.preflight_only);
     }
