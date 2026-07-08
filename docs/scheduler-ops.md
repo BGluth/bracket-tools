@@ -36,6 +36,13 @@ authoritative for sets the desk manages.** Everything here protects that.
 `scheduler --config <file>` (add `--advisor-only` to force read-only regardless of admin
 rights — the safe default for a review/rehearsal). The tool opens on the setup board.
 
+- No `--config`? The tool looks for `./scheduler.toml`, then the XDG config dir
+  (`~/.config/bracket-tools/scheduler.toml`). If neither exists, a live launch writes a
+  fully-commented starter there and exits for you to fill in — it never contacts start.gg
+  on an unreviewed config. (Offline modes instead derive a ready-to-run config, below.)
+- Default state/snapshot files live in the XDG data dir
+  (`~/.local/share/bracket-tools/`), so launching from any directory finds the same state;
+  `state_file`/`snapshot_file` in the config still override.
 - If the network is down at launch, it opens on the last-good persisted snapshot with a
   stale banner rather than a blank screen.
 - A second launch on the same state file hard-errors "already running (pid N)" — the flock
@@ -55,6 +62,14 @@ rights — the safe default for a review/rehearsal). The tool opens on the setup
   result is confirmed remotely within a poll or the targeted force-poll).
 - **r** — no-show → re-queues the set locally. The site may still show it CALLED; that
   mismatch is tracked in the divergence ledger (see handover).
+- **g** — report the selected setup's set (writes-armed only). Tap **1**/**2** per game for
+  the winner (a known best-of auto-finishes on the clinch), **Backspace** un-records,
+  **Enter** → summary → **y** submits via `reportBracketSet` and frees the setup like `f`.
+  Optional characters: **c** opens a prefix-search picker (left player then right, **Tab**
+  keeps the current pick); picks apply to every game of the set and stick per player, so
+  regulars only need picking once. **d** inside the modal is the confirm-first DQ: pick the
+  DQ'd side, review the summary, **y** submits winner-only with the DQ flag. **Esc** steps
+  back a stage (games ← characters/DQ/confirm) before it cancels.
 - **d** — player flags for the highlighted queue entry: Enter cycles
   resting → departed → force-available → clear. Departed players' sets leave the queue and
   project at zero.
@@ -96,6 +111,34 @@ scheduler --config examples/fbr-100.toml \
   races) live desk state. Writes go to the fixture recorder, never the network; to drill the
   writes-armed flow, use a config without `advisor_only = true` (the fixture answers as a
   full admin).
+
+## Autoplay replay (`--autoplay` / `--replay`) and synthetic worlds (`--synth`)
+
+Want to *see* the scheduler's decisions without driving the TUI? Let the sim play the whole
+tournament itself and read (or watch) the tape:
+
+```
+scheduler --simulate <captures-dir> --autoplay          # real corpus
+scheduler --synth de:32,de:16,swiss:8 --autoplay        # parameterized fake brackets
+scheduler --synth fbr --autoplay                        # the built-in 7-event FBR-shaped world
+scheduler --replay scheduler-replay.txt                 # watch it animated (--frame-ms to pace)
+```
+
+- `--autoplay` runs headless: at every free setup the sim commits the greedy ranker's top
+  call and the run renders to `scheduler-replay.txt` (`--replay-out` to change) — one frame
+  per call/result showing the setup board, per-bracket progress bars, and the call's score
+  ingredients ("why: depth 8 · ironman 5 · unblocks 2 · waited 6m"), then a flat decision
+  log and a summary with per-bracket finish times and the makespan.
+- The file is plain text (`less` works); `--replay <file>` pages it in the terminal like a
+  flipbook. Replays carry real player names when generated from captures — they are
+  gitignored, keep them out of the public repo.
+- `--synth SPEC` builds a fake tournament from parameters instead of captures: comma-
+  separated `kind:entrants` entries (`de`, `se`, `rr`, `swiss` — swiss takes an optional
+  `:rounds`), or the literal `fbr`. Adjacent events share ~half their players so
+  cross-bracket conflicts are real. Works with everything `--simulate` does: zero-config,
+  `--pace`, `--autoplay`, or just poking at the TUI on a world that costs nothing.
+- All offline modes derive a ready-to-run config when none exists (largest captured
+  tournament, 8 shared setups, writes fixture-armed, state pinned to `.sim` files).
 
 ## Restart to reconfigure (the config-edit fallback for everything)
 
