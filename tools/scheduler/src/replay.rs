@@ -5,25 +5,37 @@
 //! The rendered file is both human-readable (`cat`/`less` shows every frame
 //! in order, then the decision log and summary) and machine-playable: frames
 //! start with a `▶` line, and `scheduler --replay <file>` pages through them
-//! in the terminal like a flipbook.
+//! in the terminal like a flipbook — auto-advancing, with arrow keys to step
+//! back and forth at your own pace.
 
 use std::{
     collections::HashMap,
+    env,
     fmt::Write as _,
     fs,
-    io::{self, Write as _},
+    io::{self, IsTerminal, Write as _},
     path::Path,
     thread,
     time::Duration,
+};
+
+use crossterm::{
+    cursor::Hide,
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{enable_raw_mode, EnterAlternateScreen},
 };
 
 use crate::{
     config::{SchedulerConfig, SetupId},
     conflict::UnixMillis,
     fixture_source::FixtureSource,
+    graph::BracketGraph,
     model::BracketId,
+    ranker::ScoreComponents,
     rehearsal::{load_world, RehearsalError},
-    simulator::{simulate_autoplay, ReplayEvent, SimOutcome},
+    simulator::{simulate_autoplay, ReplayEvent, SetContext, SimOutcome},
+    terminal::restore_terminal,
 };
 
 /// Every frame's first line starts with this (the playback split marker).
@@ -31,14 +43,32 @@ const FRAME_MARK: &str = "▶";
 const BAR_WIDTH: usize = 20;
 const NAME_WIDTH: usize = 24;
 
+const RESET: &str = "\x1b[0m";
+const BOLD_YELLOW: &str = "\x1b[1;33m";
+const BOLD_GREEN: &str = "\x1b[1;32m";
+const CYAN: &str = "\x1b[36m";
+const BOLD_RED: &str = "\x1b[1;31m";
+const GREEN: &str = "\x1b[32m";
+const DIM: &str = "\x1b[2m";
+
+/// One bracket's shape when the replay starts.
+#[derive(Debug)]
+pub struct BracketOpening {
+    pub id: BracketId,
+    /// Incomplete sets — the progress-bar denominator.
+    pub sets_to_play: usize,
+    /// Sequential stages left on the critical path: the depth term that
+    /// dominates call order.
+    pub critical_path: u32,
+}
+
 /// One generated auto-play run, ready to render.
 #[derive(Debug)]
 pub struct Replay {
     pub started_at: UnixMillis,
     pub outcome: SimOutcome,
     pub events: Vec<ReplayEvent>,
-    /// (bracket, incomplete sets at the start) — progress-bar denominators.
-    pub brackets: Vec<(BracketId, usize)>,
+    pub brackets: Vec<BracketOpening>,
     pub setups: Vec<SetupId>,
 }
 
@@ -48,7 +78,14 @@ pub async fn generate_replay(source: &FixtureSource, config: &SchedulerConfig, n
     let brackets = world
         .brackets
         .iter()
-        .map(|b| (b.id.clone(), b.sets.iter().filter(|s| !s.is_completed()).count()))
+        .map(|b| {
+            let (graph, _) = BracketGraph::build(&b.sets, &b.groups);
+            BracketOpening {
+                id: b.id.clone(),
+                sets_to_play: b.sets.iter().filter(|s| !s.is_completed()).count(),
+                critical_path: graph.remaining_critical_path(),
+            }
+        })
         .collect();
     let (outcome, events) = simulate_autoplay(&world, &durations);
     Ok(Replay {
@@ -92,14 +129,25 @@ pub fn render_replay(replay: &Replay) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "scheduler autoplay replay");
     let _ = writeln!(out, "=========================");
-    for (id, sets) in &replay.brackets {
-        let _ = writeln!(out, "  {}: {} sets to play", short_name(id), sets);
+    for opening in &replay.brackets {
+        let _ = writeln!(
+            out,
+            "  {}: {} sets to play · critical path {}",
+            short_name(&opening.id),
+            opening.sets_to_play,
+            opening.critical_path
+        );
     }
     let _ = writeln!(out, "  setups: {}", replay.setups.len());
+    let _ = writeln!(out, "\ncall policy: longest remaining critical path wins (depth ≫ all else);");
+    let _ = writeln!(out, "ties go to the busiest player (iron), then sets unblocked, then longest");
+    let _ = writeln!(out, "wait. Expect the deepest bracket to flood the setups first — that is the");
+    let _ = writeln!(out, "depth term working, not a bug.");
     let _ = writeln!(
         out,
-        "\nEvery `{FRAME_MARK}` line begins one frame; play with: scheduler --replay <this file>\n"
+        "\nEvery `{FRAME_MARK}` line begins one frame; play with: scheduler --replay <this file>"
     );
+    let _ = writeln!(out, "(auto-advances; space pauses, arrow keys step back/forward, q quits)\n");
 
     let mut tracker = Tracker::new(replay);
     for event in &replay.events {
@@ -117,10 +165,11 @@ pub fn render_replay(replay: &Replay) -> String {
             players,
             round_text,
             components,
+            runner_up,
             ..
         } = event
         {
-            let _ = writeln!(
+            let _ = write!(
                 out,
                 "T+{} setup {}: {players} — {round_text} ({}) · depth {} iron {} unblk {} wait {}",
                 fmt_t(at - replay.started_at),
@@ -131,6 +180,10 @@ pub fn render_replay(replay: &Replay) -> String {
                 components.unblock,
                 fmt_t(components.wait_secs * 1000),
             );
+            if let Some(ru) = runner_up {
+                let _ = write!(out, " › over {} d{}", short_name(&ru.bracket), ru.components.depth);
+            }
+            out.push('\n');
         }
     }
     out.push('\n');
@@ -151,8 +204,8 @@ impl Tracker {
     fn new(replay: &Replay) -> Self {
         Self {
             assignments: HashMap::new(),
-            progress: replay.brackets.iter().map(|(id, sets)| (id.clone(), (0, *sets))).collect(),
-            order: replay.brackets.iter().map(|(id, _)| id.clone()).collect(),
+            progress: replay.brackets.iter().map(|b| (b.id.clone(), (0, b.sets_to_play))).collect(),
+            order: replay.brackets.iter().map(|b| b.id.clone()).collect(),
         }
     }
 
@@ -167,6 +220,8 @@ impl Tracker {
                 players,
                 round_text,
                 components,
+                runner_up,
+                context,
                 est_finish,
             } => {
                 self.assignments.insert(*setup, (bracket.clone(), key.clone(), players.clone()));
@@ -175,13 +230,22 @@ impl Tracker {
                 let _ = writeln!(out, "→ CALL setup {}: {players} — {round_text} ({})", setup.0, short_name(bracket));
                 let _ = writeln!(
                     out,
-                    "  why: depth {} · ironman {} · unblocks {} · waited {} · est done T+{}",
-                    components.depth,
-                    components.ironman,
-                    components.unblock,
-                    fmt_t(components.wait_secs * 1000),
+                    "  why: {} · est done T+{}",
+                    components_text(components),
                     fmt_t(est_finish - replay.started_at),
                 );
+                if let Some(ru) = runner_up {
+                    let _ = writeln!(
+                        out,
+                        "  over: {} — {} ({}): {} — {}",
+                        ru.players,
+                        ru.round_text,
+                        short_name(&ru.bracket),
+                        components_text(&ru.components),
+                        decisive_term(components, &ru.components),
+                    );
+                }
+                out.push_str(&context_lines(context));
             }
             ReplayEvent::Complete {
                 at,
@@ -189,6 +253,8 @@ impl Tracker {
                 key,
                 players,
                 winner,
+                winner_to,
+                loser_to,
                 remaining,
             } => {
                 self.assignments.retain(|_, (b, k, _)| !(b == bracket && k == key));
@@ -206,6 +272,17 @@ impl Tracker {
                     winner,
                     remaining
                 );
+                let mut parts = Vec::new();
+                if let Some(to) = winner_to {
+                    let name = if winner.is_empty() { "winner" } else { winner.as_str() };
+                    parts.push(format!("{name} → {to}"));
+                }
+                if let Some(to) = loser_to {
+                    parts.push(format!("loser → {to}"));
+                }
+                if !parts.is_empty() {
+                    let _ = writeln!(out, "  └ {}", parts.join(" · "));
+                }
             }
         }
         out
@@ -237,18 +314,263 @@ impl Tracker {
     }
 }
 
-/// Plays a rendered replay file in the terminal, one frame per cadence tick.
+/// The frame-line rendering of a candidate's score ingredients.
+fn components_text(c: &ScoreComponents) -> String {
+    format!(
+        "depth {} · ironman {} · unblocks {} · waited {}",
+        c.depth,
+        c.ironman,
+        c.unblock,
+        fmt_t(c.wait_secs * 1000)
+    )
+}
+
+/// Which score term separated a call from its runner-up (the terms are
+/// compared in weight order, so the first difference decided it).
+fn decisive_term(top: &ScoreComponents, other: &ScoreComponents) -> &'static str {
+    if top.depth != other.depth {
+        "depth decided"
+    } else if top.ironman != other.ironman {
+        "ironman decided"
+    } else if top.unblock != other.unblock {
+        "unblocks decided"
+    } else if top.wait_secs != other.wait_secs {
+        "wait decided"
+    } else {
+        "dead tie; deterministic order"
+    }
+}
+
+/// The zoomed-in bracket neighborhood: where each player came from, where
+/// the winner and loser go next.
+fn context_lines(context: &SetContext) -> String {
+    let mut out = String::new();
+    let destinations = destination_line(context);
+    let n = context.sources.len();
+    for (i, source) in context.sources.iter().enumerate() {
+        let last = destinations.is_none() && i + 1 == n;
+        let connector = match (i, last, n) {
+            (_, true, 1) => '─',
+            (0, _, _) => '┌',
+            (_, true, _) => '└',
+            _ => '├',
+        };
+        let _ = writeln!(out, "  {connector} {source}");
+    }
+    if let Some(destinations) = destinations {
+        let _ = writeln!(out, "  └ {destinations}");
+    }
+    out
+}
+
+fn destination_line(context: &SetContext) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(to) = &context.winner_to {
+        parts.push(format!("winner → {to}"));
+    }
+    if let Some(to) = &context.loser_to {
+        parts.push(format!("loser → {to}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Plays a rendered replay file in the terminal. On a tty this is
+/// interactive (auto-advance with pause/step controls); piped output falls
+/// back to a fixed-cadence dump.
 pub fn play_replay(path: &Path, frame_ms: u64) -> io::Result<()> {
     let text = fs::read_to_string(path)?;
     let frames = split_frames(&text);
+    if frames.is_empty() {
+        return Ok(());
+    }
+    if io::stdout().is_terminal() {
+        play_interactive(&frames, frame_ms)
+    } else {
+        play_plain(&frames, frame_ms)
+    }
+}
+
+fn play_plain(frames: &[String], frame_ms: u64) -> io::Result<()> {
     let mut stdout = io::stdout();
-    for frame in &frames {
+    for frame in frames {
         // Clear + home, then the frame (plain ANSI; no raw mode needed).
         write!(stdout, "\x1b[2J\x1b[H{frame}")?;
         stdout.flush()?;
         thread::sleep(Duration::from_millis(frame_ms));
     }
     Ok(())
+}
+
+/// Raw mode + alternate screen for the interactive player; restored on Drop
+/// via the same idempotent path the TUI uses.
+struct RawScreen;
+
+impl RawScreen {
+    fn new() -> io::Result<Self> {
+        enable_raw_mode()?;
+        if let Err(err) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
+            restore_terminal();
+            return Err(err);
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for RawScreen {
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+enum PlayCmd {
+    /// Cadence tick: move forward without pausing.
+    Advance,
+    /// Manual step (pauses playback).
+    Step(isize),
+    First,
+    Last,
+    Toggle,
+    Redraw,
+    Quit,
+}
+
+fn play_interactive(frames: &[String], frame_ms: u64) -> io::Result<()> {
+    let _guard = RawScreen::new()?;
+    let color = env::var_os("NO_COLOR").is_none();
+    let last = frames.len() - 1;
+    let mut idx = 0;
+    let mut playing = frames.len() > 1;
+    loop {
+        draw_frame(frames, idx, playing, frame_ms, color)?;
+        let cmd = if playing {
+            read_cmd(Some(Duration::from_millis(frame_ms.max(1))))?
+        } else {
+            read_cmd(None)?
+        };
+        match cmd {
+            PlayCmd::Quit => return Ok(()),
+            PlayCmd::Toggle => playing = !playing,
+            PlayCmd::Redraw => {}
+            PlayCmd::Advance => {
+                if idx < last {
+                    idx += 1;
+                } else {
+                    playing = false;
+                }
+            }
+            PlayCmd::Step(delta) => {
+                playing = false;
+                idx = idx.saturating_add_signed(delta).min(last);
+            }
+            PlayCmd::First => {
+                playing = false;
+                idx = 0;
+            }
+            PlayCmd::Last => {
+                playing = false;
+                idx = last;
+            }
+        }
+    }
+}
+
+/// Waits for the next player command; `None` blocks until input, `Some`
+/// yields [`PlayCmd::Advance`] when the cadence elapses first.
+fn read_cmd(timeout: Option<Duration>) -> io::Result<PlayCmd> {
+    loop {
+        if let Some(timeout) = timeout {
+            if !event::poll(timeout)? {
+                return Ok(PlayCmd::Advance);
+            }
+        }
+        match event::read()? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if let Some(cmd) = key_cmd(key) {
+                    return Ok(cmd);
+                }
+            }
+            Event::Resize(..) => return Ok(PlayCmd::Redraw),
+            _ => {}
+        }
+    }
+}
+
+fn key_cmd(key: KeyEvent) -> Option<PlayCmd> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        return Some(PlayCmd::Quit);
+    }
+    match key.code {
+        KeyCode::Right | KeyCode::Down | KeyCode::Enter | KeyCode::Char('n') | KeyCode::Char('l') | KeyCode::Char('j') => {
+            Some(PlayCmd::Step(1))
+        }
+        KeyCode::Left | KeyCode::Up | KeyCode::Char('p') | KeyCode::Char('h') | KeyCode::Char('k') => Some(PlayCmd::Step(-1)),
+        KeyCode::PageDown => Some(PlayCmd::Step(10)),
+        KeyCode::PageUp => Some(PlayCmd::Step(-10)),
+        KeyCode::Home | KeyCode::Char('g') => Some(PlayCmd::First),
+        KeyCode::End | KeyCode::Char('G') => Some(PlayCmd::Last),
+        KeyCode::Char(' ') => Some(PlayCmd::Toggle),
+        KeyCode::Char('q') | KeyCode::Esc => Some(PlayCmd::Quit),
+        _ => None,
+    }
+}
+
+fn draw_frame(frames: &[String], idx: usize, playing: bool, frame_ms: u64, color: bool) -> io::Result<()> {
+    let mut out = String::from("\x1b[2J\x1b[H");
+    for line in frames[idx].lines() {
+        if color {
+            out.push_str(&colorize_line(line));
+        } else {
+            out.push_str(line);
+        }
+        // Raw mode: a bare \n no longer implies carriage return.
+        out.push_str("\r\n");
+    }
+    let status = if playing {
+        format!("playing {frame_ms}ms/frame")
+    } else {
+        "paused".to_owned()
+    };
+    let footer = format!(
+        "frame {}/{} · {status} · space play/pause · ←/→ step · Home/End · q quit",
+        idx + 1,
+        frames.len()
+    );
+    if color {
+        let _ = write!(out, "{DIM}{footer}{RESET}");
+    } else {
+        out.push_str(&footer);
+    }
+    let mut stdout = io::stdout();
+    stdout.write_all(out.as_bytes())?;
+    stdout.flush()
+}
+
+/// Playback-time colour, keyed off the line shapes `render_replay` emits.
+/// The file on disk stays plain so it greps and diffs cleanly.
+fn colorize_line(line: &str) -> String {
+    let paint = |code: &str| format!("{code}{line}{RESET}");
+    if line.starts_with(FRAME_MARK) {
+        paint(BOLD_YELLOW)
+    } else if line.starts_with("→ CALL") {
+        paint(BOLD_GREEN)
+    } else if line.starts_with('✓') {
+        paint(CYAN)
+    } else if line.contains("WARNING") {
+        paint(BOLD_RED)
+    } else if let Some(bar) = color_bar(line) {
+        bar
+    } else if ["  over:", "  ┌", "  ├", "  └", "  ─"].iter().any(|p| line.starts_with(p)) {
+        paint(DIM)
+    } else {
+        line.to_owned()
+    }
+}
+
+/// Greens the contiguous filled run of a progress bar, if the line has one.
+fn color_bar(line: &str) -> Option<String> {
+    let start = line.find('█')?;
+    let end = line.rfind('█')? + '█'.len_utf8();
+    Some(format!("{}{GREEN}{}{RESET}{}", &line[..start], &line[start..end], &line[end..]))
 }
 
 /// Splits a rendered replay into playable chunks: the header, then one chunk
@@ -300,7 +622,7 @@ fn truncate(name: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_replay, render_replay, split_frames};
+    use super::{colorize_line, generate_replay, render_replay, split_frames};
     use crate::{fixture_source::FixtureSource, simulator::ReplayEvent};
 
     const NOW: i64 = 1_751_000_000_000;
@@ -340,6 +662,17 @@ mod tests {
         let text = render_replay(&replay);
         assert!(text.contains("→ CALL setup"), "{text}");
         assert!(text.contains("why: depth"), "{text}");
+        assert!(text.contains("call policy:"), "{text}");
+        assert!(text.contains("critical path"), "{text}");
+        // Eight entrants mean multiple candidates at the first call, so the
+        // runner-up ("over:") and its decisive term appear.
+        assert!(text.contains("  over: "), "{text}");
+        assert!(text.contains("decided") || text.contains("dead tie"), "{text}");
+        // The zoomed-in neighborhood: R1 players are seeds, and their
+        // winners/losers have destinations.
+        assert!(text.contains("← seed"), "{text}");
+        assert!(text.contains("winner → "), "{text}");
+        assert!(text.contains("loser → "), "{text}");
         assert!(text.contains("decision log"), "{text}");
         assert!(text.contains("autoplay:"), "{text}");
 
@@ -348,5 +681,40 @@ mod tests {
         assert_eq!(frames.len(), replay.events.len() + 1);
         assert!(frames[0].contains("scheduler autoplay replay"));
         assert!(frames[1].starts_with('▶'), "{}", frames[1]);
+    }
+
+    #[tokio::test]
+    async fn duration_noise_changes_the_run_deterministically() {
+        let source = FixtureSource::from_synth_spec("de:8").unwrap();
+        let (mut config, _) = source.derived_config();
+        let smooth = generate_replay(&source, &config, NOW).await.unwrap();
+
+        config.sim.duration_noise = 0.4;
+        config.sim.noise_seed = 7;
+        let noisy_a = generate_replay(&source, &config, NOW).await.unwrap();
+        let noisy_b = generate_replay(&source, &config, NOW).await.unwrap();
+        assert_eq!(noisy_a.events, noisy_b.events, "same seed, same run");
+        assert_ne!(
+            smooth.outcome.overall_finish, noisy_a.outcome.overall_finish,
+            "noise perturbs the makespan"
+        );
+
+        config.sim.noise_seed = 8;
+        let reseeded = generate_replay(&source, &config, NOW).await.unwrap();
+        assert_ne!(
+            noisy_a.outcome.overall_finish, reseeded.outcome.overall_finish,
+            "a different seed is a different run"
+        );
+    }
+
+    #[test]
+    fn colorize_targets_the_expected_line_shapes() {
+        assert!(colorize_line("▶ T+4m · CALL").starts_with("\x1b[1;33m"));
+        assert!(colorize_line("→ CALL setup 1: A vs B").starts_with("\x1b[1;32m"));
+        assert!(colorize_line("✓ de-8 A: P1 wins").starts_with("\x1b[36m"));
+        assert!(colorize_line("  WARNING x: starved").starts_with("\x1b[1;31m"));
+        assert!(colorize_line("  over: C vs D").starts_with("\x1b[2m"));
+        assert!(colorize_line("bracket [██░░] 2/4").contains("\x1b[32m██\x1b[0m"));
+        assert_eq!(colorize_line("plain text"), "plain text");
     }
 }

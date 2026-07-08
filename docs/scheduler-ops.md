@@ -140,9 +140,20 @@ scheduler --replay scheduler-replay.txt                 # watch it animated (--f
   per call/result showing the setup board, per-bracket progress bars, and the call's score
   ingredients ("why: depth 8 · ironman 5 · unblocks 2 · waited 6m"), then a flat decision
   log and a summary with per-bracket finish times and the makespan.
+- Every call frame also explains itself against the field: an "over:" line names the
+  runner-up candidate and which term decided it (the header states the policy — longest
+  critical path first, so the deepest bracket flooding the setups early is by design), and
+  a small joined block shows the changed bracket neighborhood: where each player came from
+  and where the winner/loser go next.
 - The file is plain text (`less` works); `--replay <file>` pages it in the terminal like a
-  flipbook. Replays carry real player names when generated from captures — they are
-  gitignored, keep them out of the public repo.
+  flipbook — auto-advancing with colour on a tty (`NO_COLOR` respected), space pauses,
+  arrow keys step back/forward (PgUp/PgDn ±10, Home/End jump), `q` quits. Replays carry
+  real player names when generated from captures — they are gitignored, keep them out of
+  the public repo.
+- `--noise FRAC` (with `--noise-seed N`, both for `--autoplay` and `--pace`) roughs up the
+  sim's set durations: each set gets a fixed seed-derived multiplier in `1 ± FRAC`, so
+  rounds stagger organically instead of finishing in lockstep. Off by default; the same
+  seed replays the identical run. Config equivalent: `[sim] duration_noise` / `noise_seed`.
 - `--synth SPEC` builds a fake tournament from parameters instead of captures: comma-
   separated `kind:entrants` entries (`de`, `se`, `rr`, `swiss` — swiss takes an optional
   `:rounds`), or the literal `fbr`. Adjacent events share ~half their players so

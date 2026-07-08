@@ -32,5 +32,6 @@ pub use model::{BracketId, LiveSet, PhaseGroupInfo, SetId, SetKey};
 pub use ranker::{GreedyRanker, RankedAction, RankedCandidate, Ranker};
 pub use rollout::RolloutRanker;
 pub use simulator::{
-    simulate, simulate_action, simulate_autoplay, simulate_recorded, Action, ReplayEvent, ScriptFrame, SimBracket, SimOutcome, SimWorld,
+    simulate, simulate_action, simulate_autoplay, simulate_recorded, Action, ReplayEvent, RunnerUp, ScriptFrame, SetContext, SimBracket,
+    SimOutcome, SimWorld,
 };

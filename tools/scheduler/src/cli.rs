@@ -57,14 +57,25 @@ pub struct Cli {
     #[arg(long, value_name = "FILE", default_value = "scheduler-replay.txt")]
     pub replay_out: PathBuf,
 
-    /// Play back a replay file written by --autoplay (animated, frame by
-    /// frame; Ctrl-C stops).
+    /// Play back a replay file written by --autoplay (auto-advancing; space
+    /// pauses, arrow keys step back/forward, q quits).
     #[arg(long, value_name = "FILE", conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "preflight_only"])]
     pub replay: Option<PathBuf>,
 
     /// Frame cadence for --replay playback, in milliseconds.
     #[arg(long, value_name = "MS", default_value_t = 400)]
     pub frame_ms: u64,
+
+    /// Seeded duration noise for --autoplay/--pace: every simulated set gets
+    /// a fixed multiplier in 1 ± FRAC (0.25 = ±25%). Overrides the config's
+    /// `sim.duration_noise`; default off.
+    #[arg(long, value_name = "FRAC", requires = "offline")]
+    pub noise: Option<f64>,
+
+    /// Seed for --noise: the same seed replays the identical run, a new one
+    /// rolls a different world. Overrides `sim.noise_seed`.
+    #[arg(long, value_name = "SEED", requires = "offline")]
+    pub noise_seed: Option<u64>,
 
     /// Disable the capture journal. TODO(S4): the journal itself lands with
     /// persistence; the flag is parsed now so scripts stay stable.
@@ -230,6 +241,15 @@ mod tests {
         assert!(Cli::try_parse_from(["scheduler", "--pace", "8"]).is_err());
         assert!(Cli::try_parse_from(["scheduler", "--synth", "de:8", "--pace", "8"]).is_ok());
         assert!(Cli::try_parse_from(["scheduler", "--simulate", "caps/", "--pace", "8"]).is_ok());
+    }
+
+    #[test]
+    fn noise_requires_an_offline_world() {
+        assert!(Cli::try_parse_from(["scheduler", "--noise", "0.25"]).is_err());
+        assert!(Cli::try_parse_from(["scheduler", "--noise-seed", "7"]).is_err());
+        let cli = Cli::try_parse_from(["scheduler", "--synth", "de:8", "--noise", "0.25", "--noise-seed", "7"]).unwrap();
+        assert_eq!(cli.noise, Some(0.25));
+        assert_eq!(cli.noise_seed, Some(7));
     }
 
     #[test]

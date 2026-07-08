@@ -59,7 +59,8 @@ async fn main() -> anyhow::Result<()> {
 
     if cli.offline() {
         let mut source = build_offline_source(&cli)?;
-        let config = offline_config(&cli, &config_path, &source)?;
+        let mut config = offline_config(&cli, &config_path, &source)?;
+        apply_noise_overrides(&cli, &mut config)?;
         if cli.autoplay {
             return autoplay(&cli, &config, &source).await;
         }
@@ -109,6 +110,22 @@ fn offline_config(cli: &Cli, config_path: &Path, source: &FixtureSource) -> anyh
             Ok(derive_offline_config(source))
         }
     }
+}
+
+/// `--noise`/`--noise-seed` beat whatever the config's `[sim]` section says;
+/// re-validation keeps the fraction inside the sane band.
+fn apply_noise_overrides(cli: &Cli, config: &mut SchedulerConfig) -> anyhow::Result<()> {
+    if cli.noise.is_none() && cli.noise_seed.is_none() {
+        return Ok(());
+    }
+    if let Some(noise) = cli.noise {
+        config.sim.duration_noise = noise;
+    }
+    if let Some(seed) = cli.noise_seed {
+        config.sim.noise_seed = seed;
+    }
+    config.validate().context("applying --noise")?;
+    Ok(())
 }
 
 /// Zero-config offline runs derive their config from the world itself.

@@ -107,6 +107,10 @@ pub enum ReplayEvent {
         players: String,
         round_text: String,
         components: ScoreComponents,
+        /// The next-best candidate this call beat, for "why this over that".
+        runner_up: Option<RunnerUp>,
+        /// The called set's bracket neighborhood.
+        context: SetContext,
         /// When the sim expects the set to finish.
         est_finish: UnixMillis,
     },
@@ -116,9 +120,34 @@ pub enum ReplayEvent {
         key: SetKey,
         players: String,
         winner: String,
+        /// Where the winner landed ("Grand Final (A) vs Carol"), when the
+        /// bracket has a next set for them.
+        winner_to: Option<String>,
+        /// Where the loser dropped, `None` once they're eliminated.
+        loser_to: Option<String>,
         /// Incomplete sets left in the bracket after this result.
         remaining: usize,
     },
+}
+
+/// The candidate the greedy ranker placed second when a call was committed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunnerUp {
+    pub bracket: BracketId,
+    pub players: String,
+    pub round_text: String,
+    pub components: ScoreComponents,
+}
+
+/// A set's immediate bracket neighborhood — where each player came from and
+/// where its winner/loser go. The replay's zoomed-in view of the part of the
+/// bracket that changed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SetContext {
+    /// One entry per occupied slot: "Alice ← won Winners Round 2 (C)".
+    pub sources: Vec<String>,
+    pub winner_to: Option<String>,
+    pub loser_to: Option<String>,
 }
 
 pub fn simulate(world: &SimWorld, durations: &DurationModel) -> SimOutcome {
@@ -162,9 +191,9 @@ fn simulate_inner(
     }
     loop {
         state.auto_complete_walkovers();
-        while let Some((bracket, key, setup, components)) = state.next_assignment() {
-            state.record_call(&bracket, &key, setup, components);
-            state.assign(&bracket, &key, setup);
+        while let Some(assignment) = state.next_assignment() {
+            state.record_call(&assignment);
+            state.assign(&assignment.bracket, &assignment.key, assignment.setup);
         }
         let Some(((t, _), event)) = state.events.pop_first() else {
             break;
@@ -192,6 +221,15 @@ enum Event {
     Wake,
 }
 
+/// One committed greedy decision, with the runner-up it beat (replay only).
+struct Assignment {
+    bracket: BracketId,
+    key: SetKey,
+    setup: SetupId,
+    components: ScoreComponents,
+    runner_up: Option<(BracketId, SetKey, ScoreComponents)>,
+}
+
 struct SimState {
     brackets: Vec<SimBracket>,
     graphs: HashMap<BracketId, BracketGraph>,
@@ -207,6 +245,9 @@ struct SimState {
     /// Originally-resting keys, busy until `rest_horizon_until`.
     resting: Vec<ConflictKey>,
     rest_horizon_until: UnixMillis,
+    /// Fractional spread on per-set duration estimates (0 = smooth).
+    duration_noise: f64,
+    noise_seed: u64,
     durations: DurationModel,
     events: BTreeMap<(UnixMillis, u64), Event>,
     seq: u64,
@@ -238,6 +279,8 @@ impl SimState {
             rest_window_secs: world.rest_window_secs,
             resting,
             rest_horizon_until: world.now_millis + world.sim.rest_sim_horizon_secs as i64 * 1000,
+            duration_noise: world.sim.duration_noise,
+            noise_seed: world.sim.noise_seed,
             durations: durations.clone(),
             events: BTreeMap::new(),
             seq: 0,
@@ -334,7 +377,26 @@ impl SimState {
             .iter()
             .find(|g| g.id == key.phase_group)
             .and_then(|g| g.best_of_by_round.get(&key.round).copied());
-        (self.durations.scaled_estimate_secs(&bracket.id, best_of) * 1000.0) as i64
+        let base = self.durations.scaled_estimate_secs(&bracket.id, best_of) * 1000.0;
+        (base * self.noise_factor(&bracket.id, key)) as i64
+    }
+
+    /// Seed-derived per-set duration multiplier in `1 ± duration_noise`; 1.0
+    /// when noise is off. Fixed per (bracket, set) so re-sims and rollout
+    /// action comparisons see the same world.
+    fn noise_factor(&self, bracket: &BracketId, key: &SetKey) -> f64 {
+        if self.duration_noise <= 0.0 {
+            return 1.0;
+        }
+        let hash = fnv1a64(&[
+            &self.noise_seed.to_le_bytes(),
+            bracket.0.as_bytes(),
+            key.phase_group.as_bytes(),
+            &key.round.to_le_bytes(),
+            key.identifier.as_bytes(),
+        ]);
+        let unit = (hash >> 11) as f64 / (1u64 << 53) as f64;
+        1.0 + self.duration_noise * (unit * 2.0 - 1.0)
     }
 
     fn views(&self) -> Vec<BracketView<'_>> {
@@ -380,7 +442,7 @@ impl SimState {
 
     /// One greedy decision: the first free setup (board order, holds
     /// skipped) with a non-empty ranking takes its top candidate.
-    fn next_assignment(&self) -> Option<(BracketId, SetKey, SetupId, ScoreComponents)> {
+    fn next_assignment(&self) -> Option<Assignment> {
         let views = self.views();
         let inputs = self.inputs();
         let index = self.conflict_index(&views, &inputs);
@@ -403,39 +465,78 @@ impl SimState {
             if self.hold_setup == Some(setup) {
                 continue;
             }
-            if let Some(top) = GreedyRanker.rank(setup, &candidates, &ctx).first() {
-                let RankedAction::Call(callable) = &top.action else {
-                    continue;
-                };
-                return Some((callable.bracket.clone(), callable.key.clone(), setup, top.components.clone()));
-            }
+            let ranked = GreedyRanker.rank(setup, &candidates, &ctx);
+            let Some(top) = ranked.first() else {
+                continue;
+            };
+            let RankedAction::Call(callable) = &top.action else {
+                continue;
+            };
+            let runner_up = ranked.get(1).and_then(|second| match &second.action {
+                RankedAction::Call(c) => Some((c.bracket.clone(), c.key.clone(), second.components.clone())),
+                RankedAction::Hold { .. } => None,
+            });
+            return Some(Assignment {
+                bracket: callable.bracket.clone(),
+                key: callable.key.clone(),
+                setup,
+                components: top.components.clone(),
+                runner_up,
+            });
         }
         None
     }
 
+    /// "players — round" labels for a set, resolved from its bracket table.
+    fn describe_set(&self, bracket_id: &BracketId, key: &SetKey) -> (String, String) {
+        self.bracket_index(bracket_id)
+            .and_then(|b| self.brackets[b].sets.iter().find(|s| &s.key == key))
+            .map(|s| (join_players(s), s.full_round_text.clone().unwrap_or_default()))
+            .unwrap_or_default()
+    }
+
     /// Feeds the `--autoplay` replay log; a no-op unless armed.
-    fn record_call(&mut self, bracket_id: &BracketId, key: &SetKey, setup: SetupId, components: ScoreComponents) {
+    fn record_call(&mut self, assignment: &Assignment) {
         if self.replay.is_none() {
             return;
         }
+        let Assignment {
+            bracket: bracket_id,
+            key,
+            setup,
+            components,
+            runner_up,
+        } = assignment;
         let Some(b) = self.bracket_index(bracket_id) else {
             return;
         };
         let est_finish = self.clock + self.estimate_ms(&self.brackets[b], key);
-        let (players, round_text) = self.brackets[b]
+        let (players, round_text) = self.describe_set(bracket_id, key);
+        let context = self.brackets[b]
             .sets
             .iter()
             .find(|s| &s.key == key)
-            .map(|s| (join_players(s), s.full_round_text.clone().unwrap_or_default()))
+            .map(|s| set_context(&self.brackets[b].sets, s))
             .unwrap_or_default();
+        let runner_up = runner_up.as_ref().map(|(ru_bracket, ru_key, ru_components)| {
+            let (ru_players, ru_round) = self.describe_set(ru_bracket, ru_key);
+            RunnerUp {
+                bracket: ru_bracket.clone(),
+                players: ru_players,
+                round_text: ru_round,
+                components: ru_components.clone(),
+            }
+        });
         let event = ReplayEvent::Call {
             at: self.clock,
-            setup,
+            setup: *setup,
             bracket: bracket_id.clone(),
             key: key.clone(),
             players,
             round_text,
-            components,
+            components: components.clone(),
+            runner_up,
+            context,
             est_finish,
         };
         if let Some(events) = &mut self.replay {
@@ -617,14 +718,20 @@ impl SimState {
             });
         }
         if self.replay.is_some() {
-            let remaining = self.brackets[b].sets.iter().filter(|s| !s.is_completed()).count();
+            let sets = &self.brackets[b].sets;
+            let remaining = sets.iter().filter(|s| !s.is_completed()).count();
             let players = occupants.iter().map(|o| o.display_name.as_str()).collect::<Vec<_>>().join(" vs ");
+            // Post-propagation, so destination labels carry the opponent
+            // already waiting there.
+            let context = sets.iter().find(|s| &s.key == key).map(|s| set_context(sets, s)).unwrap_or_default();
             let event = ReplayEvent::Complete {
                 at: clock,
                 bracket: bracket_id.clone(),
                 key: key.clone(),
                 players,
                 winner: winner.map(|o| o.display_name).unwrap_or_default(),
+                winner_to: context.winner_to,
+                loser_to: context.loser_to,
                 remaining,
             };
             if let Some(events) = &mut self.replay {
@@ -766,15 +873,92 @@ impl SimState {
     }
 }
 
-/// The sim stands in for the server when it fills slots, so it also clears
-/// `hasPlaceholder` the way the server does once a set's slots resolve —
-/// otherwise a placeholder-flagged cut is never callable and the projection
-/// starves.
 /// "A vs B" from a set's occupants (replay labels).
 fn join_players(set: &LiveSet) -> String {
     set.occupants().map(|o| o.display_name.as_str()).collect::<Vec<_>>().join(" vs ")
 }
 
+/// Builds a set's [`SetContext`] from its bracket table: slot provenance via
+/// the prereq edges in, winner/loser destinations via the edges out.
+fn set_context(sets: &[LiveSet], set: &LiveSet) -> SetContext {
+    let sources = set
+        .slots
+        .iter()
+        .filter_map(|slot| {
+            let name = &slot.occupant.as_ref()?.display_name;
+            let origin = match &slot.prereq {
+                Some(Prereq::Set { id, placement }) => sets.iter().find(|s| &s.id == id).map(|feeder| {
+                    let verb = if *placement == Some(2) { "lost" } else { "won" };
+                    format!("{verb} {}", set_label(feeder))
+                }),
+                _ => None,
+            };
+            Some(format!("{name} ← {}", origin.unwrap_or_else(|| "seed".to_owned())))
+        })
+        .collect();
+
+    let mut winner_to = None;
+    let mut loser_to = None;
+    for dest in sets {
+        if dest.is_completed() {
+            continue;
+        }
+        for (i, slot) in dest.slots.iter().enumerate() {
+            let Some(Prereq::Set { id, placement }) = &slot.prereq else {
+                continue;
+            };
+            if id != &set.id {
+                continue;
+            }
+            let opponent = dest
+                .slots
+                .iter()
+                .enumerate()
+                .find_map(|(j, s)| (j != i).then_some(s.occupant.as_ref()).flatten())
+                .map(|o| o.display_name.clone());
+            let label = match opponent {
+                Some(opponent) => format!("{} vs {opponent}", set_label(dest)),
+                None => set_label(dest),
+            };
+            match placement {
+                Some(2) => loser_to = Some(label),
+                _ => winner_to = Some(label),
+            }
+        }
+    }
+    SetContext {
+        sources,
+        winner_to,
+        loser_to,
+    }
+}
+
+/// "Winners Final (A)": round text plus the set identifier, or just the
+/// identifier when the API sent no round text.
+fn set_label(set: &LiveSet) -> String {
+    match set.full_round_text.as_deref() {
+        Some(text) if !text.is_empty() => format!("{text} ({})", set.key.identifier),
+        _ => format!("set {}", set.key.identifier),
+    }
+}
+
+/// FNV-1a over the concatenated chunks: a stable, dependency-free hash so
+/// duration noise reproduces across runs and builds for the same seed.
+fn fnv1a64(chunks: &[&[u8]]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for chunk in chunks {
+        for &byte in *chunk {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// The sim stands in for the server when it fills slots, so it also clears
+/// `hasPlaceholder` the way the server does once a set's slots resolve —
+/// otherwise a placeholder-flagged cut is never callable and the projection
+/// starves.
 fn clear_resolved_placeholder(set: &mut LiveSet) {
     if set.has_placeholder && set.all_slots_occupied() {
         set.has_placeholder = false;

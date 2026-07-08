@@ -83,6 +83,9 @@ pub const DEFAULT_DURATION_PRIOR_SECS: u64 = 480;
 pub const DEFAULT_PRIOR_WEIGHT: f64 = 4.0;
 pub const DEFAULT_NOISE_EPSILON: f64 = 0.05;
 pub const DEFAULT_REST_SIM_HORIZON_SECS: u64 = 600;
+/// Ceiling for `sim.duration_noise`: past this the multiplier band touches
+/// zero and estimates stop meaning anything.
+pub const MAX_DURATION_NOISE: f64 = 0.9;
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 30;
 pub const DEFAULT_NO_SHOW_SECS: u64 = 300;
 pub const DEFAULT_STALE_WARN_POLLS: u32 = 3;
@@ -118,6 +121,9 @@ pub enum ConfigError {
 
     #[error("bracket {slug:?} pools setup {} which is not in the top-level setups list", setup.0)]
     UnknownSetupInPool { slug: String, setup: SetupId },
+
+    #[error("sim.duration_noise must be within [0.0, {MAX_DURATION_NOISE}], got {0}")]
+    DurationNoiseOutOfRange(f64),
 }
 
 /// A physical station at the venue, identified by its position in the TO's
@@ -253,6 +259,9 @@ impl SchedulerConfig {
         if self.brackets.is_empty() {
             return Err(ConfigError::NoBrackets);
         }
+        if !(0.0..=MAX_DURATION_NOISE).contains(&self.sim.duration_noise) {
+            return Err(ConfigError::DurationNoiseOutOfRange(self.sim.duration_noise));
+        }
 
         let mut setups = HashSet::new();
         for setup in &self.setups {
@@ -376,6 +385,15 @@ pub struct SimConfig {
     /// they return.
     #[serde(default = "default_rest_sim_horizon_secs")]
     pub rest_sim_horizon_secs: u64,
+    /// Fractional spread applied to simulated set durations: each set gets a
+    /// fixed, seed-derived multiplier in `1 ± duration_noise`. Zero (the
+    /// default) keeps the sim fully smooth; mainly for `--autoplay`/`--pace`
+    /// rehearsals, where organic variance makes the drill more realistic.
+    #[serde(default)]
+    pub duration_noise: f64,
+    /// Seed for `duration_noise`; same seed + world = identical run.
+    #[serde(default)]
+    pub noise_seed: u64,
 }
 
 impl Default for SimConfig {
@@ -383,6 +401,8 @@ impl Default for SimConfig {
         Self {
             noise_epsilon: DEFAULT_NOISE_EPSILON,
             rest_sim_horizon_secs: DEFAULT_REST_SIM_HORIZON_SECS,
+            duration_noise: 0.0,
+            noise_seed: 0,
         }
     }
 }
@@ -567,6 +587,21 @@ mod tests {
             config.validate(),
             Err(ConfigError::UnknownSetupInPool { setup: SetupId(99), .. })
         ));
+    }
+
+    #[test]
+    fn duration_noise_defaults_off_and_validates_its_band() {
+        let config = valid_config();
+        assert_eq!(config.sim.duration_noise, 0.0);
+        assert_eq!(config.sim.noise_seed, 0);
+
+        let mut config = valid_config();
+        config.sim.duration_noise = 0.9;
+        config.validate().unwrap();
+        config.sim.duration_noise = 0.91;
+        assert!(matches!(config.validate(), Err(ConfigError::DurationNoiseOutOfRange(_))));
+        config.sim.duration_noise = -0.1;
+        assert!(matches!(config.validate(), Err(ConfigError::DurationNoiseOutOfRange(_))));
     }
 
     #[test]
