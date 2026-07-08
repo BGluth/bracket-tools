@@ -72,6 +72,7 @@ fn app_with(sets: Vec<LiveSet>, bracket: &SynthBracket) -> AppState {
         pool: vec![SetupId(1), SetupId(2)],
         duration_prior_secs: 480,
         prior_weight: 4.0,
+        characters: Vec::new(),
     }];
     AppState::new(config, false, boots, NOW)
 }

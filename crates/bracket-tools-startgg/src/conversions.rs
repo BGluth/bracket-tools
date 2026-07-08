@@ -1,5 +1,6 @@
 use bracket_tools_startgg_schema::{
     admin_probe::{self, AdminProbe},
+    get_event_characters::GetEventCharacters,
     get_event_structure::{self, GetEventStructure},
     get_games_for_set::{self, GetGamesOfSet},
     get_player_for_player_id::GetPlayerForPlayerId,
@@ -7,6 +8,7 @@ use bracket_tools_startgg_schema::{
     get_tournament_for_id::{self, GetTournamentForId},
     mark_set_called::MarkSetCalled,
     mark_set_in_progress::MarkSetInProgress,
+    report_bracket_set::ReportBracketSet,
     scalars::Timestamp,
 };
 use thiserror::Error;
@@ -150,6 +152,7 @@ macro_rules! impl_set_mutation_result_from {
 
 impl_set_mutation_result_from!(bracket_tools_startgg_schema::mark_set_called::Set);
 impl_set_mutation_result_from!(bracket_tools_startgg_schema::mark_set_in_progress::Set);
+impl_set_mutation_result_from!(bracket_tools_startgg_schema::report_bracket_set::Set);
 
 /// Unwraps a `markSetCalled` mutation response.
 pub fn extract_mark_set_called(response: MarkSetCalled) -> Result<SetMutationResult, GgConversionError> {
@@ -162,6 +165,51 @@ pub fn extract_mark_set_in_progress(response: MarkSetInProgress) -> Result<SetMu
         .mark_set_in_progress
         .required("MarkSetInProgress", "markSetInProgress")
         .map(Into::into)
+}
+
+/// Unwraps a `reportBracketSet` mutation response. The mutation returns every
+/// affected set (the reported one plus any it advanced); the entry matching
+/// `reported_id` is the payload of record, falling back to the first entry.
+pub fn extract_report_bracket_set(response: ReportBracketSet, reported_id: StartGgId) -> Result<SetMutationResult, GgConversionError> {
+    let sets: Vec<SetMutationResult> = response
+        .report_bracket_set
+        .required("ReportBracketSet", "reportBracketSet")?
+        .into_iter()
+        .flatten()
+        .map(Into::into)
+        .collect();
+    let mine = sets.iter().find(|s| s.id == Some(reported_id)).cloned();
+    mine.or_else(|| sets.into_iter().next()).ok_or(GgConversionError::MissingField {
+        entity: "ReportBracketSet",
+        field: "reportBracketSet[0]",
+    })
+}
+
+/// One playable character of an event's videogame. `id` is the numeric
+/// vocabulary `reportBracketSet` selections use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharacterInfo {
+    pub id: i32,
+    pub name: String,
+}
+
+/// Flattens a characters query response; infallible by design (an event
+/// without character data simply yields an empty roster).
+pub fn extract_event_characters(response: GetEventCharacters) -> Vec<CharacterInfo> {
+    response
+        .event
+        .and_then(|e| e.videogame)
+        .and_then(|v| v.characters)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|c| {
+            Some(CharacterInfo {
+                id: c.id?.inner().parse().ok()?,
+                name: c.name?,
+            })
+        })
+        .collect()
 }
 
 /// What the admin probe learned about the current token.

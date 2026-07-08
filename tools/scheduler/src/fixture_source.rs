@@ -15,10 +15,10 @@ use std::{
     path::{Path, PathBuf},
     slice::from_ref,
     sync::Mutex,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use bracket_tools_startgg::{AdminProbeResult, SetMutationResult, StartGgId};
+use bracket_tools_startgg::{AdminProbeResult, CharacterInfo, GameReport, SetMutationResult, StartGgId};
 use bracket_tools_startgg_schema::{
     enums::{ActivityState, BracketType},
     get_event_structure, get_sets_for_event,
@@ -37,9 +37,10 @@ use crate::{
 };
 
 /// The state ints the fixture answers mutations with, matching live
-/// observations (CALLED=6, IN_PROGRESS=2).
+/// observations (CALLED=6, IN_PROGRESS=2, COMPLETED=3).
 pub const FIXTURE_CALLED_INT: i32 = 6;
 pub const FIXTURE_IN_PROGRESS_INT: i32 = 2;
+pub const FIXTURE_COMPLETED_INT: i32 = 3;
 /// Setup pool size for a derived offline config.
 pub const SIM_SETUP_COUNT: u32 = 8;
 /// `--synth` worlds get numeric ids from the start (calls exercise the full
@@ -49,6 +50,22 @@ const SYNTH_ID_BASE: u64 = 9_000_000_000;
 const SYNTH_ID_STRIDE: u64 = 1_000_000;
 const SYNTH_PG_BASE: u64 = 2001;
 const SYNTH_TOURNAMENT: &str = "tournament/synth";
+/// The character roster every fixture event answers with (Smash 64 cast —
+/// small, recognizable, and enough to exercise prefix search).
+pub const FIXTURE_ROSTER: [&str; 12] = [
+    "Mario",
+    "Donkey Kong",
+    "Link",
+    "Samus",
+    "Yoshi",
+    "Kirby",
+    "Fox",
+    "Pikachu",
+    "Luigi",
+    "Ness",
+    "Captain Falcon",
+    "Jigglypuff",
+];
 
 #[derive(Debug, Error)]
 pub enum FixtureError {
@@ -101,6 +118,15 @@ pub struct MutationRecord {
     pub id: StartGgId,
 }
 
+/// One set report the fixture answered, in arrival order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportRecord {
+    pub set_id: StartGgId,
+    pub winner_entrant_id: Option<String>,
+    pub is_dq: bool,
+    pub games: Vec<GameReport>,
+}
+
 struct EventFixture {
     structure: get_event_structure::Event,
     /// Successive poll results; the cursor advances per fetch and repeats the
@@ -119,6 +145,7 @@ struct EventFixture {
 pub struct FixtureSource {
     events: Mutex<HashMap<String, EventFixture>>,
     mutations: Mutex<Vec<MutationRecord>>,
+    reports: Mutex<Vec<ReportRecord>>,
     /// Scripted admin-probe answer; unset answers as a full admin (id 1) so
     /// writes-armed fixtures keep working.
     admin_probe: Mutex<Option<AdminProbeResult>>,
@@ -285,6 +312,11 @@ impl FixtureSource {
         self.mutations.lock().unwrap().clone()
     }
 
+    /// Every set report answered so far, in arrival order.
+    pub fn report_log(&self) -> Vec<ReportRecord> {
+        self.reports.lock().unwrap().clone()
+    }
+
     /// Registered event slugs in live form (`tournament/x/event/y`), sorted.
     pub fn event_slugs(&self) -> Vec<String> {
         let mut slugs: Vec<String> = self.events.lock().unwrap().keys().map(|key| live_slug(key)).collect();
@@ -424,6 +456,42 @@ impl SetSource for FixtureSource {
             current_user: Some(1),
             admins: Some(vec![1]),
         }))
+    }
+
+    async fn fetch_event_characters(&self, event_slug: &str) -> Result<Vec<CharacterInfo>, FixtureError> {
+        if !self.events.lock().unwrap().contains_key(&capture_key(event_slug)) {
+            return Err(FixtureError::UnknownEvent(event_slug.to_owned()));
+        }
+        Ok(FIXTURE_ROSTER
+            .iter()
+            .enumerate()
+            .map(|(ix, name)| CharacterInfo {
+                id: ix as i32 + 1,
+                name: (*name).to_owned(),
+            })
+            .collect())
+    }
+
+    async fn report_set(
+        &self,
+        set_id: StartGgId,
+        winner_entrant_id: Option<String>,
+        is_dq: bool,
+        games: Vec<GameReport>,
+    ) -> Result<SetMutationResult, FixtureError> {
+        self.reports.lock().unwrap().push(ReportRecord {
+            set_id,
+            winner_entrant_id,
+            is_dq,
+            games,
+        });
+        let completed_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        Ok(SetMutationResult {
+            id: Some(set_id),
+            state: Some(FIXTURE_COMPLETED_INT),
+            started_at: None,
+            completed_at: Some(Timestamp(completed_at)),
+        })
     }
 }
 

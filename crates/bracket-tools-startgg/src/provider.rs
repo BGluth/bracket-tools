@@ -11,6 +11,7 @@ use bracket_tools_cache::{
 };
 use bracket_tools_startgg_schema::{
     admin_probe::{AdminProbe, AdminProbeVariables},
+    get_event_characters::{GetEventCharacters, GetEventCharactersVariables},
     get_event_structure::{self, GetEventStructure, GetEventStructureVariables},
     get_games_for_set::{GetGamesOfSet, GetGamesOfSetVariables},
     get_player_for_player_id::{GetPlayerForPlayerId, GetPlayerForPlayerIdVariables},
@@ -18,6 +19,7 @@ use bracket_tools_startgg_schema::{
     get_tournament_for_id::{GetTournamentForId, GetTournamentForIdVariables},
     mark_set_called::{MarkSetCalled, MarkSetCalledVariables},
     mark_set_in_progress::{MarkSetInProgress, MarkSetInProgressVariables},
+    report_bracket_set::{BracketSetGameDataInput, BracketSetGameSelectionInput, ReportBracketSet, ReportBracketSetVariables},
 };
 use cynic::{
     http::{CynicReqwestError, ReqwestExt},
@@ -28,14 +30,14 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
     Client,
 };
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
     conversions::{
-        extract_admin_probe, extract_event_sets_page, extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress,
-        extract_tournament_participants_page, tournament_name, AdminProbeResult, GgConversionError, Page, PlayerQueryResult,
-        SetMutationResult, SetQueryResult,
+        extract_admin_probe, extract_event_characters, extract_event_sets_page, extract_event_structure, extract_mark_set_called,
+        extract_mark_set_in_progress, extract_report_bracket_set, extract_tournament_participants_page, tournament_name, AdminProbeResult,
+        CharacterInfo, GgConversionError, Page, PlayerQueryResult, SetMutationResult, SetQueryResult,
     },
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
     types::GGRestToken,
@@ -374,6 +376,40 @@ impl<S: Storage> GGProvider<S> {
         Ok(extract_admin_probe(data))
     }
 
+    /// Fetches an event's videogame character roster (the vocabulary for
+    /// reporting character selections). Bypasses the cache entirely; an event
+    /// without character data yields an empty roster.
+    pub async fn fetch_event_characters(&self, slug: &str) -> Result<Vec<CharacterInfo>, GGProviderError> {
+        let data = self
+            .run_query(GetEventCharacters::build(GetEventCharactersVariables { slug }))
+            .await?;
+
+        Ok(extract_event_characters(data))
+    }
+
+    /// Reports a set's result: the winning entrant, optional per-game winners
+    /// and character selections, and the DQ flag. Entrant ids travel as
+    /// strings (GraphQL `ID` coercion accepts either form).
+    pub async fn report_bracket_set(
+        &self,
+        id: StartGgId,
+        winner_entrant_id: Option<&str>,
+        is_dq: bool,
+        games: &[GameReport],
+    ) -> Result<SetMutationResult, GGProviderError> {
+        let gg_id = gg_id(id);
+        let game_data = (!games.is_empty()).then(|| games.iter().enumerate().map(|(ix, game)| game_data_input(ix, game)).collect());
+        let operation = ReportBracketSet::build(ReportBracketSetVariables {
+            set_id: &gg_id,
+            winner_id: winner_entrant_id.map(cynic::Id::new),
+            is_dq: is_dq.then_some(true),
+            game_data,
+        });
+
+        self.run_set_mutation(id, operation, move |data| extract_report_bracket_set(data, id))
+            .await
+    }
+
     /// Marks a set as called (players summoned to their station).
     pub async fn mark_set_called(&self, id: StartGgId) -> Result<SetMutationResult, GGProviderError> {
         let gg_id = gg_id(id);
@@ -410,6 +446,43 @@ impl<S: Storage> GGProvider<S> {
         self.storage.delete(&cache_key(CacheEntity::Set.key_prefix(), id)).await?;
 
         Ok(extract(data)?)
+    }
+}
+
+/// One game of a set report, in play order (game numbers are assigned from
+/// position). Entrant ids are strings so preview-era and synthetic ids pass
+/// through unchanged. Serde derives exist for callers that persist queued
+/// reports across a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameReport {
+    pub winner_entrant_id: Option<String>,
+    pub selections: Vec<GameSelection>,
+}
+
+/// One entrant's character pick for one game.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GameSelection {
+    pub entrant_id: String,
+    pub character_id: Option<i32>,
+}
+
+fn game_data_input(ix: usize, game: &GameReport) -> BracketSetGameDataInput {
+    let selections = (!game.selections.is_empty()).then(|| {
+        game.selections
+            .iter()
+            .map(|s| BracketSetGameSelectionInput {
+                entrant_id: cynic::Id::new(&s.entrant_id),
+                character_id: s.character_id,
+            })
+            .collect()
+    });
+    BracketSetGameDataInput {
+        winner_id: game.winner_entrant_id.as_deref().map(cynic::Id::new),
+        game_num: ix as i32 + 1,
+        entrant1_score: None,
+        entrant2_score: None,
+        stage_id: None,
+        selections,
     }
 }
 

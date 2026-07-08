@@ -17,7 +17,8 @@ use ratatui::{
 
 use crate::{
     app::{
-        blocked_entries, flag_label, picker_rows, reassign_options, AppState, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption,
+        blocked_entries, filtered_roster, flag_label, picker_rows, reassign_options, report_roster, AppState, Modal, NoticeLevel,
+        PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, Side,
     },
     conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
     model::{BracketId, SetKey},
@@ -51,6 +52,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
         Some(Modal::PendingWrites { selected }) => draw_pending_writes(frame, state, *selected),
         Some(Modal::PlayerFlags { players, selected }) => draw_player_flags(frame, state, players, *selected),
         Some(Modal::Reassign { setup, selected }) => draw_reassign(frame, state, *setup, *selected),
+        Some(Modal::Report(draft)) => draw_report(frame, state, draft),
         Some(Modal::Help) => draw_help(frame),
         None => {}
     }
@@ -538,7 +540,7 @@ fn draw_pending_writes(frame: &mut Frame<'_>, state: &AppState, selected: usize)
             PendingStatus::Parked => "PARKED",
         };
         let row = Row::new([
-            format!("{:?}", pending.intent.kind),
+            pending.intent.kind.label().to_owned(),
             pending.intent.id.to_string(),
             short_name(&pending.intent.bracket).to_owned(),
             status.to_owned(),
@@ -651,6 +653,79 @@ fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(Confli
     frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), area);
 }
 
+fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
+    let area = centered_rect(frame.area(), 60, 60);
+    frame.render_widget(Clear, area);
+
+    let best_of = draft.best_of.map(|n| format!(" (Bo{n})")).unwrap_or_default();
+    let title = format!("Report — {} vs {}{best_of}", draft.left.name, draft.right.name);
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    lines.push(Line::from(format!(
+        "score: {} {} — {} {}",
+        draft.left.name,
+        draft.wins(Side::Left),
+        draft.wins(Side::Right),
+        draft.right.name
+    )));
+    for (ix, winner) in draft.games.iter().enumerate() {
+        lines.push(Line::from(format!("game {}: {}", ix + 1, draft.side(*winner).name)));
+    }
+    lines.push(Line::from(format!(
+        "characters: {} / {}",
+        character_name(state, draft, Side::Left),
+        character_name(state, draft, Side::Right)
+    )));
+    lines.push(Line::from(""));
+
+    match &draft.stage {
+        ReportStage::Games => {
+            lines.push(Line::from(format!("1 = {} won · 2 = {} won", draft.left.name, draft.right.name)));
+            lines.push(Line::from("c characters · d DQ · Backspace undo game · Enter finish · Esc cancel"));
+        }
+        ReportStage::Characters { side, filter, cursor } => {
+            lines.push(Line::from(format!("character for {}: {filter}_", draft.side(*side).name)));
+            let matches = filtered_roster(report_roster(state, &draft.bracket), filter);
+            for (ix, character) in matches.iter().take(8).enumerate() {
+                let line = Line::from(format!("  {}", character.name));
+                lines.push(if ix == *cursor { line.style(SELECTED) } else { line });
+            }
+            if matches.is_empty() {
+                lines.push(Line::from("  (no match)"));
+            }
+            lines.push(Line::from("type to filter · Enter pick · Tab keep · Esc back"));
+        }
+        ReportStage::DqPick => {
+            lines.push(Line::from(format!(
+                "DQ which side? 1 = {} · 2 = {}",
+                draft.left.name, draft.right.name
+            )));
+            lines.push(Line::from("Esc back"));
+        }
+        ReportStage::Confirm { dq } => {
+            lines.push(Line::from(format!("submit: {}?", draft.summary(*dq))).style(Style::new().add_modifier(Modifier::BOLD)));
+            lines.push(Line::from("y/Enter submit · Esc back"));
+        }
+    }
+
+    let body = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title(title));
+    frame.render_widget(body, area);
+}
+
+/// The display name of a side's current character pick.
+fn character_name(state: &AppState, draft: &ReportDraft, side: Side) -> String {
+    let Some(id) = draft.chars[side.ix()] else {
+        return "—".to_owned();
+    };
+    report_roster(state, &draft.bracket)
+        .iter()
+        .find(|c| c.id == id)
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| format!("#{id}"))
+}
+
 fn draw_help(frame: &mut Frame<'_>) {
     let area = centered_rect(frame.area(), 60, 60);
     frame.render_widget(Clear, area);
@@ -660,6 +735,7 @@ fn draw_help(frame: &mut Frame<'_>) {
         "p         selected setup: called -> in progress",
         "f         selected setup: free, awaiting remote result",
         "r         selected setup: un-call, set returns to the queue",
+        "g         report the selected setup's set (games + characters + DQ)",
         "z         snooze the highlighted queue entry (5m)",
         "d         player flags for the highlighted entry (rest/depart)",
         "a         reassign the selected setup's pool (redeploy)",
@@ -792,6 +868,7 @@ mod tests {
             pool: vec![SetupId(1), SetupId(2)],
             duration_prior_secs: 480,
             prior_weight: 4.0,
+            characters: Vec::new(),
         }];
         AppState::new(config, writes_armed, boots, NOW)
     }
@@ -836,6 +913,35 @@ mod tests {
         assert!(text.contains("1:called"), "called setup in strip:\n{text}");
         assert!(text.contains("writes 1 pending"), "pending badge:\n{text}");
         assert!(text.contains("Call queue (1 ready)"), "called set left the queue:\n{text}");
+    }
+
+    #[test]
+    fn report_modal_renders_stages() {
+        let mut state = test_state(true);
+        state.brackets[0].characters = vec![
+            bracket_tools_startgg::CharacterInfo {
+                id: 1,
+                name: "Mario".to_owned(),
+            },
+            bracket_tools_startgg::CharacterInfo {
+                id: 3,
+                name: "Fox".to_owned(),
+            },
+        ];
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)), NOW);
+
+        let text = render(&state);
+        assert!(text.contains("Report —"), "report title:\n{text}");
+        assert!(text.contains("score:"), "score line:\n{text}");
+
+        // The character picker stage shows the filtered roster.
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)), NOW);
+        let text = render(&state);
+        assert!(text.contains("character for"), "picker prompt:\n{text}");
+        assert!(text.contains("Fox"), "filtered roster:\n{text}");
     }
 
     #[test]

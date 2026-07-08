@@ -120,9 +120,14 @@ where
     F: Fn(&S::Error) -> PollFailure,
 {
     let mutation = async {
-        match intent.kind {
+        match &intent.kind {
             WriteKind::Called => source.mark_called(intent.id).await,
             WriteKind::InProgress => source.mark_in_progress(intent.id).await,
+            WriteKind::Report(payload) => {
+                source
+                    .report_set(intent.id, payload.winner_entrant_id.clone(), payload.is_dq, payload.games.clone())
+                    .await
+            }
         }
     };
     let sent_at = now_millis();
@@ -168,7 +173,7 @@ mod tests {
 
     use super::{run_writer, WriterConfig};
     use crate::{
-        app::{Msg, PollFailure, WriteIntent, WriteKind, WriteOutcome},
+        app::{Msg, PollFailure, ReportPayload, WriteIntent, WriteKind, WriteOutcome},
         fixture_source::{FixtureError, FixtureSource},
         model::{BracketId, SetKey},
         set_source::SetSource,
@@ -245,6 +250,20 @@ mod tests {
         async fn probe_admin(&self, _: StartGgId) -> Result<bracket_tools_startgg::AdminProbeResult, Self::Error> {
             unreachable!("writer never probes")
         }
+
+        async fn fetch_event_characters(&self, _: &str) -> Result<Vec<bracket_tools_startgg::CharacterInfo>, Self::Error> {
+            unreachable!("writer never fetches rosters")
+        }
+
+        async fn report_set(
+            &self,
+            set_id: StartGgId,
+            _: Option<String>,
+            _: bool,
+            _: Vec<bracket_tools_startgg::GameReport>,
+        ) -> Result<SetMutationResult, Self::Error> {
+            self.mark_called(set_id).await
+        }
     }
 
     async fn drive(source: FlakySource, classify: fn(&FixtureError) -> PollFailure, sent: WriteIntent) -> Vec<WriteOutcome> {
@@ -281,6 +300,37 @@ mod tests {
         let Some(Msg::Write(second)) = rx.recv().await else { panic!() };
         assert!(matches!(second.outcome, WriteOutcome::Success { .. }));
         assert_eq!(source.mutation_log().len(), 2, "both mutations reached the source in order");
+    }
+
+    #[tokio::test]
+    async fn report_intents_reach_the_source_with_their_payload() {
+        let source = FixtureSource::new();
+        let (tx, mut rx) = unbounded_channel();
+        let (intent_tx, intent_rx) = unbounded_channel();
+        let payload = ReportPayload {
+            winner_entrant_id: Some("111".to_owned()),
+            is_dq: false,
+            games: vec![bracket_tools_startgg::GameReport {
+                winner_entrant_id: Some("111".to_owned()),
+                selections: Vec::new(),
+            }],
+            summary: "A 1-0 B".to_owned(),
+        };
+        intent_tx.send(intent(WriteKind::Report(Box::new(payload)))).unwrap();
+        drop(intent_tx);
+
+        run_writer(&source, test_config(), classify, tx, intent_rx).await;
+
+        let Some(Msg::Write(result)) = rx.recv().await else { panic!() };
+        let WriteOutcome::Success { payload, .. } = result.outcome else {
+            panic!("expected success: {:?}", result.outcome);
+        };
+        assert!(payload.completed_at.is_some(), "a report completes the set");
+        let log = source.report_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].set_id, 4242);
+        assert_eq!(log[0].winner_entrant_id.as_deref(), Some("111"));
+        assert_eq!(log[0].games.len(), 1);
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 use std::{error::Error, future::Future};
 
 use bracket_tools_cache::null_storage::NullStorage;
-use bracket_tools_startgg::{AdminProbeResult, GGProvider, GGProviderError, SetMutationResult, StartGgId};
+use bracket_tools_startgg::{AdminProbeResult, CharacterInfo, GGProvider, GGProviderError, GameReport, SetMutationResult, StartGgId};
 use bracket_tools_startgg_schema::{get_event_structure, get_sets_for_event};
 
 /// A source of live bracket data the scheduler polls and writes through.
@@ -33,6 +33,19 @@ pub trait SetSource {
     /// Probes whether the token administers the tournament (preflight's
     /// writes-armed decision).
     fn probe_admin(&self, tournament_id: StartGgId) -> impl Future<Output = Result<AdminProbeResult, Self::Error>> + Send;
+
+    /// Fetches an event's videogame character roster (empty when the event
+    /// has no character data).
+    fn fetch_event_characters(&self, event_slug: &str) -> impl Future<Output = Result<Vec<CharacterInfo>, Self::Error>> + Send;
+
+    /// Reports a set's result: winner, optional per-game data, DQ flag.
+    fn report_set(
+        &self,
+        set_id: StartGgId,
+        winner_entrant_id: Option<String>,
+        is_dq: bool,
+        games: Vec<GameReport>,
+    ) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + Send;
 }
 
 /// A [`SetSource`] backed by the live start.gg API through an uncached
@@ -68,6 +81,22 @@ impl SetSource for StartggSource {
 
     async fn probe_admin(&self, tournament_id: StartGgId) -> Result<AdminProbeResult, Self::Error> {
         self.provider.fetch_admin_probe(tournament_id).await
+    }
+
+    async fn fetch_event_characters(&self, event_slug: &str) -> Result<Vec<CharacterInfo>, Self::Error> {
+        self.provider.fetch_event_characters(event_slug).await
+    }
+
+    async fn report_set(
+        &self,
+        set_id: StartGgId,
+        winner_entrant_id: Option<String>,
+        is_dq: bool,
+        games: Vec<GameReport>,
+    ) -> Result<SetMutationResult, Self::Error> {
+        self.provider
+            .report_bracket_set(set_id, winner_entrant_id.as_deref(), is_dq, &games)
+            .await
     }
 }
 

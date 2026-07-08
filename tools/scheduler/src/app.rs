@@ -5,9 +5,13 @@
 //! events to force-poll). Everything here is driven the same way by the real
 //! main loop and by tests.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet, VecDeque},
+    mem::discriminant,
+};
 
-use bracket_tools_startgg::{SetMutationResult, StartGgId};
+use bracket_tools_startgg::{CharacterInfo, GameReport, GameSelection, SetMutationResult, StartGgId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
@@ -80,10 +84,32 @@ pub enum PollFailure {
     Persistent(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteKind {
     Called,
     InProgress,
+    Report(Box<ReportPayload>),
+}
+
+impl WriteKind {
+    /// Short label for notices (the `Report` payload is too big to print).
+    pub fn label(&self) -> &'static str {
+        match self {
+            WriteKind::Called => "Called",
+            WriteKind::InProgress => "InProgress",
+            WriteKind::Report(_) => "Report",
+        }
+    }
+}
+
+/// Everything `reportBracketSet` needs, carried on the write intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportPayload {
+    pub winner_entrant_id: Option<String>,
+    pub is_dq: bool,
+    pub games: Vec<GameReport>,
+    /// Human-readable result ("A 2-1 B") for notices.
+    pub summary: String,
 }
 
 /// A mutation the update loop wants performed. The writer task owns retries;
@@ -203,7 +229,120 @@ pub enum Modal {
         setup: SetupId,
         selected: usize,
     },
+    /// Game-by-game set reporting for the selected setup's set (`g`).
+    Report(Box<ReportDraft>),
     Help,
+}
+
+/// The in-flight report the modal edits. Winner taps are the hot path (`1`/
+/// `2` per game); characters are optional, apply to every game, and stick per
+/// player across sets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportDraft {
+    /// The setup the set is on (freed on submit).
+    pub setup: SetupId,
+    pub bracket: BracketId,
+    pub key: SetKey,
+    pub raw_id: String,
+    pub left: ReportSide,
+    pub right: ReportSide,
+    pub best_of: Option<i32>,
+    /// Winner of each game so far, in play order.
+    pub games: Vec<Side>,
+    /// Character picks (left, right), applied to every game's selections.
+    pub chars: [Option<i32>; 2],
+    pub stage: ReportStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+impl Side {
+    pub fn ix(self) -> usize {
+        match self {
+            Side::Left => 0,
+            Side::Right => 1,
+        }
+    }
+
+    fn other(self) -> Side {
+        match self {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportSide {
+    pub entrant_id: String,
+    pub name: String,
+    /// Sticky-character key: the first player id, else the entrant id (stable
+    /// across events for the same human).
+    pub sticky_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReportStage {
+    /// `1`/`2` record a game winner; `c` characters, `d` DQ, Enter finish.
+    Games,
+    /// Prefix-search character picker for one side.
+    Characters { side: Side, filter: String, cursor: usize },
+    /// `1`/`2` choose which side is disqualified.
+    DqPick,
+    /// Summary + `y` to submit.
+    Confirm { dq: Option<Side> },
+}
+
+impl ReportDraft {
+    pub fn wins(&self, side: Side) -> usize {
+        self.games.iter().filter(|&&s| s == side).count()
+    }
+
+    pub fn side(&self, side: Side) -> &ReportSide {
+        match side {
+            Side::Left => &self.left,
+            Side::Right => &self.right,
+        }
+    }
+
+    /// The side with strictly more game wins, if any.
+    pub fn leader(&self) -> Option<Side> {
+        match self.wins(Side::Left).cmp(&self.wins(Side::Right)) {
+            Ordering::Greater => Some(Side::Left),
+            Ordering::Less => Some(Side::Right),
+            Ordering::Equal => None,
+        }
+    }
+
+    /// True once a side has the majority of a known best-of.
+    fn clinched(&self) -> bool {
+        let Some(best_of) = self.best_of else { return false };
+        let needed = (best_of as usize) / 2 + 1;
+        self.wins(Side::Left) >= needed || self.wins(Side::Right) >= needed
+    }
+
+    /// "A 2-1 B" (winner first), or the DQ phrasing.
+    pub fn summary(&self, dq: Option<Side>) -> String {
+        if let Some(dq_side) = dq {
+            let winner = self.side(dq_side.other());
+            return format!("{} wins by DQ over {}", winner.name, self.side(dq_side).name);
+        }
+        let (winner, loser) = match self.leader() {
+            Some(Side::Right) => (Side::Right, Side::Left),
+            _ => (Side::Left, Side::Right),
+        };
+        format!(
+            "{} {}-{} {}",
+            self.side(winner).name,
+            self.wins(winner),
+            self.wins(loser),
+            self.side(loser).name
+        )
+    }
 }
 
 /// One choice in the reassign modal. Built deterministically so the render
@@ -242,6 +381,8 @@ pub struct UiState {
 #[derive(Debug, Clone)]
 pub struct BracketRuntime {
     pub state: BracketState,
+    /// The event's character roster (reporting vocabulary; empty = none).
+    pub characters: Vec<CharacterInfo>,
     pub applied_seq: u64,
     pub last_good_poll: Option<UnixMillis>,
     pub consecutive_failures: u32,
@@ -272,6 +413,8 @@ pub struct BracketBootstrap {
     pub pool: Vec<SetupId>,
     pub duration_prior_secs: u64,
     pub prior_weight: f64,
+    /// The event's character roster (may be empty).
+    pub characters: Vec<CharacterInfo>,
 }
 
 /// Side effects `update` wants performed. The main loop translates these
@@ -334,6 +477,9 @@ pub struct AppState {
     pub callable_since: HashMap<SetKey, UnixMillis>,
     /// When the TO called each set locally (no-show timer, duration ingest).
     pub called_at: HashMap<(BracketId, SetKey), UnixMillis>,
+    /// Sticky character memory: last pick per player (reporting seeds from
+    /// this, so regulars only pick once a day). Persisted in the overlay.
+    pub last_characters: HashMap<String, i32>,
     pub called_ints: Vec<i32>,
     pub in_progress_ints: Vec<i32>,
     pub soft_busy: Vec<(BracketId, SetKey)>,
@@ -388,6 +534,7 @@ impl AppState {
                         held: false,
                         pool: b.pool,
                     },
+                    characters: b.characters,
                     applied_seq: 0,
                     last_good_poll: Some(now_millis),
                     consecutive_failures: 0,
@@ -411,6 +558,7 @@ impl AppState {
             last_completed: HashMap::new(),
             callable_since: HashMap::new(),
             called_at: HashMap::new(),
+            last_characters: HashMap::new(),
             soft_busy: Vec::new(),
             durations,
             pending_writes: Vec::new(),
@@ -462,6 +610,7 @@ impl AppState {
             last_completed: self.last_completed.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             callable_since: self.callable_since.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             called_at: flatten_pair_map(&self.called_at),
+            last_characters: self.last_characters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             called_ints: self.called_ints.clone(),
             in_progress_ints: self.in_progress_ints.clone(),
             soft_busy: self.soft_busy.clone(),
@@ -515,6 +664,7 @@ impl AppState {
         self.last_completed = doc.last_completed.into_iter().collect();
         self.callable_since = doc.callable_since.into_iter().collect();
         self.called_at = doc.called_at.into_iter().map(|(b, k, v)| ((b, k), v)).collect();
+        self.last_characters = doc.last_characters.into_iter().collect();
         // Union so a config pin added since the last run is never dropped.
         merge_ints(&mut self.called_ints, doc.called_ints);
         merge_ints(&mut self.in_progress_ints, doc.in_progress_ints);
@@ -688,6 +838,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
         KeyCode::Char('w') => state.ui.modal = Some(Modal::PendingWrites { selected: 0 }),
         KeyCode::Char('d') => open_flags_modal(state, now),
         KeyCode::Char('a') => open_reassign_modal(state, now),
+        KeyCode::Char('g') => open_report_modal(state, now),
         KeyCode::Up => state.ui.queue_ix = state.ui.queue_ix.saturating_sub(1),
         KeyCode::Down => {
             state.ui.queue_ix = (state.ui.queue_ix + 1).min(state.world.queue.len().saturating_sub(1));
@@ -698,6 +849,14 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
 
 fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mut UpdateEffects) {
     if key.code == KeyCode::Esc {
+        // The report modal steps back a stage instead of losing the draft.
+        if let Some(Modal::Report(mut draft)) = state.ui.modal.take() {
+            if draft.stage != ReportStage::Games {
+                draft.stage = ReportStage::Games;
+                state.ui.modal = Some(Modal::Report(draft));
+                return;
+            }
+        }
         close_modal(state);
         return;
     }
@@ -766,6 +925,7 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
                 None => state.ui.modal = None,
             },
         },
+        Some(Modal::Report(draft)) => handle_report_key(state, *draft, key.code, now, effects),
         // Help modal: any other key closes it too.
         Some(Modal::Help) | None => state.ui.modal = None,
     }
@@ -1023,10 +1183,12 @@ fn enqueue_write(
         return;
     }
     // Queued or reconnect-held both count as in flight for single-flight.
+    // Kinds compare by discriminant: a second Report for the same set is a
+    // duplicate even when its payload differs.
     if state
         .pending_writes
         .iter()
-        .any(|p| p.intent.id == id && p.intent.kind == kind && p.status != PendingStatus::Parked)
+        .any(|p| p.intent.id == id && discriminant(&p.intent.kind) == discriminant(&kind) && p.status != PendingStatus::Parked)
     {
         return;
     }
@@ -1080,7 +1242,7 @@ fn retry_parked(state: &mut AppState, selected: usize, now: UnixMillis, effects:
     state.notice(
         now,
         NoticeLevel::Info,
-        format!("retrying write {:?} for set {}", intent.kind, intent.id),
+        format!("retrying write {} for set {}", intent.kind.label(), intent.id),
     );
     effects.writes.push(intent);
 }
@@ -1099,7 +1261,7 @@ fn discard_pending(state: &mut AppState, selected: usize, now: UnixMillis) {
     state.notice(
         now,
         NoticeLevel::Info,
-        format!("discarded write {:?} for set {}", intent.kind, intent.id),
+        format!("discarded write {} for set {}", intent.kind.label(), intent.id),
     );
 }
 
@@ -1158,6 +1320,288 @@ fn apply_reassign(state: &mut AppState, setup: SetupId, selected: usize, now: Un
     state.ui.modal = None;
     state.dirty = true;
     state.notice(now, NoticeLevel::Info, text);
+}
+
+/// `g` on the main view: report the selected setup's set, game by game.
+fn open_report_modal(state: &mut AppState, now: UnixMillis) {
+    if !state.writes_armed {
+        state.notice(now, NoticeLevel::Warn, "reporting needs writes armed (advisor-only session)");
+        return;
+    }
+    let Some((setup, status)) = selected_assignment(state) else {
+        state.notice(now, NoticeLevel::Warn, "select a setup first (digit), then g");
+        return;
+    };
+    let (SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set }) = status else {
+        state.notice(now, NoticeLevel::Warn, format!("setup {} holds no set to report", setup.0));
+        return;
+    };
+
+    let draft = {
+        let Some(live) = state.find_set(&bracket, &set) else {
+            state.notice(now, NoticeLevel::Warn, "the set is gone from the local table");
+            return;
+        };
+        if live.id.0.parse::<u64>().is_err() {
+            state.notice(
+                now,
+                NoticeLevel::Warn,
+                "can't report: set still has a preview id (bracket not started)",
+            );
+            return;
+        }
+        let mut sides = live.slots.iter().filter_map(|slot| slot.occupant.as_ref()).map(|o| ReportSide {
+            entrant_id: o.entrant_id.0.clone(),
+            name: o.display_name.clone(),
+            sticky_key: o.player_ids.first().map(|p| p.0.clone()).unwrap_or_else(|| o.entrant_id.0.clone()),
+        });
+        let (Some(left), Some(right)) = (sides.next(), sides.next()) else {
+            state.notice(now, NoticeLevel::Warn, "the set doesn't have two entrants to report");
+            return;
+        };
+        let best_of = state
+            .bracket_ix(&bracket)
+            .and_then(|ix| state.brackets[ix].state.groups.iter().find(|g| g.id == set.phase_group))
+            .and_then(|g| g.best_of_by_round.get(&set.round).copied());
+        let chars = [
+            state.last_characters.get(&left.sticky_key).copied(),
+            state.last_characters.get(&right.sticky_key).copied(),
+        ];
+        ReportDraft {
+            setup,
+            bracket,
+            key: set,
+            raw_id: live.id.0.clone(),
+            left,
+            right,
+            best_of,
+            games: Vec::new(),
+            chars,
+            stage: ReportStage::Games,
+        }
+    };
+    state.ui.modal = Some(Modal::Report(Box::new(draft)));
+}
+
+fn handle_report_key(state: &mut AppState, mut draft: ReportDraft, code: KeyCode, now: UnixMillis, effects: &mut UpdateEffects) {
+    match draft.stage.clone() {
+        ReportStage::Games => match code {
+            KeyCode::Char('1') => record_game(state, draft, Side::Left),
+            KeyCode::Char('2') => record_game(state, draft, Side::Right),
+            KeyCode::Backspace => {
+                draft.games.pop();
+                state.ui.modal = Some(Modal::Report(Box::new(draft)));
+            }
+            KeyCode::Char('c') => {
+                if report_roster(state, &draft.bracket).is_empty() {
+                    state.notice(now, NoticeLevel::Warn, "no character data for this event");
+                } else {
+                    draft.stage = ReportStage::Characters {
+                        side: Side::Left,
+                        filter: String::new(),
+                        cursor: 0,
+                    };
+                }
+                state.ui.modal = Some(Modal::Report(Box::new(draft)));
+            }
+            KeyCode::Char('d') => {
+                draft.stage = ReportStage::DqPick;
+                state.ui.modal = Some(Modal::Report(Box::new(draft)));
+            }
+            KeyCode::Enter => {
+                if draft.games.is_empty() {
+                    state.notice(now, NoticeLevel::Warn, "record game winners first (1/2)");
+                } else if draft.leader().is_none() {
+                    state.notice(now, NoticeLevel::Warn, "score is tied — record the decider first");
+                } else {
+                    draft.stage = ReportStage::Confirm { dq: None };
+                }
+                state.ui.modal = Some(Modal::Report(Box::new(draft)));
+            }
+            _ => state.ui.modal = Some(Modal::Report(Box::new(draft))),
+        },
+        ReportStage::Characters { side, filter, cursor } => {
+            handle_character_key(state, draft, side, filter, cursor, code);
+        }
+        ReportStage::DqPick => {
+            match code {
+                KeyCode::Char('1') => draft.stage = ReportStage::Confirm { dq: Some(Side::Left) },
+                KeyCode::Char('2') => draft.stage = ReportStage::Confirm { dq: Some(Side::Right) },
+                _ => {}
+            }
+            state.ui.modal = Some(Modal::Report(Box::new(draft)));
+        }
+        ReportStage::Confirm { dq } => match code {
+            KeyCode::Enter | KeyCode::Char('y') => submit_report(state, draft, dq, now, effects),
+            _ => state.ui.modal = Some(Modal::Report(Box::new(draft))),
+        },
+    }
+}
+
+fn record_game(state: &mut AppState, mut draft: ReportDraft, winner: Side) {
+    draft.games.push(winner);
+    // A clinched best-of needs no further entry; jump to the summary.
+    if draft.clinched() {
+        draft.stage = ReportStage::Confirm { dq: None };
+    }
+    state.ui.modal = Some(Modal::Report(Box::new(draft)));
+}
+
+fn handle_character_key(state: &mut AppState, mut draft: ReportDraft, side: Side, mut filter: String, cursor: usize, code: KeyCode) {
+    let matches_len = filtered_roster(report_roster(state, &draft.bracket), &filter).len();
+    match code {
+        KeyCode::Enter => {
+            let choice = filtered_roster(report_roster(state, &draft.bracket), &filter)
+                .get(cursor)
+                .map(|c| c.id);
+            if let Some(id) = choice {
+                draft.chars[side.ix()] = Some(id);
+                state.last_characters.insert(draft.side(side).sticky_key.clone(), id);
+            }
+            advance_character_stage(&mut draft, side);
+        }
+        // Tab keeps whatever the side already had (sticky or nothing).
+        KeyCode::Tab => advance_character_stage(&mut draft, side),
+        KeyCode::Up => {
+            draft.stage = ReportStage::Characters {
+                side,
+                filter,
+                cursor: cursor.saturating_sub(1),
+            };
+        }
+        KeyCode::Down => {
+            draft.stage = ReportStage::Characters {
+                side,
+                filter,
+                cursor: (cursor + 1).min(matches_len.saturating_sub(1)),
+            };
+        }
+        KeyCode::Backspace => {
+            filter.pop();
+            draft.stage = ReportStage::Characters { side, filter, cursor: 0 };
+        }
+        KeyCode::Char(c) if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '.' | '&') => {
+            filter.push(c);
+            draft.stage = ReportStage::Characters { side, filter, cursor: 0 };
+        }
+        _ => {}
+    }
+    state.ui.modal = Some(Modal::Report(Box::new(draft)));
+}
+
+/// Left picks first, then right, then back to the game taps.
+fn advance_character_stage(draft: &mut ReportDraft, side: Side) {
+    draft.stage = match side {
+        Side::Left => ReportStage::Characters {
+            side: Side::Right,
+            filter: String::new(),
+            cursor: 0,
+        },
+        Side::Right => ReportStage::Games,
+    };
+}
+
+/// The roster the report modal picks characters from.
+pub(crate) fn report_roster<'a>(state: &'a AppState, bracket: &BracketId) -> &'a [CharacterInfo] {
+    state
+        .brackets
+        .iter()
+        .find(|b| &b.state.id == bracket)
+        .map(|b| b.characters.as_slice())
+        .unwrap_or(&[])
+}
+
+/// Case-insensitive roster filter, prefix matches first.
+pub(crate) fn filtered_roster<'a>(roster: &'a [CharacterInfo], filter: &str) -> Vec<&'a CharacterInfo> {
+    let needle = filter.to_lowercase();
+    let (mut prefix, mut rest): (Vec<&CharacterInfo>, Vec<&CharacterInfo>) = roster
+        .iter()
+        .filter(|c| c.name.to_lowercase().contains(&needle))
+        .partition(|c| c.name.to_lowercase().starts_with(&needle));
+    prefix.append(&mut rest);
+    prefix
+}
+
+fn submit_report(state: &mut AppState, mut draft: ReportDraft, dq: Option<Side>, now: UnixMillis, effects: &mut UpdateEffects) {
+    let winner_side = match dq {
+        Some(dq_side) => dq_side.other(),
+        None => match draft.leader() {
+            Some(side) => side,
+            None => {
+                state.notice(now, NoticeLevel::Warn, "score is tied — record the decider first");
+                draft.stage = ReportStage::Games;
+                state.ui.modal = Some(Modal::Report(Box::new(draft)));
+                return;
+            }
+        },
+    };
+    let summary = draft.summary(dq);
+
+    // DQs report winner-only (no game data), matching the web flow.
+    let games: Vec<GameReport> = if dq.is_some() {
+        Vec::new()
+    } else {
+        draft
+            .games
+            .iter()
+            .map(|winner| GameReport {
+                winner_entrant_id: Some(draft.side(*winner).entrant_id.clone()),
+                selections: game_selections(&draft),
+            })
+            .collect()
+    };
+
+    push_undo(state, format!("report {summary}"));
+    let pair = (draft.bracket.clone(), draft.key.clone());
+    // Same shape as `f`: we believe the match is over — free the station,
+    // suppress our own stale evidence, and poll for the confirmed result.
+    let still_holds = state.board.setups().iter().any(|s| {
+        s.id == draft.setup
+            && match &s.status {
+                SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set } => (bracket, set) == (&pair.0, &pair.1),
+                _ => false,
+            }
+    });
+    if still_holds {
+        state.board.set_status(draft.setup, SetupStatus::Free);
+    }
+    state.tombstones.awaiting_remote_completion.insert(pair.clone());
+    state.called_at.remove(&pair);
+    state.no_show_alerted.remove(&pair);
+    effects.force_poll.push(draft.bracket.clone());
+    effects.want_sim(SimUrgency::Immediate);
+
+    let payload = ReportPayload {
+        winner_entrant_id: Some(draft.side(winner_side).entrant_id.clone()),
+        is_dq: dq.is_some(),
+        games,
+        summary: summary.clone(),
+    };
+    enqueue_write(
+        state,
+        effects,
+        &draft.bracket,
+        &draft.key,
+        &draft.raw_id,
+        WriteKind::Report(Box::new(payload)),
+        now,
+    );
+    close_modal(state);
+    state.dirty = true;
+    state.notice(now, NoticeLevel::Info, format!("reported {summary}; setup {} freed", draft.setup.0));
+}
+
+/// Both sides' character picks (sides without one stay out of the list).
+fn game_selections(draft: &ReportDraft) -> Vec<GameSelection> {
+    [Side::Left, Side::Right]
+        .into_iter()
+        .filter_map(|side| {
+            Some(GameSelection {
+                entrant_id: draft.side(side).entrant_id.clone(),
+                character_id: Some(draft.chars[side.ix()]?),
+            })
+        })
+        .collect()
 }
 
 fn cycle_selected_flag(state: &mut AppState, players: &[(ConflictKey, String)], selected: usize, now: UnixMillis) {
@@ -1382,7 +1826,7 @@ fn release_held_writes(state: &mut AppState, ix: usize, captured_at: UnixMillis,
         };
         if let Some(reason) = moot {
             state.pending_writes.retain(|p| p.intent != intent);
-            let text = format!("dropped held write {:?} for set {}: {reason}", intent.kind, intent.id);
+            let text = format!("dropped held write {} for set {}: {reason}", intent.kind.label(), intent.id);
             state.notice(now, NoticeLevel::Warn, text);
             continue;
         }
@@ -1490,10 +1934,14 @@ fn handle_write_result(state: &mut AppState, result: WriteResult, now: UnixMilli
         WriteOutcome::Success { payload, offset } => {
             state.pending_writes.retain(|p| p.intent != intent);
             if let Some(new_int) = payload.state {
-                learn_state_int(state, intent.kind, new_int, now);
+                learn_state_int(state, &intent.kind, new_int, now);
             }
             if offset.is_some() {
                 state.clock_offset = offset;
+            }
+            if let WriteKind::Report(report) = &intent.kind {
+                let text = format!("report confirmed: {}", report.summary);
+                state.notice(now, NoticeLevel::Info, text);
             }
             merge_remote_set(state, &intent, &payload);
             state.dirty = true;
@@ -1510,8 +1958,10 @@ fn handle_write_result(state: &mut AppState, result: WriteResult, now: UnixMilli
                 pending.last_error = Some(error);
             }
             let text = format!(
-                "write {:?} for set {} held until {} polls again",
-                intent.kind, intent.id, intent.bracket.0
+                "write {} for set {} held until {} polls again",
+                intent.kind.label(),
+                intent.id,
+                intent.bracket.0
             );
             state.notice(now, NoticeLevel::Warn, text);
             if !state.held_writes.contains(&intent) {
@@ -1524,20 +1974,22 @@ fn handle_write_result(state: &mut AppState, result: WriteResult, now: UnixMilli
                 pending.attempts += 1;
                 pending.last_error = Some(error.clone());
             }
-            let text = format!("write {:?} for set {} failed for good: {error}", intent.kind, intent.id);
+            let text = format!("write {} for set {} failed for good: {error}", intent.kind.label(), intent.id);
             state.notice(now, NoticeLevel::Error, text);
         }
     }
 }
 
-fn learn_state_int(state: &mut AppState, kind: WriteKind, new_int: i32, now: UnixMillis) {
+fn learn_state_int(state: &mut AppState, kind: &WriteKind, new_int: i32, now: UnixMillis) {
     let learned = match kind {
         WriteKind::Called => &mut state.called_ints,
         WriteKind::InProgress => &mut state.in_progress_ints,
+        // A report's resulting state is COMPLETED, already benign by default.
+        WriteKind::Report(_) => return,
     };
     if !learned.contains(&new_int) {
         learned.push(new_int);
-        let text = format!("learned {kind:?} state int = {new_int}");
+        let text = format!("learned {} state int = {new_int}", kind.label());
         state.notice(now, NoticeLevel::Info, text);
     }
 }
@@ -1677,6 +2129,7 @@ mod tests {
                 pool: config.setups.clone(),
                 duration_prior_secs: 480,
                 prior_weight: 4.0,
+                characters: Vec::new(),
             })
             .collect()
     }
@@ -2129,6 +2582,7 @@ mod tests {
             pool: vec![SetupId(1), SetupId(2)],
             duration_prior_secs: 480,
             prior_weight: 4.0,
+            characters: Vec::new(),
         }];
         let mut state = AppState::new(config, true, boots, NOW);
         assert_eq!(state.world.queue.len(), 2);
@@ -2501,5 +2955,166 @@ mod tests {
         escalating.config.escalate_unpinned_state_deviation = true;
         update(&mut escalating, snapshot_msg("ultimate", 1, next), NOW + 1000);
         assert_eq!(escalating.soft_busy.len(), 1);
+    }
+
+    /// Calls the top candidate on setup 1, then opens the report modal for it.
+    fn reporting_app() -> AppState {
+        let mut state = se4_app(true);
+        call_top_candidate(&mut state, '1');
+        update(&mut state, key(KeyCode::Char('g')), NOW);
+        assert!(matches!(state.ui.modal, Some(Modal::Report(_))), "{:?}", state.ui.modal);
+        state
+    }
+
+    fn draft(state: &AppState) -> &super::ReportDraft {
+        match &state.ui.modal {
+            Some(Modal::Report(draft)) => draft,
+            other => panic!("expected the report modal, got {other:?}"),
+        }
+    }
+
+    fn report_payload(effects: &super::UpdateEffects) -> super::ReportPayload {
+        effects
+            .writes
+            .iter()
+            .find_map(|w| match &w.kind {
+                WriteKind::Report(payload) => Some((**payload).clone()),
+                _ => None,
+            })
+            .expect("a report intent was enqueued")
+    }
+
+    #[test]
+    fn report_flow_taps_games_and_submits() {
+        let mut state = reporting_app();
+        let (left_entrant, right_name) = {
+            let d = draft(&state);
+            (d.left.entrant_id.clone(), d.right.name.clone())
+        };
+
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(KeyCode::Char('2')), NOW);
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW); // finish → confirm
+        assert!(matches!(draft(&state).stage, super::ReportStage::Confirm { dq: None }));
+
+        let effects = update(&mut state, key(KeyCode::Char('y')), NOW);
+        let report = report_payload(&effects);
+        assert_eq!(report.winner_entrant_id, Some(left_entrant));
+        assert!(!report.is_dq);
+        assert_eq!(report.games.len(), 3);
+        assert!(report.summary.contains("2-1"), "{}", report.summary);
+        assert!(report.summary.contains(&right_name), "{}", report.summary);
+
+        // Submitting frees the station and suppresses stale local evidence.
+        assert!(state.ui.modal.is_none());
+        assert!(state.board.setups().iter().all(|s| s.status == SetupStatus::Free));
+        assert_eq!(state.tombstones.awaiting_remote_completion.len(), 1);
+        assert!(effects.force_poll.contains(&BracketId("ultimate".to_owned())));
+    }
+
+    #[test]
+    fn report_clinch_jumps_to_confirm_and_dq_reports_winner_only() {
+        // A known best-of clinches automatically.
+        let mut state = reporting_app();
+        match &mut state.ui.modal {
+            Some(Modal::Report(d)) => d.best_of = Some(3),
+            _ => unreachable!(),
+        }
+        update(&mut state, key(KeyCode::Char('2')), NOW);
+        update(&mut state, key(KeyCode::Char('2')), NOW);
+        assert!(matches!(draft(&state).stage, super::ReportStage::Confirm { dq: None }));
+        // Esc steps back to the game taps instead of losing the draft.
+        update(&mut state, key(KeyCode::Esc), NOW);
+        assert!(matches!(draft(&state).stage, super::ReportStage::Games));
+        assert_eq!(draft(&state).games.len(), 2, "the draft survived");
+
+        // DQ: d, pick the side, confirm — winner is the other side, no games.
+        update(&mut state, key(KeyCode::Char('d')), NOW);
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        let (left_name, right_entrant) = {
+            let d = draft(&state);
+            assert!(matches!(
+                d.stage,
+                super::ReportStage::Confirm {
+                    dq: Some(super::Side::Left)
+                }
+            ));
+            (d.left.name.clone(), d.right.entrant_id.clone())
+        };
+        let effects = update(&mut state, key(KeyCode::Enter), NOW);
+        let report = report_payload(&effects);
+        assert!(report.is_dq);
+        assert_eq!(report.winner_entrant_id, Some(right_entrant));
+        assert!(report.games.is_empty(), "DQ reports carry no game data");
+        assert!(report.summary.contains("DQ"), "{}", report.summary);
+        assert!(report.summary.contains(&left_name), "{}", report.summary);
+    }
+
+    #[test]
+    fn report_needs_writes_armed() {
+        let mut state = se4_app(false);
+        call_top_candidate(&mut state, '1');
+        update(&mut state, key(KeyCode::Char('g')), NOW);
+        assert!(state.ui.modal.is_none());
+        assert!(state.notices.iter().any(|n| n.text.contains("advisor-only")));
+    }
+
+    #[test]
+    fn character_picker_filters_picks_and_sticks() {
+        let roster = vec![
+            bracket_tools_startgg::CharacterInfo {
+                id: 1,
+                name: "Mario".to_owned(),
+            },
+            bracket_tools_startgg::CharacterInfo {
+                id: 2,
+                name: "Marth".to_owned(),
+            },
+            bracket_tools_startgg::CharacterInfo {
+                id: 3,
+                name: "Fox".to_owned(),
+            },
+        ];
+        let mut state = se4_app(true);
+        state.brackets[0].characters = roster;
+        call_top_candidate(&mut state, '1');
+        update(&mut state, key(KeyCode::Char('g')), NOW);
+
+        // Left side: filter "mar", cursor down to Marth, pick.
+        update(&mut state, key(KeyCode::Char('c')), NOW);
+        for c in "mar".chars() {
+            update(&mut state, key(KeyCode::Char(c)), NOW);
+        }
+        update(&mut state, key(KeyCode::Down), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        // Right side: "f" → Fox.
+        update(&mut state, key(KeyCode::Char('f')), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+
+        let (chars, left_key, right_key) = {
+            let d = draft(&state);
+            assert!(matches!(d.stage, super::ReportStage::Games));
+            (d.chars, d.left.sticky_key.clone(), d.right.sticky_key.clone())
+        };
+        assert_eq!(chars, [Some(2), Some(3)]);
+        assert_eq!(state.last_characters.get(&left_key), Some(&2));
+        assert_eq!(state.last_characters.get(&right_key), Some(&3));
+
+        // The picks ride along on every reported game.
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        let effects = update(&mut state, key(KeyCode::Char('y')), NOW);
+        let report = report_payload(&effects);
+        assert_eq!(report.games.len(), 1);
+        let selections = &report.games[0].selections;
+        assert_eq!(selections.len(), 2);
+        assert_eq!(selections[0].character_id, Some(2));
+        assert_eq!(selections[1].character_id, Some(3));
+
+        // Sticky memory survives the overlay round trip.
+        let mut restored = se4_app(true);
+        restored.apply_overlay(state.to_overlay(), NOW);
+        assert_eq!(restored.last_characters.get(&left_key), Some(&2));
     }
 }

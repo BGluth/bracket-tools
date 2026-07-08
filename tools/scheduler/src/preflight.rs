@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 
-use bracket_tools_startgg::StartGgId;
+use bracket_tools_startgg::{CharacterInfo, StartGgId};
 use tokio::time::timeout;
 
 use crate::{
@@ -57,6 +57,9 @@ pub struct BracketPreflight {
     /// (id, slug) of the owning tournament, when the structure answered —
     /// input to the cross-event identity assertion.
     pub tournament: Option<(String, String)>,
+    /// The event's character roster (reporting vocabulary); empty when the
+    /// videogame has none or the fetch failed (best-effort).
+    pub characters: Vec<CharacterInfo>,
 }
 
 #[derive(Debug)]
@@ -195,6 +198,7 @@ where
                 },
                 warnings,
                 tournament: None,
+                characters: Vec::new(),
             }
         }
         Ok(Err(error)) => {
@@ -212,6 +216,7 @@ where
                 outcome,
                 warnings,
                 tournament: None,
+                characters: Vec::new(),
             };
         }
         Ok(Ok(structure)) => structure,
@@ -263,11 +268,29 @@ where
         }
     };
 
+    // Best-effort roster fetch for healthy events (the reporting vocabulary);
+    // an event without one still schedules — reporting just skips characters.
+    let characters = match &outcome {
+        BracketOutcome::Ready { .. } => match timeout(request_timeout, source.fetch_event_characters(&config.slug)).await {
+            Ok(Ok(characters)) => characters,
+            Ok(Err(error)) => {
+                warnings.push(format!("character roster unavailable: {error}"));
+                Vec::new()
+            }
+            Err(_elapsed) => {
+                warnings.push("character roster fetch timed out".to_owned());
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    };
+
     BracketPreflight {
         config: config.clone(),
         outcome,
         warnings,
         tournament: tournament_pair,
+        characters,
     }
 }
 
@@ -380,6 +403,7 @@ impl PreflightReport {
                     pool: config.pool.clone(),
                     duration_prior_secs: config.duration_prior_secs,
                     prior_weight: config.prior_weight,
+                    characters: bracket.characters,
                 }
             })
             .collect()
@@ -506,6 +530,10 @@ mod tests {
         let boots = report.into_bootstraps();
         assert_eq!(boots.len(), 2);
         assert!(boots.iter().all(|b| !b.sets.is_empty()));
+        assert!(
+            boots.iter().all(|b| !b.characters.is_empty()),
+            "ready events carry the reporting roster"
+        );
     }
 
     #[tokio::test]

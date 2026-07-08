@@ -3,6 +3,7 @@ pub mod scalars;
 pub mod schema;
 
 pub mod admin_probe;
+pub mod get_event_characters;
 pub mod get_event_structure;
 pub mod get_games_for_set;
 pub mod get_num_players_in_tournament;
@@ -15,3 +16,4 @@ pub mod get_tourney_id;
 pub mod get_user_for_user_slug;
 pub mod mark_set_called;
 pub mod mark_set_in_progress;
+pub mod report_bracket_set;
