@@ -6,6 +6,7 @@
 //! so tests drive it without a terminal or network.
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,11 +18,14 @@ use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
     app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
     cli::{build_live_source, default_data_dir, resolve_token, Cli},
-    config::{resolve_roster, write_starter_template},
+    config::{referenced_types, resolve_roster, write_starter_template, SetupCounts},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
     model::BracketId,
-    persist::{load_overlay, load_snapshot, save_overlay, save_snapshot, sibling_with_suffix, Load, Lockfile},
+    persist::{
+        load_overlay, load_setup_defaults, load_snapshot, save_overlay, save_setup_defaults, save_snapshot, sibling_with_suffix, Load,
+        Lockfile,
+    },
     poller::{classify_provider_error, run_poller, PollerConfig},
     preflight::preflight,
     rehearsal::install_rehearsal,
@@ -45,6 +49,8 @@ const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(20);
 const SAVE_DEBOUNCE_MS: i64 = 2000;
 const DEFAULT_STATE_FILE: &str = "scheduler-state.json";
 const DEFAULT_SNAPSHOT_FILE: &str = "scheduler-snapshot.json";
+/// Cross-tournament setup-count defaults, in the XDG data dir.
+const SETUP_DEFAULTS_FILE: &str = "setup-defaults.toml";
 /// Routine rollout evaluations run at most this often; the decision-point
 /// exemption (setup freed) bypasses it.
 const SIM_DEBOUNCE_MS: i64 = 5000;
@@ -61,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         let mut source = build_offline_source(&cli)?;
         let mut config = offline_config(&cli, &config_path, &source)?;
         apply_noise_overrides(&cli, &mut config)?;
+        resolve_setup_counts(&cli, &mut config)?;
         if cli.autoplay {
             return autoplay(&cli, &config, &source).await;
         }
@@ -72,9 +79,10 @@ async fn main() -> anyhow::Result<()> {
         }
         run(cli, config, Arc::new(source), classify_fixture_error).await
     } else {
-        let Some(config) = SchedulerConfig::load_if_present(&config_path)? else {
+        let Some(mut config) = SchedulerConfig::load_if_present(&config_path)? else {
             return bootstrap_starter_config(&config_path);
         };
+        resolve_setup_counts(&cli, &mut config)?;
         let token = resolve_token(cli.token.as_deref(), &config)?;
         let source = Arc::new(build_live_source(token)?);
         run(cli, config, source, classify_provider_error).await
@@ -110,6 +118,33 @@ fn offline_config(cli: &Cli, config_path: &Path, source: &FixtureSource) -> anyh
             Ok(derive_offline_config(source))
         }
     }
+}
+
+/// Folds the remaining count sources into `config.setups` before the app is
+/// built: `--setups` beats the config, the config beats the defaults file,
+/// and a still-`None` result reaches the constructor's fallback-4 warning.
+/// (The persisted overlay's roster slots in *between* the flag and the
+/// config — `apply_overlay` adopts it unless the flag pinned counts.)
+fn resolve_setup_counts(cli: &Cli, config: &mut SchedulerConfig) -> anyhow::Result<()> {
+    resolve_setup_counts_from(cli, config, &default_data_dir().join(SETUP_DEFAULTS_FILE))
+}
+
+fn resolve_setup_counts_from(cli: &Cli, config: &mut SchedulerConfig, defaults_path: &Path) -> anyhow::Result<()> {
+    if let Some(counts) = &cli.setups {
+        config.setups = Some(counts.clone());
+    } else if config.setups.is_none() {
+        if let Some(table) = load_setup_defaults(defaults_path) {
+            // Only types this config's brackets reference: a stale entry from
+            // another venue must not materialize ghost stations.
+            let referenced = referenced_types(config);
+            let table: BTreeMap<String, u32> = table.into_iter().filter(|(t, _)| referenced.contains(t)).collect();
+            if !table.is_empty() {
+                config.setups = Some(SetupCounts::ByType(table));
+            }
+        }
+    }
+    config.validate().context("applying --setups")?;
+    Ok(())
 }
 
 /// `--noise`/`--noise-seed` beat whatever the config's `[sim]` section says;
@@ -223,8 +258,21 @@ where
     install_panic_hook();
     let mut guard = TerminalGuard::new().context("entering the terminal")?;
 
+    // Live roster changes reseed the cross-tournament defaults; offline
+    // (synth/rehearsal) worlds must not stomp the venue's real counts.
+    let defaults_path = (!cli.offline()).then(|| default_data_dir().join(SETUP_DEFAULTS_FILE));
+
     guard.terminal.draw(|frame| ui::draw(frame, &state, now_millis()))?;
-    event_loop(&mut state, rx, &mut tasks, &mut guard, &state_path, &snapshot_path).await?;
+    event_loop(
+        &mut state,
+        rx,
+        &mut tasks,
+        &mut guard,
+        &state_path,
+        &snapshot_path,
+        defaults_path.as_deref(),
+    )
+    .await?;
 
     drop(guard);
     tasks.join_set.abort_all();
@@ -348,6 +396,7 @@ async fn event_loop<S, F>(
     guard: &mut TerminalGuard,
     state_path: &Path,
     snapshot_path: &Path,
+    defaults_path: Option<&Path>,
 ) -> anyhow::Result<()>
 where
     S: SetSource + Send + Sync + 'static,
@@ -356,6 +405,9 @@ where
     let mut last_save: UnixMillis = 0;
     let mut last_sim_dispatch: UnixMillis = 0;
     let mut sim_pending = false;
+    // Defaults rewrite only on a roster *change*, so a session that never
+    // touches 's' leaves the file alone.
+    let mut last_counts = state.board.counts_by_type();
     loop {
         let mut effects = UpdateEffects::default();
         tokio::select! {
@@ -404,6 +456,7 @@ where
             if state.snapshot_dirty {
                 persist_snapshot(state, snapshot_path);
             }
+            persist_setup_defaults(state, defaults_path, &mut last_counts);
             last_save = now_millis();
         }
         guard.terminal.draw(|frame| ui::draw(frame, state, now_millis()))?;
@@ -416,7 +469,20 @@ where
     if state.snapshot_dirty {
         persist_snapshot(state, snapshot_path);
     }
+    persist_setup_defaults(state, defaults_path, &mut last_counts);
     Ok(())
+}
+
+/// Rewrites the cross-tournament defaults file when the roster shape changed
+/// (live sessions only — `defaults_path` is `None` offline). Best-effort: the
+/// overlay save already tracks the persistence badge.
+fn persist_setup_defaults(state: &AppState, path: Option<&Path>, last_counts: &mut BTreeMap<String, u32>) {
+    let Some(path) = path else { return };
+    let counts = state.board.counts_by_type();
+    if counts != *last_counts {
+        let _ = save_setup_defaults(path, &counts);
+        *last_counts = counts;
+    }
 }
 
 /// The supervised background tasks plus everything needed to respawn them.
@@ -567,10 +633,16 @@ fn now_millis() -> UnixMillis {
 mod tests {
     use std::{env, fs, path::PathBuf, process};
 
-    use bracket_tools_scheduler::{config::SetupCounts, fixture_source::FixtureSource};
+    use std::collections::BTreeMap;
+
+    use bracket_tools_scheduler::{
+        config::{BracketConfig, OneOrMany, SchedulerConfig, SetupCounts},
+        fixture_source::FixtureSource,
+        persist::save_setup_defaults,
+    };
     use clap::Parser;
 
-    use crate::{offline_config, Cli};
+    use crate::{offline_config, resolve_setup_counts_from, Cli};
 
     const WORLD_SLUG: &str = "tournament/synth/event/de8-1";
 
@@ -623,5 +695,61 @@ mod tests {
         let cli = synth_cli(&["--config", path.to_str().unwrap()]);
         let config = offline_config(&cli, &path, &synth_source()).unwrap();
         assert_eq!(config.brackets[0].slug, "tournament/real/event/main");
+    }
+
+    fn switch_config(setups: Option<SetupCounts>) -> SchedulerConfig {
+        SchedulerConfig {
+            brackets: vec![BracketConfig {
+                setup_type: Some(OneOrMany::One("switch".to_owned())),
+                ..BracketConfig::new("tournament/t/event/melee")
+            }],
+            setups,
+            ..SchedulerConfig::default()
+        }
+    }
+
+    #[test]
+    fn setup_counts_precedence_flag_config_defaults_fallback() {
+        let dir = env::temp_dir().join(format!("scheduler-defaults-test-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let defaults = dir.join("setup-defaults.toml");
+        save_setup_defaults(&defaults, &BTreeMap::from([("switch".to_owned(), 5), ("stale".to_owned(), 3)])).unwrap();
+
+        // The flag beats everything.
+        let cli = Cli::try_parse_from(["scheduler", "--setups", "switch=2"]).unwrap();
+        let mut config = switch_config(Some(SetupCounts::Uniform(9)));
+        config.brackets[0].setup_type = None;
+        resolve_setup_counts_from(&cli, &mut config, &defaults).unwrap();
+        assert_eq!(config.setups, Some(SetupCounts::ByType(BTreeMap::from([("switch".to_owned(), 2)]))));
+
+        // Config counts beat the defaults file.
+        let cli = Cli::try_parse_from(["scheduler"]).unwrap();
+        let mut config = switch_config(Some(SetupCounts::ByType(BTreeMap::from([("switch".to_owned(), 7)]))));
+        resolve_setup_counts_from(&cli, &mut config, &defaults).unwrap();
+        assert_eq!(config.setups, Some(SetupCounts::ByType(BTreeMap::from([("switch".to_owned(), 7)]))));
+
+        // No flag, no config counts: the defaults file seeds referenced types
+        // only (the stale venue entry must not materialize ghost stations).
+        let mut config = switch_config(None);
+        resolve_setup_counts_from(&cli, &mut config, &defaults).unwrap();
+        assert_eq!(config.setups, Some(SetupCounts::ByType(BTreeMap::from([("switch".to_owned(), 5)]))));
+
+        // Nothing anywhere: stays None for the constructor's fallback-4 warn.
+        let mut config = switch_config(None);
+        resolve_setup_counts_from(&cli, &mut config, &dir.join("absent.toml")).unwrap();
+        assert_eq!(config.setups, None);
+
+        // A defaults file with no referenced type is ignored entirely.
+        save_setup_defaults(&defaults, &BTreeMap::from([("other".to_owned(), 4)])).unwrap();
+        let mut config = switch_config(None);
+        resolve_setup_counts_from(&cli, &mut config, &defaults).unwrap();
+        assert_eq!(config.setups, None);
+
+        // A flag that contradicts the bracket types fails validation.
+        let cli = Cli::try_parse_from(["scheduler", "--setups", "8"]).unwrap();
+        let mut config = switch_config(None);
+        assert!(resolve_setup_counts_from(&cli, &mut config, &defaults).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

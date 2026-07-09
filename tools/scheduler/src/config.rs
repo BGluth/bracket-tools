@@ -5,6 +5,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use serde::{Deserialize, Serialize};
@@ -150,6 +151,34 @@ pub struct SetupId(pub u32);
 pub enum SetupCounts {
     Uniform(u32),
     ByType(BTreeMap<String, u32>),
+}
+
+/// The `--setups` grammar: a bare count (`8`) or comma-separated per-type
+/// counts (`switch=6,pokemon=2`).
+impl FromStr for SetupCounts {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        if let Ok(n) = raw.parse::<u32>() {
+            return Ok(Self::Uniform(n));
+        }
+        let mut table = BTreeMap::new();
+        for part in raw.split(',') {
+            let Some((name, count)) = part.split_once('=') else {
+                return Err(format!("expected type=count, got {part:?}"));
+            };
+            let (name, count) = (name.trim(), count.trim());
+            if name.is_empty() {
+                return Err(format!("empty type name in {part:?}"));
+            }
+            let count: u32 = count.parse().map_err(|_| format!("bad count in {part:?}"))?;
+            if table.insert(name.to_owned(), count).is_some() {
+                return Err(format!("duplicate type {name:?}"));
+            }
+        }
+        Ok(Self::ByType(table))
+    }
 }
 
 /// A `String | Vec<String>` TOML field.

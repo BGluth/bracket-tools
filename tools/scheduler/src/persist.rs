@@ -11,6 +11,7 @@
 //! schedulers can't halve the rate budget or last-writer-wins the state.
 
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -134,6 +135,26 @@ fn write_then_rename(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.sync_all()?;
     }
     fs::rename(tmp, path)
+}
+
+/// Writes the cross-tournament setup-count defaults (`type = count` TOML,
+/// atomically): the next run without configured counts starts from this
+/// roster shape.
+pub fn save_setup_defaults(path: &Path, counts: &BTreeMap<String, u32>) -> Result<(), PersistError> {
+    let toml = toml::to_string(counts).map_err(|e| PersistError::Write {
+        path: path.to_owned(),
+        source: io::Error::other(e),
+    })?;
+    write_then_rename(&temp_path(path), path, toml.as_bytes()).map_err(|source| PersistError::Write {
+        path: path.to_owned(),
+        source,
+    })
+}
+
+/// Best-effort read of the setup-count defaults: a missing or unparseable
+/// file is simply no defaults (never a startup failure).
+pub fn load_setup_defaults(path: &Path) -> Option<BTreeMap<String, u32>> {
+    toml::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
 /// Loads a versioned document, recovering a corrupt/version-mismatched file
@@ -269,9 +290,9 @@ fn read_pid(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
-    use super::{load_overlay, save_overlay, Load, Lockfile, OverlayDoc, OVERLAY_VERSION};
+    use super::{load_overlay, load_setup_defaults, save_overlay, save_setup_defaults, Load, Lockfile, OverlayDoc, OVERLAY_VERSION};
     use crate::{config::SetupId, conflict::SetupBoard, duration::DurationModel};
 
     fn scratch(name: &str) -> PathBuf {
@@ -373,6 +394,21 @@ mod tests {
         assert_eq!(loaded.brackets.len(), 1);
         assert_eq!(loaded.brackets[0].sets, bracket.sets, "LiveSet subtree round-trips exactly");
         assert_eq!(loaded.brackets[0].groups[0], bracket.info);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn setup_defaults_round_trip_and_best_effort_load() {
+        let path = scratch("setup-defaults.toml");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(load_setup_defaults(&path), None, "missing file is no defaults");
+
+        let counts = BTreeMap::from([("switch".to_owned(), 6), ("pokemon".to_owned(), 2)]);
+        save_setup_defaults(&path, &counts).unwrap();
+        assert_eq!(load_setup_defaults(&path), Some(counts));
+
+        std::fs::write(&path, "not = valid = toml").unwrap();
+        assert_eq!(load_setup_defaults(&path), None, "corrupt file is no defaults, not an error");
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -15,7 +15,10 @@ use clap::{ArgGroup, Parser};
 use directories::ProjectDirs;
 use thiserror::Error;
 
-use crate::{config::SchedulerConfig, set_source::StartggSource};
+use crate::{
+    config::{SchedulerConfig, SetupCounts},
+    set_source::StartggSource,
+};
 
 pub const STARTGG_TOKEN_ENV: &str = "STARTGG_TOKEN";
 pub const DEFAULT_TOKEN_PATH: &str = "~/work/tokens/scraper_gg.token";
@@ -76,6 +79,12 @@ pub struct Cli {
     /// rolls a different world. Overrides `sim.noise_seed`.
     #[arg(long, value_name = "SEED", requires = "offline")]
     pub noise_seed: Option<u64>,
+
+    /// Station counts for this run: a single number (`8`) or per-type counts
+    /// (`switch=6,pokemon=2`). Explicit operator intent — beats the config's
+    /// counts AND any persisted roster. Live and offline.
+    #[arg(long, value_name = "COUNTS", value_parser = SetupCounts::from_str)]
+    pub setups: Option<SetupCounts>,
 
     /// Disable the capture journal. TODO(S4): the journal itself lands with
     /// persistence; the flag is parsed now so scripts stay stable.
@@ -200,6 +209,7 @@ fn expand_home(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         env, fs,
         path::{Path, PathBuf},
     };
@@ -207,6 +217,7 @@ mod tests {
     use clap::Parser;
 
     use super::{expand_home, resolve_token_from, Cli, TokenError};
+    use crate::config::SetupCounts;
 
     #[test]
     fn cli_parses_all_flags() {
@@ -255,6 +266,20 @@ mod tests {
     #[test]
     fn simulate_and_synth_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["scheduler", "--simulate", "caps/", "--synth", "de:8"]).is_err());
+    }
+
+    #[test]
+    fn setups_flag_parses_both_grammars() {
+        let cli = Cli::try_parse_from(["scheduler", "--setups", "8"]).unwrap();
+        assert_eq!(cli.setups, Some(SetupCounts::Uniform(8)));
+
+        let cli = Cli::try_parse_from(["scheduler", "--setups", "switch=6, pokemon=2"]).unwrap();
+        let expected: BTreeMap<String, u32> = [("switch".to_owned(), 6), ("pokemon".to_owned(), 2)].into();
+        assert_eq!(cli.setups, Some(SetupCounts::ByType(expected)));
+
+        for bad in ["switch=6,switch=2", "=3", "switch=", "switch", "switch=x"] {
+            assert!(Cli::try_parse_from(["scheduler", "--setups", bad]).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     #[test]
