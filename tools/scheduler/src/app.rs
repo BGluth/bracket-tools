@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{resolve_roster, BracketMode, SchedulerConfig, SetupId, FALLBACK_SETUPS_PER_TYPE},
+    config::{referenced_types, resolve_roster, BracketMode, SchedulerConfig, SetupId, FALLBACK_SETUPS_PER_TYPE},
     conflict::{
         callable, effective_pool, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView, CallableSet, ConflictIndex,
         ConflictInputs, ConflictKey, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones, UnixMillis,
@@ -638,23 +638,55 @@ impl AppState {
     }
 
     /// Rehydrates a persisted overlay over a freshly-bootstrapped state,
-    /// reconciling against the current config (the setup inventory and known
-    /// state ints stay config-authoritative) and recomputing the world.
-    pub fn apply_overlay(&mut self, doc: OverlayDoc, now_millis: UnixMillis) {
-        let known_ids: HashSet<SetupId> = self.board.setups().iter().map(|s| s.id).collect();
-        for setup in doc.board.setups() {
-            if known_ids.contains(&setup.id) {
-                self.board.set_status(setup.id, setup.status.clone());
-            } else {
-                self.notice(
-                    now_millis,
-                    NoticeLevel::Warn,
-                    format!("dropped persisted state for setup {} (not in config)", setup.id.0),
+    /// reconciling against the current config (known state ints stay
+    /// config-authoritative) and recomputing the world.
+    ///
+    /// The station roster: a typed persisted board is the operator's last
+    /// known station reality, so it's adopted wholesale when `adopt_roster`
+    /// (i.e. `--setups` didn't pin counts this run). A pre-migration board
+    /// (untyped `setup_type`s) or a pinned run instead re-keys statuses by id
+    /// onto the freshly-resolved roster, preserving crash recovery.
+    pub fn apply_overlay(&mut self, doc: OverlayDoc, now_millis: UnixMillis, adopt_roster: bool) {
+        let pre_migration = doc.board.setups().iter().any(|s| s.setup_type.is_empty());
+        if adopt_roster && !pre_migration && !doc.board.setups().is_empty() {
+            self.board = doc.board.clone();
+            let referenced = referenced_types(&self.config);
+            let mut unreferenced: Vec<&str> = self
+                .board
+                .setups()
+                .iter()
+                .map(|s| s.setup_type.as_str())
+                .filter(|t| !referenced.iter().any(|r| r == t))
+                .collect();
+            unreferenced.dedup();
+            if !unreferenced.is_empty() {
+                let text = format!(
+                    "restored roster has setup type(s) no bracket references: {} (retire with 's' if stale)",
+                    unreferenced.join(", ")
                 );
+                self.notice(now_millis, NoticeLevel::Warn, text);
+            }
+        } else {
+            let known_ids: HashSet<SetupId> = self.board.setups().iter().map(|s| s.id).collect();
+            for setup in doc.board.setups() {
+                if known_ids.contains(&setup.id) {
+                    self.board.set_status(setup.id, setup.status.clone());
+                } else {
+                    self.notice(
+                        now_millis,
+                        NoticeLevel::Warn,
+                        format!("dropped persisted state for setup {} (not in config)", setup.id.0),
+                    );
+                }
             }
         }
+        // A status naming a bracket outside this config is another
+        // tournament's leftovers (the shared XDG state file): free it.
+        self.reset_unknown_bracket_statuses(now_millis);
+
         self.flags = doc.flags;
         self.tombstones = doc.tombstones;
+        let known_ids: HashSet<SetupId> = self.board.setups().iter().map(|s| s.id).collect();
         for (setup, over) in doc.pool_overrides {
             let known_bracket = match &over {
                 PoolOverride::Dedicated(b) => self.bracket_ix(b).is_some(),
@@ -699,6 +731,33 @@ impl AppState {
         }
         self.no_show_alerted = doc.no_show_alerted.into_iter().collect();
         self.world = recompute_world(self, now_millis);
+    }
+
+    /// Frees every station whose status names a bracket this config doesn't
+    /// know (runs on every overlay path — adopted or re-keyed).
+    fn reset_unknown_bracket_statuses(&mut self, now_millis: UnixMillis) {
+        let stale: Vec<SetupId> = self
+            .board
+            .setups()
+            .iter()
+            .filter_map(|s| {
+                let bracket = match &s.status {
+                    SetupStatus::Called { bracket, .. } | SetupStatus::InProgress { bracket, .. } => Some(bracket),
+                    SetupStatus::OccupiedExternal { set: Some((bracket, _)) } => Some(bracket),
+                    SetupStatus::Free | SetupStatus::OccupiedExternal { set: None } => None,
+                };
+                bracket.filter(|b| self.bracket_ix(b).is_none()).map(|_| s.id)
+            })
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let numbers = stale.iter().map(|s| s.0.to_string()).collect::<Vec<_>>().join(", ");
+        for id in stale {
+            self.board.set_status(id, SetupStatus::Free);
+        }
+        let text = format!("freed setup(s) {numbers}: their persisted sets belong to a bracket outside this config");
+        self.notice(now_millis, NoticeLevel::Warn, text);
     }
 
     /// Snapshots the last-good per-event set tables for the snapshot file
@@ -2096,7 +2155,7 @@ mod tests {
     };
     use crate::{
         config::{BracketConfig, BracketMode, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
-        conflict::{BlockReason, PoolOverride, SetupStatus},
+        conflict::{BlockReason, PoolOverride, SetupBoard, SetupStatus},
         fixture_source::FixtureSource,
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
         set_source::SetSource,
@@ -2695,7 +2754,7 @@ mod tests {
         let doc = state.to_overlay();
         let mut restored = se4_app(true);
         assert_eq!(restored.board.setups()[0].status, SetupStatus::Free);
-        restored.apply_overlay(doc, NOW);
+        restored.apply_overlay(doc, NOW, true);
 
         match restored.board.setups().iter().find(|s| s.id == SetupId(1)).unwrap().status.clone() {
             SetupStatus::Called { set, .. } => assert_eq!(set, called),
@@ -2708,6 +2767,77 @@ mod tests {
         assert_eq!(restored.pending_writes[0].status, PendingStatus::Parked);
         // The re-ranked world matches: the called set is out of the queue.
         assert!(restored.world.queue.iter().all(|e| e.key != called));
+    }
+
+    #[test]
+    fn overlay_adoption_restores_a_runtime_grown_roster() {
+        let mut state = se4_app(true);
+        state.board.add_setup(SetupId(3), "pokemon".to_owned());
+        let doc = state.to_overlay();
+
+        let mut restored = se4_app(true);
+        assert_eq!(restored.board.setups().len(), 2);
+        restored.apply_overlay(doc, NOW, true);
+        assert_eq!(restored.board.setups().len(), 3, "the runtime-added station survives a restart");
+        assert_eq!(restored.board.setups()[2].setup_type, "pokemon");
+        // Nothing in the config references "pokemon" — flagged, not dropped.
+        assert!(restored.notices.iter().any(|n| n.text.contains("no bracket references")));
+    }
+
+    #[test]
+    fn overlay_roster_is_ignored_when_counts_are_pinned() {
+        let mut state = se4_app(true);
+        call_top_candidate(&mut state, '1');
+        state.board.add_setup(SetupId(3), "default".to_owned());
+        let doc = state.to_overlay();
+
+        let mut restored = se4_app(true);
+        restored.apply_overlay(doc, NOW, false);
+        assert_eq!(restored.board.setups().len(), 2, "--setups pinned the roster");
+        assert!(
+            matches!(restored.board.setups()[0].status, SetupStatus::Called { .. }),
+            "statuses still re-key by id"
+        );
+        assert!(restored.notices.iter().any(|n| n.text.contains("dropped persisted state for setup 3")));
+    }
+
+    #[test]
+    fn pre_migration_overlay_rekeys_statuses_onto_the_config_roster() {
+        let mut state = se4_app(true);
+        call_top_candidate(&mut state, '1');
+        let mut doc = state.to_overlay();
+        // Simulate an overlay written before setup types existed: same
+        // statuses, untyped stations (serde-defaulted to "").
+        let mut old_board = SetupBoard::from_roster(&[(SetupId(1), String::new()), (SetupId(2), String::new())]);
+        for setup in doc.board.setups() {
+            old_board.set_status(setup.id, setup.status.clone());
+        }
+        doc.board = old_board;
+
+        let mut restored = se4_app(true);
+        restored.apply_overlay(doc, NOW, true);
+        let restored_setup = &restored.board.setups()[0];
+        assert_eq!(restored_setup.setup_type, DEFAULT_SETUP_TYPE, "config roster kept, not the untyped one");
+        assert!(matches!(restored_setup.status, SetupStatus::Called { .. }), "status re-keyed by id");
+    }
+
+    #[test]
+    fn overlay_statuses_naming_an_unknown_bracket_reset_to_free() {
+        let mut state = se4_app(true);
+        // A status from another tournament's session (the shared XDG file).
+        state.board.set_status(
+            SetupId(2),
+            SetupStatus::InProgress {
+                bracket: BracketId("tournament/last-week/event/melee".to_owned()),
+                set: state.brackets[0].state.sets[0].key.clone(),
+            },
+        );
+        let doc = state.to_overlay();
+
+        let mut restored = se4_app(true);
+        restored.apply_overlay(doc, NOW, true);
+        assert_eq!(restored.board.setups()[1].status, SetupStatus::Free, "foreign set freed");
+        assert!(restored.notices.iter().any(|n| n.text.contains("outside this config")));
     }
 
     #[test]
@@ -2882,7 +3012,7 @@ mod tests {
         let config = test_config(&[1, 2], &["ultimate", "melee"]);
         let boots = bootstrap(vec![("ultimate", &ultimate), ("melee", &melee)]);
         let mut restored = AppState::new(config, false, boots, NOW);
-        restored.apply_overlay(doc, NOW);
+        restored.apply_overlay(doc, NOW, true);
         assert_eq!(
             restored.pool_overrides.get(&SetupId(2)),
             Some(&PoolOverride::Dedicated(BracketId("melee".to_owned())))
@@ -3116,7 +3246,7 @@ mod tests {
 
         // Sticky memory survives the overlay round trip.
         let mut restored = se4_app(true);
-        restored.apply_overlay(state.to_overlay(), NOW);
+        restored.apply_overlay(state.to_overlay(), NOW, true);
         assert_eq!(restored.last_characters.get(&left_key), Some(&2));
     }
 }

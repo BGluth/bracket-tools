@@ -398,6 +398,27 @@ mod tests {
     }
 
     #[test]
+    fn pre_migration_overlay_without_setup_types_still_loads() {
+        // An overlay written before stations carried types: the field is
+        // absent from the JSON entirely. serde-defaults it to "" (the
+        // pre-migration marker apply_overlay branches on) — no version bump.
+        let path = scratch("premigration.json");
+        let mut json = serde_json::to_value(sample_doc()).unwrap();
+        for setup in json["board"]["setups"].as_array_mut().unwrap() {
+            let removed = setup.as_object_mut().unwrap().remove("setup_type");
+            assert!(removed.is_some(), "the field exists to strip");
+        }
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        let Load::Loaded(loaded) = load_overlay(&path).unwrap() else {
+            panic!("expected the old-shape overlay to load");
+        };
+        assert!(loaded.board.setups().iter().all(|s| s.setup_type.is_empty()));
+        assert_eq!(loaded.called_ints, vec![6], "the rest of the doc survives");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn setup_defaults_round_trip_and_best_effort_load() {
         let path = scratch("setup-defaults.toml");
         let _ = std::fs::remove_file(&path);

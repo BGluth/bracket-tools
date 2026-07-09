@@ -248,7 +248,9 @@ where
     let seeded = seed_from_snapshot(&mut bootstraps, &snapshot_path);
     let events: Vec<BracketId> = bootstraps.iter().map(|b| b.id.clone()).collect();
     let mut state = AppState::new(config.clone(), writes_armed, bootstraps, now_millis());
-    restore_overlay(&mut state, &state_path);
+    // --setups pins the roster for this run; otherwise the persisted board
+    // (crash recovery / cross-session carryover) wins.
+    restore_overlay(&mut state, &state_path, cli.setups.is_none());
     mark_seeded_stale(&mut state, &seeded);
 
     let (tx, rx) = unbounded_channel::<Msg>();
@@ -336,11 +338,11 @@ fn mark_seeded_stale(state: &mut AppState, seeded: &[(BracketId, UnixMillis)]) {
 /// Rehydrates a persisted overlay (if any) over the freshly-bootstrapped
 /// state. Corruption recovers to `.bak`; only an unreadable file (permissions)
 /// leaves the badge up. Never fails startup.
-fn restore_overlay(state: &mut AppState, path: &Path) {
+fn restore_overlay(state: &mut AppState, path: &Path, adopt_roster: bool) {
     let now = now_millis();
     match load_overlay(path) {
         Ok(Load::Loaded(doc)) => {
-            state.apply_overlay(*doc, now);
+            state.apply_overlay(*doc, now, adopt_roster);
             state.notice(now, NoticeLevel::Info, format!("restored session state from {}", path.display()));
         }
         Ok(Load::Recovered(backup)) => {
