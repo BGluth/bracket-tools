@@ -10,7 +10,7 @@ use std::{env, path::PathBuf, time::Duration};
 
 use bracket_tools_scheduler::{
     app::{update, AppState, Msg, PollFailure},
-    config::{BracketConfig, SchedulerConfig, SetupId},
+    config::{BracketConfig, SchedulerConfig, SetupCounts},
     fixture_source::{classify_fixture_error, FixtureSource},
     model::BracketId,
     poller::{poll_cycle, PollerConfig},
@@ -46,16 +46,9 @@ fn captures_dir() -> Option<PathBuf> {
 }
 
 fn fbr_config() -> SchedulerConfig {
-    let setups: Vec<SetupId> = (1..=8).map(SetupId).collect();
     SchedulerConfig {
-        setups: setups.clone(),
-        brackets: FBR_EVENTS
-            .iter()
-            .map(|slug| BracketConfig {
-                pool: setups.clone(),
-                ..BracketConfig::new(*slug)
-            })
-            .collect(),
+        setups: Some(SetupCounts::Uniform(8)),
+        brackets: FBR_EVENTS.iter().map(|slug| BracketConfig::new(*slug)).collect(),
         tournament_slug: Some("tournament/french-bread-rumble-100".to_owned()),
         known_called_state_int: Some(6),
         known_in_progress_state_int: Some(2),

@@ -1,17 +1,17 @@
-# French Bread Rumble 100 — example scheduler config (S3 review artifact).
+# French Bread Rumble 100 — example scheduler config.
 #
 #   cargo run -p bracket-tools-scheduler --bin scheduler -- --config tools/scheduler/examples/fbr-100.toml
 #
 # SAFE BY DEFAULT: advisor_only pins the session to read-only regardless of
 # token permissions — flip it (or pass no --advisor-only) on Friday once the
-# real setup pool below is corrected. The setup pool here is synthetic
-# (8 stations, Pokemon pinned to 7-8); the real bracket→setup sharing map is
-# still an open question for the TO desk.
+# setup counts below match the venue. Counts are per setup *type*: smash
+# events share the switch pool and may borrow the pokemon stations; the
+# pokemon event stays on its own hardware. Adjust counts live in the TUI
+# ('s' adds/retires stations) or at launch with --setups.
 
 tournament_slug = "tournament/french-bread-rumble-100"
 advisor_only = true
 
-setups = [1, 2, 3, 4, 5, 6, 7, 8]
 poll_interval_secs = 30
 no_show_secs = 300
 rest_window_secs = 300
@@ -30,39 +30,45 @@ known_in_progress_state_int = 2
 # preflight identity-split report.
 # player_aliases = [["1234567", "7654321"]]
 
+# Stations per setup type. Optional — omit the table and the previous
+# session's roster (or --setups) takes over.
+[setups]
+switch = 6
+pokemon = 2
+
 [[brackets]]
 slug = "tournament/french-bread-rumble-100/event/ultimate-singles"
 expected_kind = "elimination"
-pool = [1, 2, 3, 4, 5, 6, 7, 8]
+setup_type = ["switch", "pokemon"]
 
 [[brackets]]
 slug = "tournament/french-bread-rumble-100/event/melee-singles"
 expected_kind = "elimination"
 duration_prior_secs = 600
-pool = [1, 2, 3, 4, 5, 6, 7, 8]
+setup_type = ["switch", "pokemon"]
 
 [[brackets]]
 slug = "tournament/french-bread-rumble-100/event/brawl-singles"
 expected_kind = "elimination"
-pool = [1, 2, 3, 4, 5, 6, 7, 8]
+setup_type = ["switch", "pokemon"]
 
 [[brackets]]
 slug = "tournament/french-bread-rumble-100/event/rivals-2-singles"
 expected_kind = "elimination"
-pool = [1, 2, 3, 4, 5, 6, 7, 8]
+setup_type = ["switch", "pokemon"]
 
 [[brackets]]
 slug = "tournament/french-bread-rumble-100/event/mugen-singles"
 expected_kind = "elimination"
-pool = [1, 2, 3, 4, 5, 6, 7, 8]
+setup_type = ["switch", "pokemon"]
 
 [[brackets]]
 slug = "tournament/french-bread-rumble-100/event/special-smash"
 expected_kind = "elimination"
-pool = [1, 2, 3, 4, 5, 6, 7, 8]
+setup_type = ["switch", "pokemon"]
 
 [[brackets]]
 slug = "tournament/french-bread-rumble-100/event/pokemon-champions-4v4-double-battle"
 expected_kind = "swiss"
 duration_prior_secs = 600
-pool = [7, 8]
+setup_type = "pokemon"

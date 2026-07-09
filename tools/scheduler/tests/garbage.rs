@@ -4,7 +4,7 @@
 
 use bracket_tools_scheduler::{
     app::{update, AppState, BracketBootstrap, Msg, PollOutcome, PollResult},
-    config::{BracketConfig, BracketMode, SchedulerConfig, SetupId},
+    config::{BracketConfig, BracketMode, SchedulerConfig, SetupCounts},
     model::{live_sets_from_schema, BracketId, LiveSet, Prereq, SetId, Slot},
     synth::{make_de_bracket, SynthBracket},
     ui,
@@ -56,11 +56,8 @@ fn schema_set(id: &str, round: Option<i32>, identifier: Option<&str>, pg: Option
 
 fn app_with(sets: Vec<LiveSet>, bracket: &SynthBracket) -> AppState {
     let config = SchedulerConfig {
-        setups: vec![SetupId(1), SetupId(2)],
-        brackets: vec![BracketConfig {
-            pool: vec![SetupId(1), SetupId(2)],
-            ..BracketConfig::new("garbage")
-        }],
+        setups: Some(SetupCounts::Uniform(2)),
+        brackets: vec![BracketConfig::new("garbage")],
         ..SchedulerConfig::default()
     };
     let boots = vec![BracketBootstrap {
@@ -69,7 +66,7 @@ fn app_with(sets: Vec<LiveSet>, bracket: &SynthBracket) -> AppState {
         groups: vec![bracket.info.clone()],
         mode: BracketMode::Full,
         start_at: None,
-        pool: vec![SetupId(1), SetupId(2)],
+        setup_types: vec!["default".to_owned()],
         duration_prior_secs: 480,
         prior_weight: 4.0,
         characters: Vec::new(),

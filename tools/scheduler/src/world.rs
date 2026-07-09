@@ -38,7 +38,9 @@ pub struct BracketState {
     /// structure query's start time).
     pub start_at: Option<i64>,
     pub held: bool,
-    pub pool: Vec<SetupId>,
+    /// The setup types this bracket may be called on; resolved against the
+    /// live board roster at recompute time.
+    pub setup_types: Vec<String>,
 }
 
 /// Everything a recompute reads. All references point into app-owned state;
@@ -59,8 +61,6 @@ pub struct WorldInputs<'a> {
     /// Per-setup reassignments (the `a` action); folded into every bracket's
     /// effective pool here.
     pub pool_overrides: &'a HashMap<SetupId, PoolOverride>,
-    /// Every configured station (override resolution needs the full roster).
-    pub all_setups: &'a [SetupId],
     pub rest_window_secs: u64,
     pub sim: SimConfig,
     pub now_millis: UnixMillis,
@@ -154,7 +154,7 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
     let pools: Vec<Vec<SetupId>> = inputs
         .brackets
         .iter()
-        .map(|bracket| effective_pool(&bracket.id, &bracket.pool, inputs.all_setups, inputs.pool_overrides))
+        .map(|bracket| effective_pool(&bracket.id, &bracket.setup_types, inputs.board.setups(), inputs.pool_overrides))
         .collect();
     let views: Vec<BracketView<'_>> = inputs
         .brackets
@@ -274,11 +274,14 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
 
 /// Setups every one of whose serving full-mode brackets has affirmatively
 /// finished (a bracket with no sets yet — unstarted or unfetched — is not
-/// "finished", so a pre-start lull never reads as exhaustion).
+/// "finished", so a pre-start lull never reads as exhaustion). A station
+/// serving no bracket at all is plain free, not exhausted.
 fn exhausted_setups(inputs: &WorldInputs<'_>, pools: &[Vec<SetupId>]) -> Vec<SetupId> {
     inputs
-        .all_setups
+        .board
+        .setups()
         .iter()
+        .map(|s| s.id)
         .filter(|setup| {
             let serving: Vec<_> = inputs
                 .brackets
@@ -291,7 +294,6 @@ fn exhausted_setups(inputs: &WorldInputs<'_>, pools: &[Vec<SetupId>]) -> Vec<Set
                     .iter()
                     .all(|(bracket, _)| !bracket.sets.is_empty() && bracket.sets.iter().all(LiveSet::is_completed))
         })
-        .copied()
         .collect()
 }
 
@@ -310,7 +312,6 @@ pub struct SimSnapshot {
     pub snoozes: HashMap<(BracketId, SetKey), UnixMillis>,
     pub callable_since: HashMap<SetKey, UnixMillis>,
     pub pool_overrides: HashMap<SetupId, PoolOverride>,
-    pub all_setups: Vec<SetupId>,
     pub rest_window_secs: u64,
     pub sim: SimConfig,
     pub now_millis: UnixMillis,
@@ -361,7 +362,7 @@ pub fn rollout_rankings(s: &SimSnapshot, top_k: usize) -> RolloutRankings {
     let pools: Vec<Vec<SetupId>> = s
         .brackets
         .iter()
-        .map(|bracket| effective_pool(&bracket.id, &bracket.pool, &s.all_setups, &s.pool_overrides))
+        .map(|bracket| effective_pool(&bracket.id, &bracket.setup_types, s.board.setups(), &s.pool_overrides))
         .collect();
     let views: Vec<BracketView<'_>> = s
         .brackets
@@ -528,7 +529,7 @@ mod tests {
 
     use super::{recompute, BracketState, World, WorldInputs};
     use crate::{
-        config::{BracketMode, SetupId, SimConfig},
+        config::{BracketMode, SetupId, SimConfig, DEFAULT_SETUP_TYPE},
         conflict::{AliasMap, BlockReason, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones},
         duration::DurationModel,
         model::{BracketId, LiveSet},
@@ -554,7 +555,7 @@ mod tests {
                     mode: BracketMode::Full,
                     start_at: None,
                     held: false,
-                    pool: setups.clone(),
+                    setup_types: vec![DEFAULT_SETUP_TYPE.to_owned()],
                 })
                 .collect();
             Self {
@@ -572,7 +573,6 @@ mod tests {
             let flags = PlayerFlags::default();
             let tombstones = Tombstones::default();
             let (last_completed, snoozes, callable_since) = (HashMap::new(), HashMap::new(), HashMap::new());
-            let all_setups: Vec<SetupId> = self.board.setups().iter().map(|s| s.id).collect();
             let bracket_refs: Vec<&BracketState> = self.brackets.iter().collect();
             let inputs = WorldInputs {
                 brackets: &bracket_refs,
@@ -586,7 +586,6 @@ mod tests {
                 snoozes: &snoozes,
                 callable_since: &callable_since,
                 pool_overrides,
-                all_setups: &all_setups,
                 rest_window_secs: 0,
                 sim: SimConfig::default(),
                 now_millis: NOW,
@@ -617,7 +616,6 @@ mod tests {
             snoozes: HashMap::new(),
             callable_since: HashMap::new(),
             pool_overrides: HashMap::new(),
-            all_setups: vec![SetupId(1), SetupId(2)],
             rest_window_secs: 0,
             sim: SimConfig::default(),
             now_millis: NOW,

@@ -17,7 +17,7 @@ use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
     app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
     cli::{build_live_source, default_data_dir, resolve_token, Cli},
-    config::write_starter_template,
+    config::{resolve_roster, write_starter_template},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
     model::BracketId,
@@ -134,7 +134,7 @@ fn derive_offline_config(source: &FixtureSource) -> SchedulerConfig {
     println!(
         "derived config: {} event(s), {} shared setups, writes fixture-armed",
         config.brackets.len(),
-        config.setups.len(),
+        resolve_roster(&config).roster.len(),
     );
     if !skipped.is_empty() {
         println!("  skipped (a different tournament than the largest): {}", skipped.join(", "));
@@ -567,7 +567,7 @@ fn now_millis() -> UnixMillis {
 mod tests {
     use std::{env, fs, path::PathBuf, process};
 
-    use bracket_tools_scheduler::fixture_source::FixtureSource;
+    use bracket_tools_scheduler::{config::SetupCounts, fixture_source::FixtureSource};
     use clap::Parser;
 
     use crate::{offline_config, Cli};
@@ -586,7 +586,7 @@ mod tests {
 
     fn write_config(name: &str, slug: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("scheduler-main-test-{}-{name}.toml", process::id()));
-        fs::write(&path, format!("setups = [1, 2]\n\n[[brackets]]\nslug = {slug:?}\npool = [1, 2]\n")).unwrap();
+        fs::write(&path, format!("setups = 2\n\n[[brackets]]\nslug = {slug:?}\n")).unwrap();
         path
     }
 
@@ -610,7 +610,11 @@ mod tests {
     fn discovered_config_naming_a_world_event_is_honored() {
         let path = write_config("matching", WORLD_SLUG);
         let config = offline_config(&synth_cli(&[]), &path, &synth_source()).unwrap();
-        assert_eq!(config.setups.len(), 2, "the discovered config itself must be used, not a derived one");
+        assert_eq!(
+            config.setups,
+            Some(SetupCounts::Uniform(2)),
+            "the discovered config itself must be used, not a derived one"
+        );
     }
 
     #[test]

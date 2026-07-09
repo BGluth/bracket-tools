@@ -88,12 +88,13 @@ pub async fn generate_replay(source: &FixtureSource, config: &SchedulerConfig, n
         })
         .collect();
     let (outcome, events) = simulate_autoplay(&world, &durations);
+    let setups = world.board.setups().iter().map(|s| s.id).collect();
     Ok(Replay {
         started_at: now_millis,
         outcome,
         events,
         brackets,
-        setups: config.setups.clone(),
+        setups,
     })
 }
 

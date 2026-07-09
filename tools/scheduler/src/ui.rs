@@ -840,7 +840,7 @@ mod tests {
     use super::draw;
     use crate::{
         app::{update, AppState, BracketBootstrap, Msg},
-        config::{BracketConfig, BracketMode, SchedulerConfig, SetupId},
+        config::{BracketConfig, BracketMode, SchedulerConfig, SetupCounts, DEFAULT_SETUP_TYPE},
         model::BracketId,
         synth::{make_se_bracket, materialize_ids},
     };
@@ -852,11 +852,8 @@ mod tests {
         bracket.sets = materialize_ids(&bracket.sets, 9000);
         let slug = "tournament/fbr/event/ultimate-singles";
         let config = SchedulerConfig {
-            setups: vec![SetupId(1), SetupId(2)],
-            brackets: vec![BracketConfig {
-                pool: vec![SetupId(1), SetupId(2)],
-                ..BracketConfig::new(slug)
-            }],
+            setups: Some(SetupCounts::Uniform(2)),
+            brackets: vec![BracketConfig::new(slug)],
             ..SchedulerConfig::default()
         };
         let boots = vec![BracketBootstrap {
@@ -865,7 +862,7 @@ mod tests {
             groups: vec![bracket.info.clone()],
             mode: BracketMode::Full,
             start_at: None,
-            pool: vec![SetupId(1), SetupId(2)],
+            setup_types: vec![DEFAULT_SETUP_TYPE.to_owned()],
             duration_prior_secs: 480,
             prior_weight: 4.0,
             characters: Vec::new(),

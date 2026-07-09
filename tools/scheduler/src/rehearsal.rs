@@ -20,7 +20,7 @@ use bracket_tools_startgg_schema::get_sets_for_event;
 use thiserror::Error;
 
 use crate::{
-    config::SchedulerConfig,
+    config::{pool_for_types, resolve_roster, SchedulerConfig},
     conflict::{AliasMap, PlayerFlags, SetupBoard, Tombstones, UnixMillis},
     duration::DurationModel,
     fixture_source::{schema_set_from_live, FixtureError, FixtureSource},
@@ -149,6 +149,7 @@ pub(crate) async fn load_world(
     let mut initial = Vec::new();
     let mut brackets = Vec::new();
     let mut drop_ins = DROP_IN_ID_BASE;
+    let roster = resolve_roster(config).roster;
     for (ix, bracket) in config.brackets.iter().enumerate() {
         let missing = |source| RehearsalError::MissingEvent {
             slug: bracket.slug.clone(),
@@ -171,14 +172,14 @@ pub(crate) async fn load_world(
             // from the served structures by set_timeline.
             start_at: None,
             held: false,
-            pool: bracket.pool.clone(),
+            pool: pool_for_types(&bracket.setup_types(), &roster),
         });
         initial.push((bracket.slug.clone(), live));
     }
 
     let world = SimWorld {
         brackets,
-        board: SetupBoard::new(&config.setups),
+        board: SetupBoard::from_roster(&roster),
         flags: PlayerFlags::default(),
         tombstones: Tombstones::default(),
         called_ints: config.known_called_state_int.into_iter().collect(),
@@ -313,7 +314,7 @@ mod tests {
 
     use super::{install_rehearsal, RehearsalError};
     use crate::{
-        config::{BracketConfig, SchedulerConfig, SetupId},
+        config::{BracketConfig, SchedulerConfig, SetupCounts},
         fixture_source::FixtureSource,
         model::live_sets_from_schema,
         set_source::SetSource,
@@ -323,7 +324,7 @@ mod tests {
     const NOW: i64 = 1_751_000_000_000;
     const SLUG: &str = "tournament/synth/event/melee-singles";
 
-    fn bracket_config(slug: &str, pool: &[SetupId]) -> BracketConfig {
+    fn bracket_config(slug: &str) -> BracketConfig {
         BracketConfig {
             slug: slug.to_owned(),
             expected_kind: None,
@@ -331,21 +332,20 @@ mod tests {
             start_at_override: None,
             duration_prior_secs: 480,
             prior_weight: 3.0,
-            pool: pool.to_vec(),
+            setup_type: None,
         }
     }
 
     fn synth_setup(slugs: &[&str]) -> (FixtureSource, SchedulerConfig) {
-        let setups = [SetupId(1), SetupId(2)];
         let mut source = FixtureSource::new();
         let mut config = SchedulerConfig {
-            setups: setups.to_vec(),
+            setups: Some(SetupCounts::Uniform(2)),
             ..Default::default()
         };
         for (ix, slug) in slugs.iter().enumerate() {
             let bracket = make_de_bracket(1001 + ix as u64 * 1000, 4);
             source.add_synth_event(slug, from_ref(&bracket.info), vec![bracket.sets]);
-            config.brackets.push(bracket_config(slug, &setups));
+            config.brackets.push(bracket_config(slug));
         }
         (source, config)
     }
@@ -406,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn config_slug_missing_from_captures_is_an_error() {
         let (mut source, mut config) = synth_setup(&[SLUG]);
-        config.brackets.push(bracket_config("tournament/other/event/x", &[SetupId(1)]));
+        config.brackets.push(bracket_config("tournament/other/event/x"));
         let err = install_rehearsal(&mut source, &config, 8.0, NOW).await.unwrap_err();
         assert!(matches!(err, RehearsalError::MissingEvent { .. }), "{err:?}");
     }

@@ -6,12 +6,12 @@
 //! id elsewhere). All local wall-clock inputs are unix millis; server
 //! timestamps (unix seconds) are converted at the comparison boundary.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{BracketMode, SetupId},
+    config::{BracketMode, SetupId, DEFAULT_SETUP_TYPE},
     graph::BracketGraph,
     model::{BracketId, EntrantId, LiveSet, PlayerId, SetId, SetKey, SlotOccupant},
 };
@@ -124,6 +124,10 @@ pub enum SetupStatus {
 pub struct Setup {
     pub id: SetupId,
     pub status: SetupStatus,
+    /// The hardware class this station belongs to; brackets pool by type.
+    /// Empty only in pre-migration persisted overlays (detected on load).
+    #[serde(default)]
+    pub setup_type: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,12 +137,17 @@ pub struct SetupBoard {
 
 impl SetupBoard {
     pub fn new(ids: &[SetupId]) -> Self {
+        Self::from_roster(&ids.iter().map(|&id| (id, DEFAULT_SETUP_TYPE.to_owned())).collect::<Vec<_>>())
+    }
+
+    pub fn from_roster(roster: &[(SetupId, String)]) -> Self {
         Self {
-            setups: ids
+            setups: roster
                 .iter()
-                .map(|&id| Setup {
-                    id,
+                .map(|(id, setup_type)| Setup {
+                    id: *id,
                     status: SetupStatus::Free,
+                    setup_type: setup_type.clone(),
                 })
                 .collect(),
         }
@@ -148,6 +157,37 @@ impl SetupBoard {
         if let Some(setup) = self.setups.iter_mut().find(|s| s.id == id) {
             setup.status = status;
         }
+    }
+
+    /// Adds a free station, keeping the board in id order (the strip renders
+    /// board order; placards are numeric).
+    pub fn add_setup(&mut self, id: SetupId, setup_type: String) {
+        let setup = Setup {
+            id,
+            status: SetupStatus::Free,
+            setup_type,
+        };
+        let at = self.setups.partition_point(|s| s.id < id);
+        self.setups.insert(at, setup);
+    }
+
+    pub fn remove_setup(&mut self, id: SetupId) {
+        self.setups.retain(|s| s.id != id);
+    }
+
+    /// The smallest positive station number not on the board — a retired
+    /// number is reused (physical placard reuse).
+    pub fn lowest_unused_id(&self) -> SetupId {
+        let taken: HashSet<u32> = self.setups.iter().map(|s| s.id.0).collect();
+        SetupId((1..).find(|n| !taken.contains(n)).expect("u32 range never exhausts"))
+    }
+
+    pub fn counts_by_type(&self) -> BTreeMap<String, u32> {
+        let mut counts = BTreeMap::new();
+        for setup in &self.setups {
+            *counts.entry(setup.setup_type.clone()).or_insert(0) += 1;
+        }
+        counts
     }
 
     pub fn setups(&self) -> &[Setup] {
@@ -169,23 +209,28 @@ pub enum PoolOverride {
     AllowAny,
 }
 
-/// One bracket's effective pool: config-pool setups that aren't overridden
-/// away, plus setups dedicated to this bracket or opened to all.
+/// One bracket's effective pool: the roster's matching-type stations that
+/// aren't overridden away, plus stations dedicated to this bracket or opened
+/// to all.
 pub fn effective_pool(
     bracket: &BracketId,
-    config_pool: &[SetupId],
-    all_setups: &[SetupId],
+    setup_types: &[String],
+    roster: &[Setup],
     overrides: &HashMap<SetupId, PoolOverride>,
 ) -> Vec<SetupId> {
-    let mut pool: Vec<SetupId> = config_pool.iter().filter(|s| !overrides.contains_key(s)).copied().collect();
-    for setup in all_setups {
-        let extra = match overrides.get(setup) {
+    let mut pool: Vec<SetupId> = roster
+        .iter()
+        .filter(|s| setup_types.contains(&s.setup_type) && !overrides.contains_key(&s.id))
+        .map(|s| s.id)
+        .collect();
+    for setup in roster {
+        let extra = match overrides.get(&setup.id) {
             Some(PoolOverride::Dedicated(b)) => b == bracket,
             Some(PoolOverride::AllowAny) => true,
             None => false,
         };
-        if extra && !pool.contains(setup) {
-            pool.push(*setup);
+        if extra && !pool.contains(&setup.id) {
+            pool.push(setup.id);
         }
     }
     pool.sort();
@@ -587,8 +632,9 @@ mod tests {
     use std::{collections::HashMap, slice::from_ref};
 
     use super::{
-        aggregate_remaining, callable, callable_sets, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView, BusySource,
-        CallableSet, ConflictIndex, ConflictInputs, ConflictKey, PlayerFlags, Setup, SetupBoard, SetupStatus, Tombstones,
+        aggregate_remaining, callable, callable_sets, effective_pool, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView,
+        BusySource, CallableSet, ConflictIndex, ConflictInputs, ConflictKey, PlayerFlags, PoolOverride, Setup, SetupBoard, SetupStatus,
+        Tombstones,
     };
     use crate::{
         config::{BracketMode, SetupId},
@@ -1168,8 +1214,68 @@ mod tests {
             board.setups()[1],
             Setup {
                 id: SetupId(2),
-                status: SetupStatus::OccupiedExternal { set: None }
+                status: SetupStatus::OccupiedExternal { set: None },
+                setup_type: "default".to_owned(),
             }
+        );
+    }
+
+    fn typed_board(roster: &[(u32, &str)]) -> SetupBoard {
+        SetupBoard::from_roster(&roster.iter().map(|(id, t)| (SetupId(*id), (*t).to_owned())).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn board_add_retire_and_number_reuse() {
+        let mut board = typed_board(&[(1, "switch"), (2, "switch"), (3, "pokemon")]);
+        assert_eq!(board.lowest_unused_id(), SetupId(4));
+
+        board.remove_setup(SetupId(2));
+        assert_eq!(board.lowest_unused_id(), SetupId(2), "a retired number is reused");
+        board.add_setup(SetupId(2), "pokemon".to_owned());
+        let ids: Vec<u32> = board.setups().iter().map(|s| s.id.0).collect();
+        assert_eq!(ids, vec![1, 2, 3], "the board stays in id order");
+        assert_eq!(board.setups()[1].setup_type, "pokemon", "the reused number carries its new type");
+
+        let counts = board.counts_by_type();
+        assert_eq!(counts["switch"], 1);
+        assert_eq!(counts["pokemon"], 2);
+    }
+
+    #[test]
+    fn effective_pool_matches_types_and_folds_overrides() {
+        let board = typed_board(&[(1, "switch"), (2, "switch"), (3, "pokemon")]);
+        let melee = BracketId("melee".to_owned());
+        let pokemon = BracketId("pokemon".to_owned());
+        let switch_only = ["switch".to_owned()];
+        let both = ["switch".to_owned(), "pokemon".to_owned()];
+
+        let no_overrides = HashMap::new();
+        assert_eq!(
+            effective_pool(&melee, &switch_only, board.setups(), &no_overrides),
+            vec![SetupId(1), SetupId(2)]
+        );
+        assert_eq!(
+            effective_pool(&melee, &both, board.setups(), &no_overrides),
+            vec![SetupId(1), SetupId(2), SetupId(3)],
+            "a type list unions the pools"
+        );
+
+        // Dedicating a matching-type station to someone else removes it; a
+        // dedication to us adds a station our types would never match.
+        let overrides = HashMap::from([
+            (SetupId(2), PoolOverride::Dedicated(pokemon.clone())),
+            (SetupId(3), PoolOverride::Dedicated(melee.clone())),
+        ]);
+        assert_eq!(
+            effective_pool(&melee, &switch_only, board.setups(), &overrides),
+            vec![SetupId(1), SetupId(3)]
+        );
+
+        let overrides = HashMap::from([(SetupId(3), PoolOverride::AllowAny)]);
+        assert_eq!(
+            effective_pool(&melee, &switch_only, board.setups(), &overrides),
+            vec![SetupId(1), SetupId(2), SetupId(3)],
+            "AllowAny opens a foreign-type station to everyone"
         );
     }
 }

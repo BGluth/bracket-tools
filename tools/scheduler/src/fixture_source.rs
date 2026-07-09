@@ -28,7 +28,7 @@ use cynic::GraphQlResponse;
 use thiserror::Error;
 
 use crate::{
-    config::{BracketConfig, SchedulerConfig, SetupId},
+    config::{BracketConfig, SchedulerConfig, SetupCounts},
     model::{GroupKind, LiveSet, PhaseGroupInfo, Prereq, Slot, PREREQ_TYPE_SEED, PREREQ_TYPE_SET},
     set_source::SetSource,
     synth::{
@@ -342,17 +342,10 @@ impl FixtureSource {
         let (chosen, skipped): (Vec<String>, Vec<String>) =
             slugs.into_iter().partition(|slug| tournament_prefix(slug) == chosen_tournament);
 
-        let setups: Vec<SetupId> = (1..=SIM_SETUP_COUNT).map(SetupId).collect();
-        let brackets = chosen
-            .iter()
-            .map(|slug: &String| BracketConfig {
-                pool: setups.clone(),
-                ..BracketConfig::new(slug.clone())
-            })
-            .collect();
+        let brackets = chosen.iter().map(|slug: &String| BracketConfig::new(slug.clone())).collect();
         let config = SchedulerConfig {
             brackets,
-            setups,
+            setups: Some(SetupCounts::Uniform(SIM_SETUP_COUNT)),
             known_called_state_int: Some(FIXTURE_CALLED_INT),
             known_in_progress_state_int: Some(FIXTURE_IN_PROGRESS_INT),
             ..SchedulerConfig::default()
@@ -762,6 +755,7 @@ mod tests {
         FIXTURE_IN_PROGRESS_INT, SIM_SETUP_COUNT,
     };
     use crate::{
+        config::SetupCounts,
         model::{live_sets_from_schema, phase_groups_from_schema, LiveSet},
         set_source::SetSource,
         synth::{complete, make_de_bracket, make_swiss},
@@ -1018,8 +1012,8 @@ mod tests {
         let slugs: Vec<_> = config.brackets.iter().map(|b| b.slug.as_str()).collect();
         assert_eq!(slugs, vec!["tournament/big/event/melee", "tournament/big/event/ultimate"]);
         assert_eq!(skipped, vec!["tournament/small/event/rivals".to_owned()]);
-        assert_eq!(config.setups.len(), SIM_SETUP_COUNT as usize);
-        assert!(config.brackets.iter().all(|b| b.pool == config.setups));
+        assert_eq!(config.setups, Some(SetupCounts::Uniform(SIM_SETUP_COUNT)));
+        assert!(config.brackets.iter().all(|b| b.setup_types() == vec!["default"]), "one shared pool");
         assert_eq!(config.known_called_state_int, Some(FIXTURE_CALLED_INT));
         assert_eq!(config.known_in_progress_state_int, Some(FIXTURE_IN_PROGRESS_INT));
         assert!(!config.advisor_only, "derived sim sessions arm writes");

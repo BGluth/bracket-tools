@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{BracketMode, SchedulerConfig, SetupId},
+    config::{resolve_roster, BracketMode, SchedulerConfig, SetupId, FALLBACK_SETUPS_PER_TYPE},
     conflict::{
         callable, effective_pool, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView, CallableSet, ConflictIndex,
         ConflictInputs, ConflictKey, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones, UnixMillis,
@@ -410,7 +410,7 @@ pub struct BracketBootstrap {
     pub mode: crate::config::BracketMode,
     /// Effective open time (config override already folded in), unix secs.
     pub start_at: Option<i64>,
-    pub pool: Vec<SetupId>,
+    pub setup_types: Vec<String>,
     pub duration_prior_secs: u64,
     pub prior_weight: f64,
     /// The event's character roster (may be empty).
@@ -532,7 +532,7 @@ impl AppState {
                         mode: b.mode,
                         start_at: b.start_at,
                         held: false,
-                        pool: b.pool,
+                        setup_types: b.setup_types,
                     },
                     characters: b.characters,
                     applied_seq: 0,
@@ -544,8 +544,9 @@ impl AppState {
             })
             .collect();
 
+        let roster = resolve_roster(&config);
         let mut state = Self {
-            board: SetupBoard::new(&config.setups),
+            board: SetupBoard::from_roster(&roster.roster),
             aliases: AliasMap::build(&config.player_aliases),
             called_ints: config.known_called_state_int.into_iter().collect(),
             in_progress_ints: config.known_in_progress_state_int.into_iter().collect(),
@@ -577,6 +578,16 @@ impl AppState {
             undo: None,
             config,
         };
+        if roster.fallback {
+            let text = format!(
+                "no setup counts configured — assuming {FALLBACK_SETUPS_PER_TYPE} per type (fix with --setups or the config)"
+            );
+            state.notice(now_millis, NoticeLevel::Warn, text);
+        }
+        for setup_type in &roster.zero_station_types {
+            let text = format!("setup type {setup_type:?} has no stations — add some with 's'");
+            state.notice(now_millis, NoticeLevel::Warn, text);
+        }
         for ix in 0..state.brackets.len() {
             stamp_ready(&mut state, ix, now_millis);
         }
@@ -630,10 +641,10 @@ impl AppState {
     /// reconciling against the current config (the setup inventory and known
     /// state ints stay config-authoritative) and recomputing the world.
     pub fn apply_overlay(&mut self, doc: OverlayDoc, now_millis: UnixMillis) {
-        let mut board = SetupBoard::new(&self.config.setups);
+        let known_ids: HashSet<SetupId> = self.board.setups().iter().map(|s| s.id).collect();
         for setup in doc.board.setups() {
-            if self.config.setups.contains(&setup.id) {
-                board.set_status(setup.id, setup.status.clone());
+            if known_ids.contains(&setup.id) {
+                self.board.set_status(setup.id, setup.status.clone());
             } else {
                 self.notice(
                     now_millis,
@@ -642,7 +653,6 @@ impl AppState {
                 );
             }
         }
-        self.board = board;
         self.flags = doc.flags;
         self.tombstones = doc.tombstones;
         for (setup, over) in doc.pool_overrides {
@@ -650,7 +660,7 @@ impl AppState {
                 PoolOverride::Dedicated(b) => self.bracket_ix(b).is_some(),
                 PoolOverride::AllowAny => true,
             };
-            if self.config.setups.contains(&setup) && known_bracket {
+            if known_ids.contains(&setup) && known_bracket {
                 self.pool_overrides.insert(setup, over);
             } else {
                 self.notice(
@@ -724,7 +734,6 @@ impl AppState {
             snoozes: self.snoozes.clone(),
             callable_since: self.callable_since.clone(),
             pool_overrides: self.pool_overrides.clone(),
-            all_setups: self.config.setups.clone(),
             rest_window_secs: self.config.rest_window_secs,
             sim: self.config.sim.clone(),
             now_millis,
@@ -1673,7 +1682,7 @@ fn verify_callable(
     let pools: Vec<Vec<SetupId>> = state
         .brackets
         .iter()
-        .map(|b| effective_pool(&b.state.id, &b.state.pool, &state.config.setups, &state.pool_overrides))
+        .map(|b| effective_pool(&b.state.id, &b.state.setup_types, state.board.setups(), &state.pool_overrides))
         .collect();
     let views: Vec<BracketView<'_>> = state
         .brackets
@@ -2054,7 +2063,6 @@ fn recompute_world(state: &AppState, now: UnixMillis) -> World {
         snoozes: &state.snoozes,
         callable_since: &state.callable_since,
         pool_overrides: &state.pool_overrides,
-        all_setups: &state.config.setups,
         rest_window_secs: state.config.rest_window_secs,
         sim: state.config.sim.clone(),
         now_millis: now,
@@ -2087,7 +2095,7 @@ mod tests {
         WriteKind, WriteOutcome, WriteResult,
     };
     use crate::{
-        config::{BracketConfig, BracketMode, SchedulerConfig, SetupId},
+        config::{BracketConfig, BracketMode, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
         conflict::{BlockReason, PoolOverride, SetupStatus},
         fixture_source::FixtureSource,
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
@@ -2103,21 +2111,15 @@ mod tests {
 
     fn test_config(setups: &[u32], brackets: &[&str]) -> SchedulerConfig {
         SchedulerConfig {
-            setups: setups.iter().map(|&n| SetupId(n)).collect(),
-            brackets: brackets
-                .iter()
-                .map(|slug| BracketConfig {
-                    pool: setups.iter().map(|&n| SetupId(n)).collect(),
-                    ..BracketConfig::new(*slug)
-                })
-                .collect(),
+            setups: Some(SetupCounts::Uniform(setups.len() as u32)),
+            brackets: brackets.iter().map(|slug| BracketConfig::new(*slug)).collect(),
             known_called_state_int: Some(6),
             known_in_progress_state_int: Some(2),
             ..SchedulerConfig::default()
         }
     }
 
-    fn bootstrap(config: &SchedulerConfig, brackets: Vec<(&str, &SynthBracket)>) -> Vec<BracketBootstrap> {
+    fn bootstrap(brackets: Vec<(&str, &SynthBracket)>) -> Vec<BracketBootstrap> {
         brackets
             .into_iter()
             .map(|(slug, bracket)| BracketBootstrap {
@@ -2126,7 +2128,7 @@ mod tests {
                 groups: vec![bracket.info.clone()],
                 mode: BracketMode::Full,
                 start_at: None,
-                pool: config.setups.clone(),
+                setup_types: vec![DEFAULT_SETUP_TYPE.to_owned()],
                 duration_prior_secs: 480,
                 prior_weight: 4.0,
                 characters: Vec::new(),
@@ -2143,7 +2145,7 @@ mod tests {
 
     fn se4_app(writes_armed: bool) -> AppState {
         let config = test_config(&[1, 2], &["ultimate"]);
-        let boots = bootstrap(&config, vec![("ultimate", &se4())]);
+        let boots = bootstrap(vec![("ultimate", &se4())]);
         AppState::new(config, writes_armed, boots, NOW)
     }
 
@@ -2251,7 +2253,7 @@ mod tests {
         let ultimate = make_de_bracket_with(1001, &players);
         let melee = make_de_bracket_with(2001, &players);
         let config = test_config(&[1, 2, 3], &["ultimate", "melee"]);
-        let boots = bootstrap(&config, vec![("ultimate", &ultimate), ("melee", &melee)]);
+        let boots = bootstrap(vec![("ultimate", &ultimate), ("melee", &melee)]);
         let mut state = AppState::new(config, false, boots, NOW);
 
         let effects = call_top_candidate(&mut state, '1');
@@ -2298,7 +2300,7 @@ mod tests {
         let mut config = test_config(&[1, 2], &["ultimate", "melee"]);
         // P1 (ultimate) and M1 (melee) are the same human.
         config.player_aliases = vec![vec![PlayerId("P1".to_owned()), PlayerId("M1".to_owned())]];
-        let boots = bootstrap(&config, vec![("ultimate", &ultimate), ("melee", &melee)]);
+        let boots = bootstrap(vec![("ultimate", &ultimate), ("melee", &melee)]);
         let mut state = AppState::new(config, false, boots, NOW);
 
         // Find and call P1's ultimate set via the picker.
@@ -2396,7 +2398,7 @@ mod tests {
     fn preview_ids_never_enqueue_writes() {
         let config = test_config(&[1], &["ultimate"]);
         let preview = make_se_bracket(1001, 4); // preview_* ids
-        let boots = bootstrap(&config, vec![("ultimate", &preview)]);
+        let boots = bootstrap(vec![("ultimate", &preview)]);
         let mut state = AppState::new(config, true, boots, NOW);
 
         let effects = call_top_candidate(&mut state, '1');
@@ -2579,7 +2581,7 @@ mod tests {
             groups: vec![bracket.info.clone()],
             mode: BracketMode::Full,
             start_at: None,
-            pool: vec![SetupId(1), SetupId(2)],
+            setup_types: vec![DEFAULT_SETUP_TYPE.to_owned()],
             duration_prior_secs: 480,
             prior_weight: 4.0,
             characters: Vec::new(),
@@ -2844,7 +2846,7 @@ mod tests {
         let ultimate = make_de_bracket_with(1001, &players_a);
         let melee = make_de_bracket_with(2001, &players_b);
         let config = test_config(&[1, 2], &["ultimate", "melee"]);
-        let boots = bootstrap(&config, vec![("ultimate", &ultimate), ("melee", &melee)]);
+        let boots = bootstrap(vec![("ultimate", &ultimate), ("melee", &melee)]);
         let mut state = AppState::new(config, false, boots, NOW);
         assert!(state.world.queue.iter().any(|e| e.candidate_setups.contains(&SetupId(2))));
 
@@ -2878,7 +2880,7 @@ mod tests {
         // The override survives an overlay round trip.
         let doc = state.to_overlay();
         let config = test_config(&[1, 2], &["ultimate", "melee"]);
-        let boots = bootstrap(&config, vec![("ultimate", &ultimate), ("melee", &melee)]);
+        let boots = bootstrap(vec![("ultimate", &ultimate), ("melee", &melee)]);
         let mut restored = AppState::new(config, false, boots, NOW);
         restored.apply_overlay(doc, NOW);
         assert_eq!(

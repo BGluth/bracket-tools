@@ -400,7 +400,7 @@ impl PreflightReport {
                     groups,
                     mode,
                     start_at: config.start_at_override.or(event_start_at),
-                    pool: config.pool.clone(),
+                    setup_types: config.setup_types(),
                     duration_prior_secs: config.duration_prior_secs,
                     prior_weight: config.prior_weight,
                     characters: bracket.characters,
@@ -478,7 +478,7 @@ mod tests {
     use super::{preflight, BracketOutcome};
     use crate::{
         app::PollFailure,
-        config::{BracketConfig, BracketMode, ExpectedKind, SchedulerConfig, SetupId},
+        config::{BracketConfig, BracketMode, ExpectedKind, SchedulerConfig, SetupCounts},
         fixture_source::{FixtureError, FixtureSource},
         synth::{make_de_bracket, make_de_bracket_with, SynthPlayer},
     };
@@ -493,14 +493,8 @@ mod tests {
 
     fn config_for(slugs: &[&str]) -> SchedulerConfig {
         SchedulerConfig {
-            setups: vec![SetupId(1)],
-            brackets: slugs
-                .iter()
-                .map(|slug| BracketConfig {
-                    pool: vec![SetupId(1)],
-                    ..BracketConfig::new(*slug)
-                })
-                .collect(),
+            setups: Some(SetupCounts::Uniform(1)),
+            brackets: slugs.iter().map(|slug| BracketConfig::new(*slug)).collect(),
             ..SchedulerConfig::default()
         }
     }
