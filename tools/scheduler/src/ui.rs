@@ -17,8 +17,8 @@ use ratatui::{
 
 use crate::{
     app::{
-        blocked_entries, filtered_roster, flag_label, picker_rows, reassign_options, report_roster, AppState, Modal, NoticeLevel,
-        PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, Side,
+        blocked_entries, filtered_roster, flag_label, picker_rows, reassign_options, report_roster, setups_rows, AppState, Modal,
+        NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, SetupsRow, Side,
     },
     conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
     model::{BracketId, SetKey},
@@ -52,6 +52,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
         Some(Modal::PendingWrites { selected }) => draw_pending_writes(frame, state, *selected),
         Some(Modal::PlayerFlags { players, selected }) => draw_player_flags(frame, state, players, *selected),
         Some(Modal::Reassign { setup, selected }) => draw_reassign(frame, state, *setup, *selected),
+        Some(Modal::Setups { selected }) => draw_setups(frame, state, *selected),
         Some(Modal::Report(draft)) => draw_report(frame, state, draft),
         Some(Modal::Help) => draw_help(frame),
         None => {}
@@ -59,16 +60,23 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
 }
 
 fn draw_setup_strip(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMillis) {
+    // With more than one hardware class on the board, each station shows its
+    // type's initial (e.g. `7p:free`); a single-type board stays clean.
+    let multi_type = state.board.counts_by_type().len() > 1;
     let mut spans = Vec::new();
     for setup in state.board.setups() {
         let selected = state.ui.selected_setup == Some(setup.id);
         let exhausted = state.world.pool_exhausted.contains(&setup.id);
+        let number = match (multi_type, setup.setup_type.chars().next()) {
+            (true, Some(initial)) => format!("{}{initial}", setup.id.0),
+            _ => setup.id.0.to_string(),
+        };
         let (label, style) = match &setup.status {
             SetupStatus::Free if exhausted => (
-                format!("{}:done→a", setup.id.0),
+                format!("{number}:done→a"),
                 Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
             ),
-            SetupStatus::Free => (format!("{}:free", setup.id.0), Style::new().fg(Color::Green)),
+            SetupStatus::Free => (format!("{number}:free"), Style::new().fg(Color::Green)),
             SetupStatus::Called { bracket, set } => {
                 let age = state
                     .called_at
@@ -84,13 +92,13 @@ fn draw_setup_strip(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: Un
                 } else {
                     Style::new().fg(Color::Yellow)
                 };
-                (format!("{}:called {} {}", setup.id.0, players_for(state, bracket, set), age), style)
+                (format!("{number}:called {} {}", players_for(state, bracket, set), age), style)
             }
             SetupStatus::InProgress { bracket, set } => (
-                format!("{}:playing {}", setup.id.0, players_for(state, bracket, set)),
+                format!("{number}:playing {}", players_for(state, bracket, set)),
                 Style::new().fg(Color::Cyan),
             ),
-            SetupStatus::OccupiedExternal { .. } => (format!("{}:ext", setup.id.0), Style::new().fg(Color::Magenta)),
+            SetupStatus::OccupiedExternal { .. } => (format!("{number}:ext"), Style::new().fg(Color::Magenta)),
         };
         let style = if selected {
             style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -635,6 +643,35 @@ fn draw_reassign(frame: &mut Frame<'_>, state: &AppState, setup: crate::config::
     frame.render_widget(Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)), area);
 }
 
+fn draw_setups(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
+    let area = centered_rect(frame.area(), 50, 60);
+    frame.render_widget(Clear, area);
+
+    let rows = setups_rows(state).into_iter().enumerate().map(|(ix, option)| {
+        let label = match option {
+            SetupsRow::Retire(id, setup_type) => {
+                let status = state
+                    .board
+                    .setups()
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| if s.status == SetupStatus::Free { "free" } else { "occupied" })
+                    .unwrap_or("?");
+                format!("setup {} ({setup_type}) — {status}", id.0)
+            }
+            SetupsRow::Add(setup_type) => format!("+ add a {setup_type} station"),
+        };
+        let row = Row::new([label]);
+        if ix == selected {
+            row.style(SELECTED)
+        } else {
+            row
+        }
+    });
+    let title = "Stations — Enter retires (free only) / adds, Esc closes";
+    frame.render_widget(Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)), area);
+}
+
 fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(ConflictKey, String)], selected: usize) {
     let area = centered_rect(frame.area(), 50, 40);
     frame.render_widget(Clear, area);
@@ -739,6 +776,7 @@ fn draw_help(frame: &mut Frame<'_>) {
         "z         snooze the highlighted queue entry (5m)",
         "d         player flags for the highlighted entry (rest/depart)",
         "a         reassign the selected setup's pool (redeploy)",
+        "s         stations: add/retire setups mid-event",
         "i         inspect blocked sets (why not callable)",
         "n         notices page (Enter acks)",
         "w         pending writes + divergence ledger",

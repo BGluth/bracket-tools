@@ -229,6 +229,11 @@ pub enum Modal {
         setup: SetupId,
         selected: usize,
     },
+    /// Add/retire stations mid-event (`s`). Stays open across edits so a
+    /// batch of arrivals is a few Enters.
+    Setups {
+        selected: usize,
+    },
     /// Game-by-game set reporting for the selected setup's set (`g`).
     Report(Box<ReportDraft>),
     Help,
@@ -366,6 +371,42 @@ pub(crate) fn reassign_options(state: &AppState) -> Vec<ReassignOption> {
     options.push(ReassignOption::AllowAny);
     options.push(ReassignOption::RestoreConfig);
     options
+}
+
+/// One row of the setups modal. Built deterministically so the render and
+/// the commit agree on indexing.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetupsRow {
+    /// An existing station (with its type), retired on Enter when free.
+    Retire(SetupId, String),
+    /// "Add a station" for one type.
+    Add(String),
+}
+
+/// The setups modal's rows: stations grouped by type (board order), each
+/// group closed by its add row. Config-referenced types with no station yet
+/// still get an add row, so a zero-count type can be seeded.
+pub(crate) fn setups_rows(state: &AppState) -> Vec<SetupsRow> {
+    let mut types: Vec<String> = Vec::new();
+    for setup in state.board.setups() {
+        if !types.contains(&setup.setup_type) {
+            types.push(setup.setup_type.clone());
+        }
+    }
+    for referenced in referenced_types(&state.config) {
+        if !types.contains(&referenced) {
+            types.push(referenced);
+        }
+    }
+
+    let mut rows = Vec::new();
+    for setup_type in types {
+        for setup in state.board.setups().iter().filter(|s| s.setup_type == setup_type) {
+            rows.push(SetupsRow::Retire(setup.id, setup_type.clone()));
+        }
+        rows.push(SetupsRow::Add(setup_type));
+    }
+    rows
 }
 
 #[derive(Debug, Clone, Default)]
@@ -901,6 +942,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
         KeyCode::Char('r') => requeue_selected(state, now, effects),
         KeyCode::Char('z') => snooze_selected(state, now),
         KeyCode::Char('u') => undo(state, now),
+        KeyCode::Char('s') => state.ui.modal = Some(Modal::Setups { selected: 0 }),
         KeyCode::Char('i') => state.ui.modal = Some(Modal::Inspection { selected: 0 }),
         KeyCode::Char('n') => state.ui.modal = Some(Modal::Notices { selected: 0 }),
         KeyCode::Char('w') => state.ui.modal = Some(Modal::PendingWrites { selected: 0 }),
@@ -990,6 +1032,13 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
             KeyCode::Enter => apply_reassign(state, setup, selected, now),
             code => match scroll(code, selected, reassign_options(state).len()) {
                 Some(next) => state.ui.modal = Some(Modal::Reassign { setup, selected: next }),
+                None => state.ui.modal = None,
+            },
+        },
+        Some(Modal::Setups { selected }) => match key.code {
+            KeyCode::Enter => apply_setups_row(state, selected, now, effects),
+            code => match scroll(code, selected, setups_rows(state).len()) {
+                Some(next) => state.ui.modal = Some(Modal::Setups { selected: next }),
                 None => state.ui.modal = None,
             },
         },
@@ -1388,6 +1437,57 @@ fn apply_reassign(state: &mut AppState, setup: SetupId, selected: usize, now: Un
     state.ui.modal = None;
     state.dirty = true;
     state.notice(now, NoticeLevel::Info, text);
+}
+
+/// Enter in the setups modal: retire the selected station or add one of the
+/// selected type. The modal stays open (batch edits); the cursor clamps to
+/// the rebuilt row list.
+fn apply_setups_row(state: &mut AppState, selected: usize, now: UnixMillis, effects: &mut UpdateEffects) {
+    match setups_rows(state).get(selected) {
+        Some(SetupsRow::Retire(id, _)) => retire_setup(state, *id, now, effects),
+        Some(SetupsRow::Add(setup_type)) => add_setup_station(state, setup_type.clone(), now, effects),
+        None => return,
+    }
+    let len = setups_rows(state).len();
+    state.ui.modal = Some(Modal::Setups {
+        selected: selected.min(len.saturating_sub(1)),
+    });
+}
+
+fn retire_setup(state: &mut AppState, id: SetupId, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(setup) = state.board.setups().iter().find(|s| s.id == id) else {
+        return;
+    };
+    if setup.status != SetupStatus::Free {
+        state.notice(now, NoticeLevel::Warn, format!("setup {} is occupied — free it first (f/r)", id.0));
+        return;
+    }
+    push_undo(state, format!("retire setup {}", id.0));
+    state.board.remove_setup(id);
+    // A stale Dedicated override must not re-attach when the next arrival
+    // reuses this number.
+    state.pool_overrides.remove(&id);
+    if state.ui.selected_setup == Some(id) {
+        state.ui.selected_setup = None;
+    }
+    state.dirty = true;
+    // Close the stale-rollout window: the next picker must not offer a
+    // station that no longer exists.
+    effects.want_sim(SimUrgency::Immediate);
+    state.notice(now, NoticeLevel::Info, format!("retired setup {}", id.0));
+}
+
+fn add_setup_station(state: &mut AppState, setup_type: String, now: UnixMillis, effects: &mut UpdateEffects) {
+    let id = state.board.lowest_unused_id();
+    push_undo(state, format!("add setup {}", id.0));
+    state.board.add_setup(id, setup_type.clone());
+    if id.0 > 10 {
+        let text = format!("setup {} is beyond digit selection (1-9, 0 = 10) — free/retire a lower number to use it", id.0);
+        state.notice(now, NoticeLevel::Warn, text);
+    }
+    state.dirty = true;
+    effects.want_sim(SimUrgency::Immediate);
+    state.notice(now, NoticeLevel::Info, format!("added setup {} ({setup_type})", id.0));
 }
 
 /// `g` on the main view: report the selected setup's set, game by game.
@@ -2146,15 +2246,17 @@ fn merge_ints(into: &mut Vec<i32>, from: Vec<i32>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use bracket_tools_startgg::SetMutationResult;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus, PollFailure, PollOutcome, PollResult, WriteIntent,
-        WriteKind, WriteOutcome, WriteResult,
+        setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus, PollFailure, PollOutcome, PollResult,
+        SetupsRow, SimUrgency, WriteIntent, WriteKind, WriteOutcome, WriteResult,
     };
     use crate::{
-        config::{BracketConfig, BracketMode, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
+        config::{BracketConfig, BracketMode, OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
         conflict::{BlockReason, PoolOverride, SetupBoard, SetupStatus},
         fixture_source::FixtureSource,
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
@@ -2767,6 +2869,135 @@ mod tests {
         assert_eq!(restored.pending_writes[0].status, PendingStatus::Parked);
         // The re-ranked world matches: the called set is out of the queue.
         assert!(restored.world.queue.iter().all(|e| e.key != called));
+    }
+
+    #[test]
+    fn setups_modal_adds_and_undo_restores() {
+        let mut state = se4_app(false);
+        update(&mut state, key(KeyCode::Char('s')), NOW);
+        assert!(matches!(state.ui.modal, Some(Modal::Setups { selected: 0 })));
+        assert_eq!(
+            setups_rows(&state),
+            vec![
+                SetupsRow::Retire(SetupId(1), "default".to_owned()),
+                SetupsRow::Retire(SetupId(2), "default".to_owned()),
+                SetupsRow::Add("default".to_owned()),
+            ]
+        );
+
+        // Enter on the add row: setup 3 appears, the modal stays open, and
+        // the roster change demands an immediate rollout re-evaluation.
+        update(&mut state, key(KeyCode::Down), NOW);
+        update(&mut state, key(KeyCode::Down), NOW);
+        let effects = update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(effects.sim, Some(SimUrgency::Immediate));
+        assert!(matches!(state.ui.modal, Some(Modal::Setups { .. })), "modal stays open for batch adds");
+        let ids: Vec<u32> = state.board.setups().iter().map(|s| s.id.0).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert!(state.world.per_setup.contains_key(&SetupId(3)), "the new station ranks immediately");
+
+        // Esc + u: the whole roster edit rolls back.
+        update(&mut state, key(KeyCode::Esc), NOW);
+        update(&mut state, key(KeyCode::Char('u')), NOW);
+        assert_eq!(state.board.setups().len(), 2, "undo restores the roster");
+    }
+
+    #[test]
+    fn setups_modal_retires_free_stations_only() {
+        let mut state = se4_app(true);
+        call_top_candidate(&mut state, '1');
+        state.pool_overrides.insert(SetupId(2), PoolOverride::AllowAny);
+        state.ui.selected_setup = Some(SetupId(2));
+        update(&mut state, key(KeyCode::Char('s')), NOW);
+
+        // Row 0 is the occupied setup 1: Enter refuses with a warning.
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(state.board.setups().len(), 2, "occupied stations don't retire");
+        assert!(state.notices.iter().any(|n| n.text.contains("occupied")));
+
+        // Row 1 is the free setup 2: retired, its override and selection go
+        // with it (a stale Dedicated must not re-attach to a reused number).
+        update(&mut state, key(KeyCode::Down), NOW);
+        let effects = update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(effects.sim, Some(SimUrgency::Immediate));
+        let ids: Vec<u32> = state.board.setups().iter().map(|s| s.id.0).collect();
+        assert_eq!(ids, vec![1]);
+        assert!(state.pool_overrides.is_empty(), "stale override removed");
+        assert_eq!(state.ui.selected_setup, None, "selection cleared");
+    }
+
+    #[test]
+    fn setups_modal_add_reuses_the_lowest_retired_number() {
+        let mut state = se4_app(false);
+        update(&mut state, key(KeyCode::Char('s')), NOW);
+        // Retire setup 1 (row 0, free), then add: the arrival becomes the
+        // new setup 1 (physical placard reuse).
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(state.board.setups().len(), 1);
+        update(&mut state, key(KeyCode::Down), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        let ids: Vec<u32> = state.board.setups().iter().map(|s| s.id.0).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn setups_modal_seeds_a_zero_station_type() {
+        let melee = se4();
+        let config = SchedulerConfig {
+            setups: Some(SetupCounts::ByType(BTreeMap::from([("switch".to_owned(), 1)]))),
+            brackets: vec![
+                BracketConfig {
+                    setup_type: Some(OneOrMany::One("switch".to_owned())),
+                    ..BracketConfig::new("melee")
+                },
+                BracketConfig {
+                    setup_type: Some(OneOrMany::One("pokemon".to_owned())),
+                    ..BracketConfig::new("pokemon")
+                },
+            ],
+            ..SchedulerConfig::default()
+        };
+        let boots = vec![
+            BracketBootstrap {
+                id: BracketId("melee".to_owned()),
+                sets: melee.sets.clone(),
+                groups: vec![melee.info.clone()],
+                mode: BracketMode::Full,
+                start_at: None,
+                setup_types: vec!["switch".to_owned()],
+                duration_prior_secs: 480,
+                prior_weight: 4.0,
+                characters: Vec::new(),
+            },
+            BracketBootstrap {
+                id: BracketId("pokemon".to_owned()),
+                sets: Vec::new(),
+                groups: Vec::new(),
+                mode: BracketMode::Full,
+                start_at: None,
+                setup_types: vec!["pokemon".to_owned()],
+                duration_prior_secs: 480,
+                prior_weight: 4.0,
+                characters: Vec::new(),
+            },
+        ];
+        let mut state = AppState::new(config, false, boots, NOW);
+        assert!(
+            state.notices.iter().any(|n| n.text.contains("pokemon") && n.text.contains("no stations")),
+            "zero-station type warned at launch: {:?}",
+            state.notices
+        );
+
+        // The modal still offers pokemon's add row; Enter seeds station 2.
+        update(&mut state, key(KeyCode::Char('s')), NOW);
+        let rows = setups_rows(&state);
+        let pokemon_add = rows.iter().position(|r| r == &SetupsRow::Add("pokemon".to_owned())).unwrap();
+        for _ in 0..pokemon_add {
+            update(&mut state, key(KeyCode::Down), NOW);
+        }
+        update(&mut state, key(KeyCode::Enter), NOW);
+        let added = state.board.setups().iter().find(|s| s.setup_type == "pokemon").unwrap();
+        assert_eq!(added.id, SetupId(2));
     }
 
     #[test]
