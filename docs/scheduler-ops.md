@@ -43,6 +43,15 @@ rights — the safe default for a review/rehearsal). The tool opens on the setup
 - Default state/snapshot files live in the XDG data dir
   (`~/.local/share/bracket-tools/`), so launching from any directory finds the same state;
   `state_file`/`snapshot_file` in the config still override.
+- **Setup counts are per *type*, and optional.** Brackets declare `setup_type = "switch"`
+  (or a list = the union of those types' pools); `setups = 8` is one shared default pool,
+  `[setups] switch = 6 / pokemon = 2` is per-type. Station numbers are derived 1..N in
+  first-reference order. Count resolution, highest first: `--setups 8` or
+  `--setups switch=6,pokemon=2` on the command line (pins the roster for this run) → the
+  persisted roster from the last session (crash recovery — includes stations added with
+  `s`) → the config's counts → `~/.local/share/bracket-tools/setup-defaults.toml` (rewritten
+  automatically whenever a live session's roster changes) → 4 per type with a warning.
+  A type with zero stations is fine at launch — seed it from the `s` modal.
 - If the network is down at launch, it opens on the last-good persisted snapshot with a
   stale banner rather than a blank screen.
 - A second launch on the same state file hard-errors "already running (pid N)" — the flock
@@ -76,9 +85,14 @@ rights — the safe default for a review/rehearsal). The tool opens on the setup
 - **z** snooze · **u** undo (single level) · **q** / Ctrl-C quit.
 - **a** — reassign the selected setup: dedicate it to one bracket / allow any / restore the
   config pools, for when a bracket finishes early and its setups should redeploy. Free
-  setups whose brackets all finished show **N:done→a** in the strip. (Editing the config
-  `pool` lists and restarting remains a safe fallback — the restart preserves your overlay
-  and re-runs preflight.)
+  setups whose brackets all finished show **N:done→a** in the strip.
+- **s** — stations modal: **add or retire setups mid-event**, no restart. Rows are the
+  board grouped by type plus one "add a &lt;type&gt; station" row per type; the modal stays
+  open so a batch of arrivals is a few Enters. Retire needs the station **free** (occupied →
+  warning, free it with f/r first) and takes any pool override with it; an add reuses the
+  lowest open number (station 3 goes home → the next arrival becomes the new 3). Every edit
+  recomputes and re-simulates immediately, persists to the overlay, and (live) reseeds the
+  cross-tournament defaults, so the next run assumes today's counts. **u** undoes.
 - **i** inspect (why a set is not callable) · **n** notices/log · **w** pending writes +
   divergence ledger · **?** context help.
 
@@ -175,10 +189,12 @@ Config changes take effect on **restart only**. A restart is safe mid-event:
   event launches stale-flagged and keeps retrying (NO demote prompt); only a definitive
   failure (bad slug, failed structure assertion) prompts a per-event conflict_only downgrade;
 - no-show countdowns and wait-times resume from the wall clock;
-- you'll see reconciliation notices for anything dropped (unknown setup ids, stale pool
-  overrides). These are informational.
+- you'll see reconciliation notices for anything dropped (stale pool overrides, stations
+  holding sets from a bracket outside this config). These are informational.
 
-Use this to add setups, change pools, pin a state int, or tune durations without losing state.
+Setup counts do NOT need a restart — that's the `s` modal. Use a restart to change which
+events run, retype a bracket's `setup_type`, pin a state int, or tune durations without
+losing state.
 
 ## conflict_only discipline (the ANY-bracket guarantee)
 
