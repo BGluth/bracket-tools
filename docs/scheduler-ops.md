@@ -145,7 +145,6 @@ tournament itself and read (or watch) the tape:
 ```
 scheduler --simulate <captures-dir> --autoplay          # real corpus
 scheduler --synth de:32,de:16,swiss:8 --autoplay        # parameterized fake brackets
-scheduler --synth fbr --autoplay                        # the built-in 7-event FBR-shaped world
 scheduler --replay scheduler-replay.txt                 # watch it animated (--frame-ms to pace)
 ```
 
@@ -170,7 +169,7 @@ scheduler --replay scheduler-replay.txt                 # watch it animated (--f
   seed replays the identical run. Config equivalent: `[sim] duration_noise` / `noise_seed`.
 - `--synth SPEC` builds a fake tournament from parameters instead of captures: comma-
   separated `kind:entrants` entries (`de`, `se`, `rr`, `swiss` — swiss takes an optional
-  `:rounds`), or the literal `fbr`. Adjacent events share ~half their players so
+  `:rounds`). Adjacent events share ~half their players (wearing fictional gamer tags) so
   cross-bracket conflicts are real. Works with everything `--simulate` does: zero-config,
   `--pace`, `--autoplay`, or just poking at the TUI on a world that costs nothing.
 - All offline modes derive a ready-to-run config when none exists (largest captured

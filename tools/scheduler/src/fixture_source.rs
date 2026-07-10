@@ -31,9 +31,7 @@ use crate::{
     config::{BracketConfig, SchedulerConfig, SetupCounts},
     model::{GroupKind, LiveSet, PhaseGroupInfo, Prereq, Slot, PREREQ_TYPE_SEED, PREREQ_TYPE_SET},
     set_source::SetSource,
-    synth::{
-        default_players, make_de_bracket_with, make_fbr_world, make_rr_pool_with, make_se_bracket_with, make_swiss_with, materialize_ids,
-    },
+    synth::{make_de_bracket_with, make_rr_pool_with, make_se_bracket_with, make_swiss_with, materialize_ids, tagged_players},
 };
 
 /// The state ints the fixture answers mutations with, matching live
@@ -101,7 +99,7 @@ pub enum SynthSpecError {
     #[error("empty --synth spec")]
     Empty,
 
-    #[error("bad --synth entry {entry:?}: {reason} (expected kind:entrants with kind de|se|rr|swiss, e.g. de:32, or the literal `fbr`)")]
+    #[error("bad --synth entry {entry:?}: {reason} (expected kind:entrants with kind de|se|rr|swiss, e.g. de:32)")]
     Bad { entry: String, reason: String },
 }
 
@@ -185,22 +183,12 @@ impl FixtureSource {
 
     /// Builds a purely synthetic world from a `--synth` spec: comma-separated
     /// `kind:entrants` entries (`de:32`, `se:16`, `rr:8`, `swiss:16` — swiss
-    /// takes an optional `:rounds`), or the literal `fbr` for the shipped
-    /// 7-event FBR-shaped world. Adjacent events share ~half their players,
-    /// so cross-event conflicts are real. Set ids are numeric from the start,
-    /// so calls exercise the full write path even without `--pace`.
+    /// takes an optional `:rounds`). Adjacent events share ~half their
+    /// players, so cross-event conflicts are real. Set ids are numeric from
+    /// the start, so calls exercise the full write path even without
+    /// `--pace`.
     pub fn from_synth_spec(spec: &str) -> Result<Self, SynthSpecError> {
         let mut source = Self::new();
-        if spec.trim() == "fbr" {
-            for (index, event) in make_fbr_world().into_iter().enumerate() {
-                let name = event.id.0.strip_prefix("synth/").unwrap_or(&event.id.0).to_owned();
-                let slug = format!("{SYNTH_TOURNAMENT}-fbr/event/{name}");
-                let sets = materialize_ids(&event.sets, SYNTH_ID_BASE + index as u64 * SYNTH_ID_STRIDE);
-                source.add_synth_event(&slug, &event.groups, vec![sets]);
-            }
-            return Ok(source);
-        }
-
         let entries: Vec<SynthEntry> = spec
             .split(',')
             .map(str::trim)
@@ -221,7 +209,7 @@ impl FixtureSource {
             pool_len = pool_len.max(next_start + entry.entrants);
             next_start += entry.entrants.div_ceil(2);
         }
-        let pool = default_players(pool_len);
+        let pool = tagged_players(pool_len);
 
         for (index, entry) in entries.iter().enumerate() {
             let players = &pool[starts[index]..starts[index] + entry.entrants];
@@ -981,12 +969,31 @@ mod tests {
     }
 
     #[test]
-    fn synth_spec_fbr_is_one_tournament() {
-        let source = FixtureSource::from_synth_spec("fbr").unwrap();
+    fn synth_spec_multi_event_is_one_tournament() {
+        let source = FixtureSource::from_synth_spec("de:32,de:16,rr:6,swiss:16").unwrap();
         let (config, skipped) = source.derived_config();
-        assert_eq!(config.brackets.len(), 7);
+        assert_eq!(config.brackets.len(), 4);
         assert!(skipped.is_empty(), "{skipped:?}");
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn synth_spec_rejects_the_removed_fbr_literal() {
+        assert!(matches!(FixtureSource::from_synth_spec("fbr"), Err(SynthSpecError::Bad { .. })));
+    }
+
+    #[tokio::test]
+    async fn synth_players_wear_tags_not_numbers() {
+        let source = FixtureSource::from_synth_spec("de:8").unwrap();
+        let sets = source.fetch_event_sets("tournament/synth/event/de8-1").await.unwrap();
+        let (live, _, _) = live_sets_from_schema(sets);
+        let names: Vec<&str> = live
+            .iter()
+            .flat_map(|s| s.slots.iter())
+            .filter_map(|slot| slot.occupant.as_ref().map(|o| o.display_name.as_str()))
+            .collect();
+        assert!(!names.is_empty());
+        assert!(names.iter().all(|n| !n.starts_with("Player ")), "tags expected: {names:?}");
     }
 
     #[test]
@@ -1013,7 +1020,10 @@ mod tests {
         assert_eq!(slugs, vec!["tournament/big/event/melee", "tournament/big/event/ultimate"]);
         assert_eq!(skipped, vec!["tournament/small/event/rivals".to_owned()]);
         assert_eq!(config.setups, Some(SetupCounts::Uniform(SIM_SETUP_COUNT)));
-        assert!(config.brackets.iter().all(|b| b.setup_types() == vec!["default"]), "one shared pool");
+        assert!(
+            config.brackets.iter().all(|b| b.setup_types() == vec!["default"]),
+            "one shared pool"
+        );
         assert_eq!(config.known_called_state_int, Some(FIXTURE_CALLED_INT));
         assert_eq!(config.known_in_progress_state_int, Some(FIXTURE_IN_PROGRESS_INT));
         assert!(!config.advisor_only, "derived sim sessions arm writes");

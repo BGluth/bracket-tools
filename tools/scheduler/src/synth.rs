@@ -25,6 +25,108 @@ use crate::model::{
 const WINNER: i32 = 1;
 const LOSER: i32 = 2;
 
+/// Fictional gamer tags for `--synth` rehearsal worlds (some carry made-up
+/// sponsor prefixes so label widths look like a real bracket). Unit tests
+/// keep the deterministic `Player N` vocabulary from [`default_players`].
+const SYNTH_TAGS: &[&str] = &[
+    "Quasar",
+    "Drift",
+    "KBN | Nimbus",
+    "Wisp",
+    "Ember",
+    "Talon",
+    "Pixel",
+    "HXD | Vortex",
+    "Karma",
+    "Slate",
+    "Comet",
+    "Rune",
+    "ZBT | Havoc",
+    "Lotus",
+    "Fizz",
+    "Onyx",
+    "Sable",
+    "MNT | Prism",
+    "Echo",
+    "Rascal",
+    "Bramble",
+    "Zephyr",
+    "K7 | Ivory",
+    "Grim",
+    "Pesto",
+    "Waffle",
+    "Noodle",
+    "KBN | Crouton",
+    "Biscuit",
+    "Squid",
+    "Tofu",
+    "Marble",
+    "HXD | Clover",
+    "Sprig",
+    "Doodle",
+    "Fjord",
+    "Kelp",
+    "ZBT | Moth",
+    "Pigeon",
+    "Yeti",
+    "Goblin",
+    "Turnip",
+    "MNT | Parry",
+    "Ledge",
+    "Waveland",
+    "Pivot",
+    "Crossup",
+    "K7 | Meteor",
+    "Tumble",
+    "Skewer",
+    "Gale",
+    "Frost",
+    "KBN | Cinder",
+    "Thistle",
+    "Badger",
+    "Otter",
+    "Lynx",
+    "HXD | Heron",
+    "Viper",
+    "Mantis",
+    "Wren",
+    "Corvid",
+    "ZBT | Dingo",
+    "Gecko",
+    "Koi",
+    "Tapir",
+    "Newt",
+    "MNT | Osprey",
+    "Puffin",
+    "Stoat",
+    "Vole",
+    "Shrike",
+    "K7 | Fathom",
+    "Umbra",
+    "Zenith",
+    "Solstice",
+    "Cascade",
+    "KBN | Latch",
+    "Mortar",
+    "Anchor",
+    "Sprocket",
+    "Juniper",
+    "HXD | Static",
+    "Mango2King",
+    "Tempo",
+    "Ronin",
+    "Dusk",
+    "ZBT | Gizmo",
+    "Sprout",
+    "Jinx",
+    "Ferrous",
+    "Halcyon",
+    "MNT | Bandit",
+    "Cobalt",
+    "Wick",
+    "Tundra",
+];
+
 #[derive(Debug, Clone)]
 pub struct SynthPlayer {
     pub player_id: String,
@@ -54,6 +156,24 @@ pub fn default_players(n: usize) -> Vec<SynthPlayer> {
         .map(|i| SynthPlayer {
             player_id: format!("P{i}"),
             name: format!("Player {i}"),
+        })
+        .collect()
+}
+
+/// Players `P1..Pn` wearing fictional gamer tags, seeded in order. Pools
+/// deeper than the tag list wrap with a numeric suffix (`Quasar 2`).
+pub fn tagged_players(n: usize) -> Vec<SynthPlayer> {
+    (1..=n)
+        .map(|i| {
+            let tag = SYNTH_TAGS[(i - 1) % SYNTH_TAGS.len()];
+            let name = match (i - 1) / SYNTH_TAGS.len() {
+                0 => tag.to_owned(),
+                wrap => format!("{tag} {}", wrap + 1),
+            };
+            SynthPlayer {
+                player_id: format!("P{i}"),
+                name,
+            }
         })
         .collect()
 }

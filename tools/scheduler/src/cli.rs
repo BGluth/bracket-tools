@@ -40,7 +40,7 @@ pub struct Cli {
 
     /// Build a synthetic tournament instead of hitting live start.gg:
     /// comma-separated kind:entrants entries (de|se|rr|swiss; swiss takes an
-    /// optional :rounds), e.g. `de:32,rr:8`, or the literal `fbr`.
+    /// optional :rounds), e.g. `de:32,rr:8`.
     #[arg(long, value_name = "SPEC")]
     pub synth: Option<String>,
 
@@ -278,7 +278,10 @@ mod tests {
         assert_eq!(cli.setups, Some(SetupCounts::ByType(expected)));
 
         for bad in ["switch=6,switch=2", "=3", "switch=", "switch", "switch=x"] {
-            assert!(Cli::try_parse_from(["scheduler", "--setups", bad]).is_err(), "{bad:?} must be rejected");
+            assert!(
+                Cli::try_parse_from(["scheduler", "--setups", bad]).is_err(),
+                "{bad:?} must be rejected"
+            );
         }
     }
 
