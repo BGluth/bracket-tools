@@ -245,8 +245,9 @@ pub enum Modal {
 }
 
 /// The in-flight report the modal edits. Winner taps are the hot path (`1`/
-/// `2` per game); characters are optional, apply to every game, and stick per
-/// player across sets.
+/// `2` per game); characters are optional and per game — a new game copies
+/// the previous game's picks, and editing a game re-propagates from it
+/// forward. Sticky picks per player seed the first game across sets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReportDraft {
     /// The setup the set is on (freed on submit).
@@ -257,11 +258,22 @@ pub struct ReportDraft {
     pub left: ReportSide,
     pub right: ReportSide,
     pub best_of: Option<i32>,
-    /// Winner of each game so far, in play order.
-    pub games: Vec<Side>,
-    /// Character picks (left, right), applied to every game's selections.
+    /// Each game so far, in play order.
+    pub games: Vec<GameDraft>,
+    /// Character picks (left, right) for the first game before it is
+    /// recorded; later games copy their predecessor.
     pub chars: [Option<i32>; 2],
+    /// The game the character picker targets (picks apply from it onward);
+    /// Up/Down move it in the Games stage.
+    pub game_cursor: usize,
     pub stage: ReportStage,
+}
+
+/// One recorded game: its winner and both sides' character picks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GameDraft {
+    pub winner: Side,
+    pub chars: [Option<i32>; 2],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,7 +321,7 @@ pub enum ReportStage {
 
 impl ReportDraft {
     pub fn wins(&self, side: Side) -> usize {
-        self.games.iter().filter(|&&s| s == side).count()
+        self.games.iter().filter(|g| g.winner == side).count()
     }
 
     pub fn side(&self, side: Side) -> &ReportSide {
@@ -1569,6 +1581,7 @@ fn open_report_modal(state: &mut AppState, now: UnixMillis) {
             best_of,
             games: Vec::new(),
             chars,
+            game_cursor: 0,
             stage: ReportStage::Games,
         }
     };
@@ -1582,6 +1595,15 @@ fn handle_report_key(state: &mut AppState, mut draft: ReportDraft, code: KeyCode
             KeyCode::Char('2') => record_game(state, draft, Side::Right),
             KeyCode::Backspace => {
                 draft.games.pop();
+                draft.game_cursor = draft.game_cursor.min(draft.games.len().saturating_sub(1));
+                state.ui.modal = Some(Modal::Report(Box::new(draft)));
+            }
+            KeyCode::Up => {
+                draft.game_cursor = draft.game_cursor.saturating_sub(1);
+                state.ui.modal = Some(Modal::Report(Box::new(draft)));
+            }
+            KeyCode::Down => {
+                draft.game_cursor = (draft.game_cursor + 1).min(draft.games.len().saturating_sub(1));
                 state.ui.modal = Some(Modal::Report(Box::new(draft)));
             }
             KeyCode::Char('c') => {
@@ -1631,7 +1653,11 @@ fn handle_report_key(state: &mut AppState, mut draft: ReportDraft, code: KeyCode
 }
 
 fn record_game(state: &mut AppState, mut draft: ReportDraft, winner: Side) {
-    draft.games.push(winner);
+    // A new game assumes the previous game's characters (the TO edits the
+    // exceptions).
+    let chars = draft.games.last().map_or(draft.chars, |g| g.chars);
+    draft.games.push(GameDraft { winner, chars });
+    draft.game_cursor = draft.games.len() - 1;
     // A clinched best-of needs no further entry; jump to the summary.
     if draft.clinched() {
         draft.stage = ReportStage::Confirm { dq: None };
@@ -1647,7 +1673,12 @@ fn handle_character_key(state: &mut AppState, mut draft: ReportDraft, side: Side
                 .get(cursor)
                 .map(|c| c.id);
             if let Some(id) = choice {
+                // Apply from the targeted game onward — carry-forward means
+                // a switch mid-set holds for the rest of it.
                 draft.chars[side.ix()] = Some(id);
+                for game in draft.games.iter_mut().skip(draft.game_cursor) {
+                    game.chars[side.ix()] = Some(id);
+                }
                 state.last_characters.insert(draft.side(side).sticky_key.clone(), id);
             }
             advance_character_stage(&mut draft, side);
@@ -1736,9 +1767,9 @@ fn submit_report(state: &mut AppState, mut draft: ReportDraft, dq: Option<Side>,
         draft
             .games
             .iter()
-            .map(|winner| GameReport {
-                winner_entrant_id: Some(draft.side(*winner).entrant_id.clone()),
-                selections: game_selections(&draft),
+            .map(|game| GameReport {
+                winner_entrant_id: Some(draft.side(game.winner).entrant_id.clone()),
+                selections: game_selections(&draft, game),
             })
             .collect()
     };
@@ -1783,14 +1814,14 @@ fn submit_report(state: &mut AppState, mut draft: ReportDraft, dq: Option<Side>,
     state.notice(now, NoticeLevel::Info, format!("reported {summary}; setup {} freed", draft.setup.0));
 }
 
-/// Both sides' character picks (sides without one stay out of the list).
-fn game_selections(draft: &ReportDraft) -> Vec<GameSelection> {
+/// One game's character picks per side (sides without one stay out).
+fn game_selections(draft: &ReportDraft, game: &GameDraft) -> Vec<GameSelection> {
     [Side::Left, Side::Right]
         .into_iter()
         .filter_map(|side| {
             Some(GameSelection {
                 entrant_id: draft.side(side).entrant_id.clone(),
-                character_id: Some(draft.chars[side.ix()]?),
+                character_id: Some(game.chars[side.ix()]?),
             })
         })
         .collect()
@@ -3530,5 +3561,59 @@ mod tests {
         let mut restored = se4_app(true);
         restored.apply_overlay(state.to_overlay(), NOW, true);
         assert_eq!(restored.last_characters.get(&left_key), Some(&2));
+    }
+
+    #[test]
+    fn characters_apply_per_game_and_carry_forward() {
+        let roster = vec![
+            bracket_tools_startgg::CharacterInfo {
+                id: 1,
+                name: "Mario".to_owned(),
+            },
+            bracket_tools_startgg::CharacterInfo {
+                id: 2,
+                name: "Marth".to_owned(),
+            },
+            bracket_tools_startgg::CharacterInfo {
+                id: 3,
+                name: "Fox".to_owned(),
+            },
+        ];
+        let mut state = se4_app(true);
+        state.brackets[0].characters = roster;
+        call_top_candidate(&mut state, '1');
+        update(&mut state, key(KeyCode::Char('g')), NOW);
+
+        // Base picks before any game: Marth / Fox.
+        update(&mut state, key(KeyCode::Char('c')), NOW);
+        for c in "marth".chars() {
+            update(&mut state, key(KeyCode::Char(c)), NOW);
+        }
+        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(KeyCode::Char('f')), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+
+        // Two games copy them; then the left player switches to Mario for
+        // game 2 onward (cursor already sits on the last recorded game).
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(KeyCode::Char('2')), NOW);
+        assert_eq!(draft(&state).game_cursor, 1);
+        update(&mut state, key(KeyCode::Char('c')), NOW);
+        for c in "mario".chars() {
+            update(&mut state, key(KeyCode::Char(c)), NOW);
+        }
+        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(KeyCode::Tab), NOW); // right keeps Fox
+
+        // Game 3 inherits the switched pick.
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        let effects = update(&mut state, key(KeyCode::Char('y')), NOW);
+        let report = report_payload(&effects);
+        assert_eq!(report.games.len(), 3);
+        let left_char = |ix: usize| report.games[ix].selections[0].character_id;
+        let right_char = |ix: usize| report.games[ix].selections[1].character_id;
+        assert_eq!([left_char(0), left_char(1), left_char(2)], [Some(2), Some(1), Some(1)]);
+        assert_eq!([right_char(0), right_char(1), right_char(2)], [Some(3), Some(3), Some(3)]);
     }
 }

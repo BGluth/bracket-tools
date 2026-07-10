@@ -708,23 +708,48 @@ fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
         draft.wins(Side::Right),
         draft.right.name
     )));
-    for (ix, winner) in draft.games.iter().enumerate() {
-        lines.push(Line::from(format!("game {}: {}", ix + 1, draft.side(*winner).name)));
+    for (ix, game) in draft.games.iter().enumerate() {
+        let chars = match (game.chars[0], game.chars[1]) {
+            (None, None) => String::new(),
+            _ => format!(
+                "  ·  {} vs {}",
+                character_name(state, draft, &game.chars, Side::Left),
+                character_name(state, draft, &game.chars, Side::Right)
+            ),
+        };
+        let line = Line::from(format!("game {}: {}{}", ix + 1, draft.side(game.winner).name, chars));
+        // The cursor marks which game `c` re-characters (that game onward).
+        let targeted = matches!(draft.stage, ReportStage::Games) && ix == draft.game_cursor;
+        lines.push(if targeted { line.style(SELECTED) } else { line });
     }
-    lines.push(Line::from(format!(
-        "characters: {} / {}",
-        character_name(state, draft, Side::Left),
-        character_name(state, draft, Side::Right)
-    )));
+    if draft.games.is_empty() {
+        lines.push(Line::from(format!(
+            "characters: {} / {}",
+            character_name(state, draft, &draft.chars, Side::Left),
+            character_name(state, draft, &draft.chars, Side::Right)
+        )));
+    }
     lines.push(Line::from(""));
 
     match &draft.stage {
         ReportStage::Games => {
             lines.push(Line::from(format!("1 = {} won · 2 = {} won", draft.left.name, draft.right.name)));
-            lines.push(Line::from("c characters · d DQ · Backspace undo game · Enter finish · Esc cancel"));
+            let chars_hint = if draft.games.len() > 1 {
+                format!("c characters (game {}+, Up/Down aim)", draft.game_cursor + 1)
+            } else {
+                "c characters".to_owned()
+            };
+            lines.push(Line::from(format!(
+                "{chars_hint} · d DQ · Backspace undo game · Enter finish · Esc cancel"
+            )));
         }
         ReportStage::Characters { side, filter, cursor } => {
-            lines.push(Line::from(format!("character for {}: {filter}_", draft.side(*side).name)));
+            let target = if draft.games.is_empty() {
+                String::new()
+            } else {
+                format!(" (game {}+)", draft.game_cursor + 1)
+            };
+            lines.push(Line::from(format!("character for {}{target}: {filter}_", draft.side(*side).name)));
             let matches = filtered_roster(report_roster(state, &draft.bracket), filter);
             for (ix, character) in matches.iter().take(8).enumerate() {
                 let line = Line::from(format!("  {}", character.name));
@@ -754,9 +779,9 @@ fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
     frame.render_widget(body, area);
 }
 
-/// The display name of a side's current character pick.
-fn character_name(state: &AppState, draft: &ReportDraft, side: Side) -> String {
-    let Some(id) = draft.chars[side.ix()] else {
+/// The display name of one side's pick in a `[left, right]` pair.
+fn character_name(state: &AppState, draft: &ReportDraft, chars: &[Option<i32>; 2], side: Side) -> String {
+    let Some(id) = chars[side.ix()] else {
         return "—".to_owned();
     };
     report_roster(state, &draft.bracket)
