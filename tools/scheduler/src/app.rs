@@ -31,6 +31,11 @@ use crate::{
 /// How long `z` parks a queue entry.
 pub const SNOOZE_SECS: i64 = 300;
 const NOTICE_CAP: usize = 200;
+/// Idle refresh cadence for the time-derived world terms (rest windows,
+/// snooze expiry, wait credit). A recompute runs a full forward sim, so a
+/// bare tick only triggers one when the world is at least this stale;
+/// anything that actually changes state recomputes immediately.
+pub const WORLD_REFRESH_MS: i64 = 10_000;
 
 #[derive(Debug)]
 pub enum Msg {
@@ -545,6 +550,9 @@ pub struct AppState {
     /// when the picker closes.
     rollout_pending: Option<RolloutRankings>,
     pub dirty: bool,
+    /// When the world was last recomputed; bare ticks skip the recompute
+    /// until [`WORLD_REFRESH_MS`] has passed.
+    last_recompute: UnixMillis,
     /// Set whenever a message may have changed the persisted overlay; the main
     /// loop debounces a save and clears it.
     pub overlay_dirty: bool,
@@ -612,6 +620,7 @@ impl AppState {
             rollout: None,
             rollout_pending: None,
             dirty: false,
+            last_recompute: 0,
             overlay_dirty: false,
             snapshot_dirty: false,
             persist_failed: false,
@@ -620,9 +629,8 @@ impl AppState {
             config,
         };
         if roster.fallback {
-            let text = format!(
-                "no setup counts configured — assuming {FALLBACK_SETUPS_PER_TYPE} per type (fix with --setups or the config)"
-            );
+            let text =
+                format!("no setup counts configured — assuming {FALLBACK_SETUPS_PER_TYPE} per type (fix with --setups or the config)");
             state.notice(now_millis, NoticeLevel::Warn, text);
         }
         for setup_type in &roster.zero_station_types {
@@ -863,19 +871,24 @@ pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateE
     let mut effects = UpdateEffects::default();
     // Key/Poll/Write can all touch the persisted overlay; a bare Tick only
     // does when it fires a no-show alert (scan_no_shows marks it), so an idle
-    // desk never churns saves. The same three ask the simulator to
-    // re-evaluate (routine unless a handler escalated to the decision-point
-    // exemption).
+    // desk never churns saves. Rollout re-evaluations are asked for only when
+    // the handler actually changed scheduling state (marked dirty) — pure
+    // navigation must not burn a background sim — plus the explicit
+    // decision-point requests handlers add themselves.
     match msg {
         Msg::Key(key) => {
             handle_key(state, key, now_millis, &mut effects);
             state.overlay_dirty = true;
-            effects.want_sim(SimUrgency::Routine);
+            if state.dirty {
+                effects.want_sim(SimUrgency::Routine);
+            }
         }
         Msg::Poll(poll) => {
             handle_poll(state, poll, now_millis, &mut effects);
             state.overlay_dirty = true;
-            effects.want_sim(SimUrgency::Routine);
+            if state.dirty {
+                effects.want_sim(SimUrgency::Routine);
+            }
         }
         Msg::Write(result) => {
             handle_write_result(state, result, now_millis);
@@ -885,13 +898,18 @@ pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateE
         Msg::SimResult(rankings) => apply_sim_result(state, rankings),
         Msg::Tick => {
             scan_no_shows(state, now_millis);
-            state.dirty = true;
+            // A recompute runs a full forward sim; only refresh the
+            // time-derived terms once they're meaningfully stale.
+            if now_millis - state.last_recompute >= WORLD_REFRESH_MS {
+                state.dirty = true;
+            }
         }
     }
     if state.dirty {
         state.world = recompute_world(state, now_millis);
         state.ui.queue_ix = state.ui.queue_ix.min(state.world.queue.len().saturating_sub(1));
         state.dirty = false;
+        state.last_recompute = now_millis;
     }
     effects
 }
@@ -936,7 +954,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
     match key.code {
         KeyCode::Char('q') => effects.quit = true,
         KeyCode::Char('?') => state.ui.modal = Some(Modal::Help),
-        KeyCode::Char(c @ '0'..='9') => select_setup(state, c, now),
+        KeyCode::Char(c @ '0'..='9') => select_setup(state, c, now, effects),
         KeyCode::Char('p') => progress_selected(state, now, effects),
         KeyCode::Char('f') => free_selected(state, now, effects),
         KeyCode::Char('r') => requeue_selected(state, now, effects),
@@ -1085,7 +1103,7 @@ pub(crate) fn picker_rows(state: &AppState, setup: SetupId) -> (Vec<RolloutRow>,
 }
 
 /// Digits map straight to the TO's setup numbering (`SetupId(d)`, `0` = 10).
-fn select_setup(state: &mut AppState, digit: char, now: UnixMillis) {
+fn select_setup(state: &mut AppState, digit: char, now: UnixMillis, effects: &mut UpdateEffects) {
     let number = digit.to_digit(10).map(|d| if d == 0 { 10 } else { d }).unwrap_or(0);
     let setup = SetupId(number);
     let Some(status) = state.board.setups().iter().find(|s| s.id == setup).map(|s| s.status.clone()) else {
@@ -1104,6 +1122,9 @@ fn select_setup(state: &mut AppState, digit: char, now: UnixMillis) {
                 selected: 0,
                 refreshed: false,
             });
+            // Opening the picker is a decision point; ask for a fresh rollout
+            // (navigation keys alone no longer schedule one).
+            effects.want_sim(SimUrgency::Routine);
         }
         _ => {
             state.ui.selected_setup = Some(setup);
@@ -1482,7 +1503,10 @@ fn add_setup_station(state: &mut AppState, setup_type: String, now: UnixMillis, 
     push_undo(state, format!("add setup {}", id.0));
     state.board.add_setup(id, setup_type.clone());
     if id.0 > 10 {
-        let text = format!("setup {} is beyond digit selection (1-9, 0 = 10) — free/retire a lower number to use it", id.0);
+        let text = format!(
+            "setup {} is beyond digit selection (1-9, 0 = 10) — free/retire a lower number to use it",
+            id.0
+        );
         state.notice(now, NoticeLevel::Warn, text);
     }
     state.dirty = true;
@@ -2252,8 +2276,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus, PollFailure, PollOutcome, PollResult,
-        SetupsRow, SimUrgency, WriteIntent, WriteKind, WriteOutcome, WriteResult,
+        recompute_world, setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus, PollFailure, PollOutcome,
+        PollResult, SetupsRow, SimUrgency, WriteIntent, WriteKind, WriteOutcome, WriteResult, WORLD_REFRESH_MS,
     };
     use crate::{
         config::{BracketConfig, BracketMode, OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
@@ -2516,18 +2540,31 @@ mod tests {
 
     #[test]
     fn queue_is_deterministic_between_recomputes() {
-        // Same instant, repeated recomputes: byte-identical queues.
-        let mut state = se4_app(false);
-        update(&mut state, Msg::Tick, NOW + 1000);
-        let first = state.world.queue.clone();
-        update(&mut state, Msg::Tick, NOW + 1000);
-        assert_eq!(first, state.world.queue);
+        // Same instant, repeated recomputes: byte-identical queues. (Direct
+        // recomputes — a bare tick only refreshes once the world is stale.)
+        let state = se4_app(false);
+        let first = recompute_world(&state, NOW + 1000).queue;
+        assert_eq!(first, recompute_world(&state, NOW + 1000).queue);
 
         // Later instant: only the wait-time credit may move; the ordering
         // identity must not.
-        update(&mut state, Msg::Tick, NOW + 60_000);
+        let later = recompute_world(&state, NOW + 60_000).queue;
         let order = |entries: &[crate::world::QueueEntry]| entries.iter().map(|e| e.key.clone()).collect::<Vec<_>>();
-        assert_eq!(order(&first), order(&state.world.queue));
+        assert_eq!(order(&first), order(&later));
+    }
+
+    #[test]
+    fn bare_ticks_recompute_only_once_stale() {
+        let mut state = se4_app(false);
+        update(&mut state, Msg::Tick, NOW);
+        let stamped = state.last_recompute;
+        assert_eq!(stamped, NOW, "first tick computes the initial world");
+
+        update(&mut state, Msg::Tick, NOW + 1000);
+        assert_eq!(state.last_recompute, stamped, "fresh world: tick skips the recompute");
+
+        update(&mut state, Msg::Tick, NOW + WORLD_REFRESH_MS);
+        assert_eq!(state.last_recompute, NOW + WORLD_REFRESH_MS, "stale world: tick refreshes");
     }
 
     #[test]
@@ -2548,10 +2585,12 @@ mod tests {
         update(&mut state, key(KeyCode::Char('z')), NOW);
         assert_eq!(state.world.queue.len(), 1, "snoozed set hidden");
 
-        // Just before expiry: still hidden. After: back.
+        // Just before expiry: still hidden. After (plus the tick refresh
+        // cadence — bare ticks recompute at most every WORLD_REFRESH_MS):
+        // back.
         update(&mut state, Msg::Tick, NOW + (super::SNOOZE_SECS - 1) * 1000);
         assert_eq!(state.world.queue.len(), 1);
-        update(&mut state, Msg::Tick, NOW + (super::SNOOZE_SECS + 1) * 1000);
+        update(&mut state, Msg::Tick, NOW + super::SNOOZE_SECS * 1000 + WORLD_REFRESH_MS);
         assert_eq!(state.world.queue.len(), 2);
     }
 
@@ -2891,7 +2930,10 @@ mod tests {
         update(&mut state, key(KeyCode::Down), NOW);
         let effects = update(&mut state, key(KeyCode::Enter), NOW);
         assert_eq!(effects.sim, Some(SimUrgency::Immediate));
-        assert!(matches!(state.ui.modal, Some(Modal::Setups { .. })), "modal stays open for batch adds");
+        assert!(
+            matches!(state.ui.modal, Some(Modal::Setups { .. })),
+            "modal stays open for batch adds"
+        );
         let ids: Vec<u32> = state.board.setups().iter().map(|s| s.id.0).collect();
         assert_eq!(ids, vec![1, 2, 3]);
         assert!(state.world.per_setup.contains_key(&SetupId(3)), "the new station ranks immediately");
@@ -2983,7 +3025,10 @@ mod tests {
         ];
         let mut state = AppState::new(config, false, boots, NOW);
         assert!(
-            state.notices.iter().any(|n| n.text.contains("pokemon") && n.text.contains("no stations")),
+            state
+                .notices
+                .iter()
+                .any(|n| n.text.contains("pokemon") && n.text.contains("no stations")),
             "zero-station type warned at launch: {:?}",
             state.notices
         );
@@ -3029,7 +3074,10 @@ mod tests {
             matches!(restored.board.setups()[0].status, SetupStatus::Called { .. }),
             "statuses still re-key by id"
         );
-        assert!(restored.notices.iter().any(|n| n.text.contains("dropped persisted state for setup 3")));
+        assert!(restored
+            .notices
+            .iter()
+            .any(|n| n.text.contains("dropped persisted state for setup 3")));
     }
 
     #[test]
@@ -3048,7 +3096,10 @@ mod tests {
         let mut restored = se4_app(true);
         restored.apply_overlay(doc, NOW, true);
         let restored_setup = &restored.board.setups()[0];
-        assert_eq!(restored_setup.setup_type, DEFAULT_SETUP_TYPE, "config roster kept, not the untyped one");
+        assert_eq!(
+            restored_setup.setup_type, DEFAULT_SETUP_TYPE,
+            "config roster kept, not the untyped one"
+        );
         assert!(matches!(restored_setup.status, SetupStatus::Called { .. }), "status re-keyed by id");
     }
 
