@@ -34,7 +34,7 @@ use bracket_tools_scheduler::{
     set_source::SetSource,
     terminal::{install_panic_hook, TerminalGuard},
     ui,
-    world::{rollout_rankings, SimSnapshot, ROLLOUT_TOP_K},
+    world::{rollout_rankings, snapshot_within_sim_ceiling, SimSnapshot, ROLLOUT_TOP_K},
     writer::{run_writer, WriterConfig},
     SchedulerConfig,
 };
@@ -56,6 +56,14 @@ const SETUP_DEFAULTS_FILE: &str = "setup-defaults.toml";
 /// Routine rollout evaluations run at most this often; the decision-point
 /// exemption (setup freed) bypasses it.
 const SIM_DEBOUNCE_MS: i64 = 5000;
+/// The evaluator rests for twice its last run's cost (capped here) before
+/// the next dispatch: big worlds/boards get stale-but-recent rollouts at
+/// bounded CPU instead of pinning a core when one evaluation outlasts the
+/// trigger cadence (measured live: 50 stations × 4 events did exactly that).
+const MAX_SIM_IDLE_GAP_MS: i64 = 30_000;
+/// Lost-result guard: a wedged or restarted evaluator must not block
+/// rollouts forever.
+const SIM_INFLIGHT_TIMEOUT_MS: i64 = 120_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -632,6 +640,11 @@ where
     let mut last_save: UnixMillis = 0;
     let mut last_sim_dispatch: UnixMillis = 0;
     let mut sim_pending = false;
+    let mut sim_urgent = false;
+    let mut sim_ceiling_notified = false;
+    let mut sim_inflight = false;
+    let mut last_sim_done: UnixMillis = 0;
+    let mut last_sim_cost: i64 = 0;
     // Defaults rewrite only on a roster *change*, so a session that never
     // touches 's' leaves the file alone.
     let mut last_counts = state.board.counts_by_type();
@@ -640,15 +653,25 @@ where
         tokio::select! {
             maybe_msg = rx.recv() => {
                 let Some(msg) = maybe_msg else { break };
+                let mut sim_done = matches!(msg, Msg::SimResult(_));
                 effects = update(state, msg, now_millis());
                 // Coalesce whatever else is already queued before drawing.
                 while let Ok(more) = rx.try_recv() {
+                    sim_done |= matches!(more, Msg::SimResult(_));
                     effects.merge(update(state, more, now_millis()));
+                }
+                if sim_done {
+                    sim_inflight = false;
+                    last_sim_done = now_millis();
+                    last_sim_cost = last_sim_done - last_sim_dispatch;
                 }
             }
             died = tasks.join_set.join_next() => {
                 if let Some(result) = died {
                     let name = tasks.restart_dead_task(result);
+                    if name == "simulator" {
+                        sim_inflight = false;
+                    }
                     state.notice(now_millis(), NoticeLevel::Error, format!("internal task died and was restarted: {name}"));
                     state.dirty = true;
                 }
@@ -666,15 +689,38 @@ where
         }
         // Rollout triggers: Immediate (setup freed) bypasses the debounce;
         // Routine coalesces to one evaluation per window (the 1s tick keeps
-        // this loop spinning, so pending requests flush on time).
+        // this loop spinning, so pending requests flush on time). Either way
+        // the evaluator is single-flight and rests in proportion to its last
+        // cost — on cheap worlds the gap rounds to nothing, on expensive
+        // ones CPU stays bounded and the picker labels the ranking's age.
         if effects.sim == Some(SimUrgency::Routine) {
             sim_pending = true;
         }
+        if effects.sim == Some(SimUrgency::Immediate) {
+            sim_urgent = true;
+        }
         let now = now_millis();
-        if effects.sim == Some(SimUrgency::Immediate) || (sim_pending && now - last_sim_dispatch >= SIM_DEBOUNCE_MS) {
-            let _ = tasks.sim_tx.send(state.sim_snapshot(now));
-            last_sim_dispatch = now;
+        if sim_inflight && now - last_sim_dispatch >= SIM_INFLIGHT_TIMEOUT_MS {
+            sim_inflight = false;
+        }
+        let rested = now - last_sim_done >= (2 * last_sim_cost).min(MAX_SIM_IDLE_GAP_MS);
+        let due = sim_urgent || (sim_pending && now - last_sim_dispatch >= SIM_DEBOUNCE_MS);
+        if due && !sim_inflight && rested {
+            let snapshot = state.sim_snapshot(now);
+            if snapshot_within_sim_ceiling(&snapshot) {
+                let _ = tasks.sim_tx.send(snapshot);
+                last_sim_dispatch = now;
+                sim_inflight = true;
+            } else if !sim_ceiling_notified {
+                sim_ceiling_notified = true;
+                let text = format!(
+                    "world exceeds sim.world_ceiling ({}) — greedy rankings only, no rollout/projections",
+                    state.config.sim.world_ceiling
+                );
+                state.notice(now, NoticeLevel::Info, text);
+            }
             sim_pending = false;
+            sim_urgent = false;
         }
         if (state.overlay_dirty || state.snapshot_dirty) && now_millis() - last_save >= SAVE_DEBOUNCE_MS {
             if state.overlay_dirty {

@@ -18,7 +18,7 @@ use crate::{
     model::{BracketId, LiveSet, PhaseGroupInfo, SetId, SetKey},
     ranker::{GreedyRanker, RankContext, RankedAction, RankedCandidate, Ranker},
     rollout::RolloutRanker,
-    simulator::{simulate, SimBracket, SimWorld},
+    simulator::{simulate, SimBracket, SimOutcome, SimWorld},
 };
 
 /// How many greedy-leading candidates the decision-point rollout simulates
@@ -238,7 +238,14 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
         sim: inputs.sim.clone(),
         now_millis: inputs.now_millis,
     };
-    let outcome = simulate(&sim_world, durations);
+    // Oversized worlds skip the projections sim (it walks the whole
+    // remaining tournament): summaries lose their finish estimates but the
+    // recompute stays interactive. Same knob gates rollout dispatch.
+    let outcome = if world_within_sim_ceiling(&sim_world) {
+        simulate(&sim_world, durations)
+    } else {
+        SimOutcome::default()
+    };
 
     let summaries = inputs
         .brackets
@@ -266,7 +273,7 @@ pub fn recompute(inputs: &WorldInputs<'_>, durations: &DurationModel, ranker: &i
         blocked,
         remaining,
         summaries,
-        overall_projected_finish: (!inputs.brackets.is_empty()).then_some(outcome.overall_finish),
+        overall_projected_finish: (!inputs.brackets.is_empty() && outcome.overall_finish != 0).then_some(outcome.overall_finish),
         pool_exhausted,
         graph_warnings,
     }
@@ -498,6 +505,32 @@ fn queue_entry(candidate: RankedCandidate, graphs: &HashMap<BracketId, BracketGr
         players,
         round_text,
     })
+}
+
+/// Whether the forward sims are affordable: `sim.world_ceiling` compared
+/// against stations × incomplete sets (0 = unlimited).
+fn within_sim_ceiling(ceiling: u64, stations: usize, open_sets: u64) -> bool {
+    ceiling == 0 || stations as u64 * open_sets <= ceiling
+}
+
+fn world_within_sim_ceiling(world: &SimWorld) -> bool {
+    let open = world
+        .brackets
+        .iter()
+        .map(|b| b.sets.iter().filter(|s| !s.is_completed()).count() as u64)
+        .sum();
+    within_sim_ceiling(world.sim.world_ceiling, world.board.setups().len(), open)
+}
+
+/// The rollout-dispatch gate ([`SimSnapshot`] form; same knob as the
+/// recompute's projections sim).
+pub fn snapshot_within_sim_ceiling(snapshot: &SimSnapshot) -> bool {
+    let open = snapshot
+        .brackets
+        .iter()
+        .map(|b| b.sets.iter().filter(|s| !s.is_completed()).count() as u64)
+        .sum();
+    within_sim_ceiling(snapshot.sim.world_ceiling, snapshot.board.setups().len(), open)
 }
 
 /// Union of the per-setup rankings, deduplicated by set. Scores don't depend

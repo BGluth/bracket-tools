@@ -2933,6 +2933,23 @@ mod tests {
         assert!(matches!(state.ui.modal, Some(Modal::Notices { .. })));
     }
 
+    #[test]
+    fn sim_world_ceiling_skips_projections_and_gates_rollout() {
+        use crate::world::snapshot_within_sim_ceiling;
+
+        let mut state = se4_app(true);
+        assert!(state.world.summaries.iter().any(|s| s.projected_finish.is_some()));
+        assert!(snapshot_within_sim_ceiling(&state.sim_snapshot(NOW)));
+
+        // An oversized world keeps ranking greedily but stops simulating.
+        state.config.sim.world_ceiling = 1;
+        state.world = recompute_world(&state, NOW);
+        assert!(state.world.summaries.iter().all(|s| s.projected_finish.is_none()));
+        assert!(state.world.overall_projected_finish.is_none());
+        assert!(!state.world.queue.is_empty(), "greedy rankings survive");
+        assert!(!snapshot_within_sim_ceiling(&state.sim_snapshot(NOW)));
+    }
+
     fn call_top_candidate(state: &mut AppState, setup_digit: char) -> super::UpdateEffects {
         update(state, key(KeyCode::Char(setup_digit)), NOW);
         assert!(matches!(state.ui.modal, Some(Modal::CallPicker { .. })), "picker should open");

@@ -69,7 +69,7 @@ pub enum Action {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SimOutcome {
     /// Latest projected finish across fully-scheduled brackets (unix millis;
     /// `now` when nothing was left to run).

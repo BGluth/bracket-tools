@@ -550,6 +550,13 @@ pub struct SimConfig {
     /// rehearsals, where organic variance makes the drill more realistic.
     #[serde(default)]
     pub duration_noise: f64,
+    /// CPU ceiling for the forward sims: when stations × incomplete sets
+    /// exceeds this, the recompute skips its projections sim and rollout
+    /// evaluations stay off — greedy rankings only. (One rollout evaluation
+    /// on a 50-station × ~280-set world measured 20s+ of solid CPU.)
+    /// 0 = unlimited.
+    #[serde(default = "default_sim_world_ceiling")]
+    pub world_ceiling: u64,
     /// Seed for `duration_noise`; same seed + world = identical run.
     #[serde(default)]
     pub noise_seed: u64,
@@ -562,6 +569,7 @@ impl Default for SimConfig {
             rest_sim_horizon_secs: DEFAULT_REST_SIM_HORIZON_SECS,
             duration_noise: 0.0,
             noise_seed: 0,
+            world_ceiling: default_sim_world_ceiling(),
         }
     }
 }
@@ -576,6 +584,10 @@ fn default_prior_weight() -> f64 {
 
 fn default_noise_epsilon() -> f64 {
     DEFAULT_NOISE_EPSILON
+}
+
+fn default_sim_world_ceiling() -> u64 {
+    5_000
 }
 
 fn default_poll_interval_secs() -> u64 {
