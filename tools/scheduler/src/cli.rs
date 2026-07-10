@@ -27,7 +27,7 @@ pub const CONFIG_FILE: &str = "scheduler.toml";
 
 #[derive(Debug, Parser)]
 #[command(name = "scheduler", about = "Multi-bracket calling tool for the TO desk")]
-#[command(group = ArgGroup::new("offline").args(["simulate", "synth"]))]
+#[command(group = ArgGroup::new("offline").args(["simulate", "synth", "rehearse"]))]
 pub struct Cli {
     /// Path to the TOML config file. Defaults to ./scheduler.toml when
     /// present, else the XDG config dir. A missing config writes a starter
@@ -45,9 +45,18 @@ pub struct Cli {
     #[arg(long, value_name = "SPEC")]
     pub synth: Option<String>,
 
-    /// Rehearsal mode for --simulate/--synth: script the offline world
-    /// forward and play it back at FACTOR x real time (1 = live pace).
-    /// Without it, the offline world is served statically.
+    /// Dress-rehearse a real tournament without touching it: fetch the
+    /// configured events from live start.gg once, then play the bracket
+    /// forward as a paced offline world (defaults to 1x; set --pace to
+    /// compress). Reads the real config/seeding; writes go to the fixture,
+    /// never to start.gg. Combines with --tournament, --pace, --autoplay.
+    #[arg(long)]
+    pub rehearse: bool,
+
+    /// Playback speed for --simulate/--synth/--rehearse: script the offline
+    /// world forward and play it back at FACTOR x real time (1 = live pace).
+    /// Without it, --simulate/--synth serve a static world; --rehearse
+    /// defaults to 1x.
     #[arg(long, value_name = "FACTOR", requires = "offline")]
     pub pace: Option<f64>,
 
@@ -63,7 +72,7 @@ pub struct Cli {
 
     /// Play back a replay file written by --autoplay (auto-advancing; space
     /// pauses, arrow keys step back/forward, q quits).
-    #[arg(long, value_name = "FILE", conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "preflight_only"])]
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["simulate", "synth", "rehearse", "autoplay", "pace", "preflight_only"])]
     pub replay: Option<PathBuf>,
 
     /// Frame cadence for --replay playback, in milliseconds.
@@ -115,7 +124,7 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "URL_OR_SLUG",
-        conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "replay", "preflight_only", "tournament"]
+        conflicts_with_all = ["simulate", "synth", "rehearse", "autoplay", "pace", "replay", "preflight_only", "tournament"]
     )]
     pub init_tournament: Option<String>,
 
@@ -126,16 +135,18 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "SLUG",
-        conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "replay", "config"]
+        conflicts_with_all = ["simulate", "synth", "replay", "config"]
     )]
     pub tournament: Option<String>,
 }
 
 impl Cli {
-    /// True when the session runs against a fixture world (`--simulate` or
-    /// `--synth`) rather than live start.gg.
+    /// True when the session runs against a fixture world (`--simulate`,
+    /// `--synth`, or `--rehearse`) rather than live start.gg. Rehearse
+    /// fetches its world live once, but the app itself is fixture-backed:
+    /// `.sim` state paths, no roster-cache writes, no rate-limit waits.
     pub fn offline(&self) -> bool {
-        self.simulate.is_some() || self.synth.is_some()
+        self.simulate.is_some() || self.synth.is_some() || self.rehearse
     }
 
     /// Where the config lives: the explicit flag, else `./scheduler.toml`
@@ -303,6 +314,28 @@ mod tests {
         assert!(Cli::try_parse_from(["scheduler", "--pace", "8"]).is_err());
         assert!(Cli::try_parse_from(["scheduler", "--synth", "de:8", "--pace", "8"]).is_ok());
         assert!(Cli::try_parse_from(["scheduler", "--simulate", "caps/", "--pace", "8"]).is_ok());
+        assert!(Cli::try_parse_from(["scheduler", "--rehearse", "--pace", "8"]).is_ok());
+    }
+
+    #[test]
+    fn rehearse_is_offline_and_combines_with_tournament() {
+        let cli = Cli::try_parse_from(["scheduler", "--tournament", "seed-test-1", "--rehearse", "--pace", "8"]).unwrap();
+        assert!(cli.rehearse);
+        assert!(cli.offline(), "rehearse runs the app fixture-backed");
+        assert_eq!(cli.tournament.as_deref(), Some("seed-test-1"));
+
+        assert!(
+            Cli::try_parse_from(["scheduler", "--tournament", "t", "--rehearse", "--autoplay"]).is_ok(),
+            "headless rehearse works"
+        );
+        assert!(
+            Cli::try_parse_from(["scheduler", "--rehearse", "--simulate", "caps/"]).is_err(),
+            "one world source at a time"
+        );
+        assert!(
+            Cli::try_parse_from(["scheduler", "--tournament", "t", "--pace", "8"]).is_err(),
+            "pace still needs an offline world, not a live launch"
+        );
     }
 
     #[test]

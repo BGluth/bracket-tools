@@ -29,7 +29,7 @@ use bracket_tools_scheduler::{
     },
     poller::{classify_provider_error, run_poller, PollerConfig},
     preflight::{preflight, PreflightEnv},
-    rehearsal::install_rehearsal,
+    rehearsal::{install_rehearsal, seed_fixture_from_live},
     replay::{generate_replay, play_replay, render_replay},
     set_source::SetSource,
     terminal::{install_panic_hook, TerminalGuard},
@@ -71,6 +71,9 @@ async fn main() -> anyhow::Result<()> {
         None => cli.config_path(),
     };
 
+    if cli.rehearse {
+        return rehearse(cli, &config_path).await;
+    }
     if cli.offline() {
         let mut source = build_offline_source(&cli)?;
         let mut config = offline_config(&cli, &config_path, &source)?;
@@ -95,6 +98,35 @@ async fn main() -> anyhow::Result<()> {
         let source = Arc::new(build_live_source(token)?);
         run(cli, config, source, classify_provider_error).await
     }
+}
+
+/// `--rehearse`: fetch the configured events from live start.gg once, then
+/// run them as a paced offline world — the real config and seeding, with
+/// writes going to the fixture instead of the tournament.
+async fn rehearse(cli: Cli, config_path: &Path) -> anyhow::Result<()> {
+    let Some(mut config) = SchedulerConfig::load_if_present(config_path)? else {
+        bail!(
+            "--rehearse needs an existing config ({} not found) — run --init-tournament first or pass --config",
+            config_path.display()
+        );
+    };
+    apply_noise_overrides(&cli, &mut config)?;
+    resolve_setup_counts(&cli, &mut config)?;
+    let token = resolve_token(cli.token.as_deref(), &config)?;
+    let live = build_live_source(token)?;
+    println!("rehearse: fetching {} event(s) from live start.gg…", config.brackets.len());
+    let mut source = seed_fixture_from_live(&live, &config, PREFLIGHT_TIMEOUT)
+        .await
+        .context("seeding the rehearsal world")?;
+    if cli.autoplay {
+        return autoplay(&cli, &config, &source).await;
+    }
+    let speed = cli.pace.unwrap_or(1.0);
+    let report = install_rehearsal(&mut source, &config, speed, now_millis())
+        .await
+        .context("building the rehearsal")?;
+    print!("{}", report.render());
+    run(cli, config, Arc::new(source), classify_fixture_error).await
 }
 
 fn build_offline_source(cli: &Cli) -> anyhow::Result<FixtureSource> {

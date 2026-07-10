@@ -14,10 +14,12 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
+    time::Duration,
 };
 
 use bracket_tools_startgg_schema::get_sets_for_event;
 use thiserror::Error;
+use tokio::time::timeout;
 
 use crate::{
     config::{pool_for_types, resolve_roster, SchedulerConfig},
@@ -49,6 +51,9 @@ pub enum RehearsalError {
 
     #[error("--pace must be positive, got {0}")]
     InvalidSpeed(f64),
+
+    #[error("--rehearse: fetching {slug} live ({what}): {message}")]
+    LiveFetch { slug: String, what: String, message: String },
 }
 
 /// What the generator installed, printed before the TUI takes the screen.
@@ -89,6 +94,40 @@ impl RehearsalReport {
         }
         out
     }
+}
+
+/// `--rehearse`: seeds a fixture world by fetching every configured event
+/// from the live API once — a real tournament rehearses with no capture
+/// directory. Events go in through the same LiveSet→schema inversion synth
+/// worlds use, so every later fetch exercises the real forward conversion.
+/// The one lossy corner (a completed set's non-numeric `winner_id` drops) is
+/// moot here: rehearsals target not-yet-started brackets, and completedness
+/// itself rides on `completed_at`.
+pub async fn seed_fixture_from_live<S: SetSource>(
+    source: &S,
+    config: &SchedulerConfig,
+    request_timeout: Duration,
+) -> Result<FixtureSource, RehearsalError> {
+    let mut fixture = FixtureSource::new();
+    for bracket in &config.brackets {
+        let fetch_err = |what: &str, message: String| RehearsalError::LiveFetch {
+            slug: bracket.slug.clone(),
+            what: what.to_owned(),
+            message,
+        };
+        let structure = timeout(request_timeout, source.fetch_event_structure(&bracket.slug))
+            .await
+            .map_err(|_| fetch_err("structure", "timed out".to_owned()))?
+            .map_err(|e| fetch_err("structure", e.to_string()))?;
+        let sets = timeout(request_timeout, source.fetch_event_sets(&bracket.slug))
+            .await
+            .map_err(|_| fetch_err("sets", "timed out".to_owned()))?
+            .map_err(|e| fetch_err("sets", e.to_string()))?;
+        let (groups, _) = phase_groups_from_schema(&structure);
+        let (live, _warnings, _skipped) = live_sets_from_schema(sets);
+        fixture.add_synth_event(&bracket.slug, &groups, vec![live]);
+    }
+    Ok(fixture)
 }
 
 /// Builds and installs a paced rehearsal over `source`'s registered events —
@@ -312,7 +351,7 @@ fn rebase(ts_secs: i64, anchor_secs: i64, speed: f64) -> i64 {
 mod tests {
     use std::{slice::from_ref, time::Duration};
 
-    use super::{install_rehearsal, RehearsalError};
+    use super::{install_rehearsal, seed_fixture_from_live, RehearsalError};
     use crate::{
         config::{BracketConfig, SchedulerConfig, SetupCounts},
         fixture_source::FixtureSource,
@@ -401,6 +440,29 @@ mod tests {
         // Synth brackets share P1..P4, so the two DE-4s cannot overlap at
         // all: 8 sequential sets, not 4.
         assert_eq!(report.finishes_at - report.started_at, 64_000);
+    }
+
+    #[tokio::test]
+    async fn seeds_a_fixture_from_a_live_source_and_rehearses_it() {
+        // The "live API" is itself a fixture — SetSource is the only seam
+        // seed_fixture_from_live uses.
+        let (live, config) = synth_setup(&[SLUG]);
+        let mut seeded = seed_fixture_from_live(&live, &config, Duration::from_secs(1)).await.unwrap();
+
+        let report = install_rehearsal(&mut seeded, &config, 60.0, NOW).await.unwrap();
+        assert!(report.blocked.is_empty());
+        assert_eq!(report.frames.len(), 1);
+        assert!(report.frames[0].1 > 1, "world scripts forward: {:?}", report.frames);
+    }
+
+    #[tokio::test]
+    async fn seeding_a_missing_event_names_it() {
+        let (live, mut config) = synth_setup(&[SLUG]);
+        config.brackets.push(bracket_config("tournament/other/event/x"));
+        let Err(err) = seed_fixture_from_live(&live, &config, Duration::from_secs(1)).await else {
+            panic!("expected the missing event to error");
+        };
+        assert!(matches!(err, RehearsalError::LiveFetch { .. }), "{err:?}");
     }
 
     #[tokio::test]

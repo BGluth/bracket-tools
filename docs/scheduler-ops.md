@@ -118,9 +118,24 @@ rights — the safe default for a review/rehearsal). The tool opens on the setup
 Calls happen by **voice**; the start.gg writes are bookkeeping and never block advising. If
 writes are parked (non-admin, or a mutation failed), keep calling — the queue keeps working.
 
-## Dress rehearsal (`--simulate` + `--pace`)
+## Dress rehearsal (`--rehearse`, or `--simulate` + `--pace`)
 
-Drill the whole calling loop against the capture corpus, no network, no live tournament:
+The one-command form: rehearse a real (typically not-yet-started) tournament directly from
+its live bracket — no capture directory. It fetches the configured events once, then runs
+them as a paced offline world; writes go to the fixture, never to start.gg, and the event's
+start date is ignored (a rehearsal world is "live now"):
+
+```
+scheduler --tournament seed-test-1 --rehearse --pace 8
+```
+
+`--pace` defaults to 1× (live speed) under `--rehearse`; `--rehearse --autoplay` plays the
+whole event headlessly and writes a replay instead of running the TUI. Everything below
+about pacing, `.sim` state, drop-ins, and writes applies equally here. Re-run to pick up
+reseeding — the world is a snapshot from launch time.
+
+The capture-corpus form drills the same loop fully offline (no network at all), replaying a
+directory the smoke bin captured earlier:
 
 ```
 scheduler --config examples/fbr-100.toml \
