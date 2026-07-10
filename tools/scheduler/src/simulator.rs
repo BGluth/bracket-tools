@@ -723,7 +723,11 @@ impl SimState {
             let players = occupants.iter().map(|o| o.display_name.as_str()).collect::<Vec<_>>().join(" vs ");
             // Post-propagation, so destination labels carry the opponent
             // already waiting there.
-            let context = sets.iter().find(|s| &s.key == key).map(|s| set_context(sets, s)).unwrap_or_default();
+            let context = sets
+                .iter()
+                .find(|s| &s.key == key)
+                .map(|s| set_context(sets, s))
+                .unwrap_or_default();
             let event = ReplayEvent::Complete {
                 at: clock,
                 bracket: bracket_id.clone(),
