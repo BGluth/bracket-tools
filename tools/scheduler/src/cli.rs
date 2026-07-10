@@ -119,8 +119,9 @@ pub struct Cli {
     pub init_tournament: Option<String>,
 
     /// Run a tournament initialized with --init-tournament: resolves the
-    /// config at <config-dir>/tournaments/<slug>.toml (a unique prefix of
-    /// the slug works too).
+    /// config at <config-dir>/tournaments/<slug>.toml. Accepts the same
+    /// forms as --init-tournament (full start.gg URL, tournament/<slug>, or
+    /// the bare slug); a unique prefix of the slug works too.
     #[arg(
         long,
         value_name = "SLUG",

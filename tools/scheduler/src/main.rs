@@ -106,9 +106,21 @@ fn build_offline_source(cli: &Cli) -> anyhow::Result<FixtureSource> {
     }
 }
 
+/// The bare slug a `--tournament` lookup uses: full start.gg URLs and
+/// `tournament/<slug>` normalize exactly like `--init-tournament`'s input;
+/// anything unparseable stays as typed (it may be a filename prefix).
+fn normalize_tournament_input(input: &str) -> String {
+    match parse_tournament_slug(input) {
+        Ok(pinned) => pinned.strip_prefix("tournament/").unwrap_or(&pinned).to_owned(),
+        Err(_) => input.trim().to_owned(),
+    }
+}
+
 /// Resolves `--tournament <slug>` to its config under the tournaments dir;
 /// a unique filename prefix also works. Misses list what is available.
-fn tournament_config_path(slug: &str) -> anyhow::Result<PathBuf> {
+fn tournament_config_path(input: &str) -> anyhow::Result<PathBuf> {
+    let slug = normalize_tournament_input(input);
+    let slug = slug.as_str();
     let dir = tournaments_dir();
     let exact = dir.join(format!("{slug}.toml"));
     if exact.exists() {
@@ -783,7 +795,20 @@ mod world_tag_tests {
     use bracket_tools_scheduler::config::BracketConfig;
     use clap::Parser;
 
-    use super::{world_tag, Cli, SchedulerConfig};
+    use super::{normalize_tournament_input, world_tag, Cli, SchedulerConfig};
+
+    #[test]
+    fn tournament_lookup_accepts_init_style_inputs() {
+        for input in [
+            "https://www.start.gg/tournament/french-bread-rumble-100/events",
+            "tournament/french-bread-rumble-100",
+            "french-bread-rumble-100",
+        ] {
+            assert_eq!(normalize_tournament_input(input), "french-bread-rumble-100", "{input}");
+        }
+        // A partial slug stays as typed (prefix matching handles it).
+        assert_eq!(normalize_tournament_input("french"), "french");
+    }
 
     #[test]
     fn tags_follow_synth_spec_then_tournament_then_legacy() {
