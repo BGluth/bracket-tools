@@ -116,7 +116,7 @@ fn draw_setup_strip(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: Un
 
 fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMillis) {
     let header = Row::new([
-        "#", "setup", "bracket", "round", "players", "depth", "iron", "unblk", "wait", "poll",
+        "#", "setup", "bracket", "round", "players", "score", "depth", "iron", "unblk", "wait", "poll",
     ])
     .style(Style::new().add_modifier(Modifier::BOLD));
     let rows = state.world.queue.iter().enumerate().map(|(ix, entry)| {
@@ -128,6 +128,7 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMill
             short_name(&entry.bracket).to_owned(),
             entry.round_text.clone(),
             entry.players.clone(),
+            format!("{:.0}", entry.candidate.score),
             components.depth.to_string(),
             components.ironman.to_string(),
             components.unblock.to_string(),
@@ -146,6 +147,7 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMill
         Constraint::Length(14),
         Constraint::Length(18),
         Constraint::Min(24),
+        Constraint::Length(6),
         Constraint::Length(5),
         Constraint::Length(4),
         Constraint::Length(5),
