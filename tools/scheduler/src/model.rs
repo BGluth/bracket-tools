@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 
 /// The observed live `prereqType` vocabulary (S1 smoke). Only [`PREREQ_TYPE_SET`]
 /// creates a bracket edge; everything else is pre-satisfied.
+/// The tag without its sponsor/team prefix ("KBN | Crouton" → "Crouton").
+/// Display-only — conflict keys and the identity scan keep the full name.
+pub fn strip_sponsor(name: &str) -> &str {
+    name.rsplit_once(" | ").map_or(name, |(_, tag)| tag)
+}
+
 pub const PREREQ_TYPE_SET: &str = "set";
 pub const PREREQ_TYPE_SEED: &str = "seed";
 
@@ -357,6 +363,15 @@ mod tests {
     };
 
     use super::{live_set_from_schema, LiveSet, ModelWarning, Prereq, SetId, SetKey, SkipReason};
+
+    #[test]
+    fn strip_sponsor_takes_the_tag_after_the_last_separator() {
+        use super::strip_sponsor;
+        assert_eq!(strip_sponsor("KBN | Crouton"), "Crouton");
+        assert_eq!(strip_sponsor("Crouton"), "Crouton");
+        assert_eq!(strip_sponsor("A | B | Tag"), "Tag");
+        assert_eq!(strip_sponsor(""), "");
+    }
 
     fn schema_set() -> Set {
         Set {

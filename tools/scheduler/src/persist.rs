@@ -52,6 +52,10 @@ pub struct OverlayDoc {
     /// pre-reporting overlays still load.
     #[serde(default)]
     pub last_characters: Vec<(String, i32)>,
+    /// Display toggle (`t`): sponsor prefixes hidden. Serde default so
+    /// pre-existing overlays load.
+    #[serde(default)]
+    pub hide_sponsors: bool,
     pub called_ints: Vec<i32>,
     pub in_progress_ints: Vec<i32>,
     pub soft_busy: Vec<(BracketId, SetKey)>,
@@ -304,6 +308,7 @@ mod tests {
     fn sample_doc() -> OverlayDoc {
         OverlayDoc {
             last_characters: Vec::new(),
+            hide_sponsors: false,
             version: OVERLAY_VERSION,
             board: SetupBoard::new(&[SetupId(1), SetupId(2)]),
             flags: Default::default(),

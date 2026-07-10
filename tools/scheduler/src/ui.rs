@@ -17,11 +17,11 @@ use ratatui::{
 
 use crate::{
     app::{
-        blocked_entries, filtered_roster, flag_label, picker_rows, reassign_options, report_roster, setups_rows, AppState, ListView, Modal,
-        NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, SetupsRow, Side,
+        blocked_entries, filtered_roster, find_set_rows, flag_label, picker_rows, reassign_options, report_roster, setups_rows, AppState,
+        ListView, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, SetupsRow, Side,
     },
     conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
-    model::{BracketId, SetKey},
+    model::{strip_sponsor, BracketId, SetKey},
     world::RolloutRow,
 };
 
@@ -67,6 +67,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
         Some(Modal::PlayerFlags { players, selected }) => draw_player_flags(frame, state, players, *selected),
         Some(Modal::Reassign { setup, selected }) => draw_reassign(frame, state, *setup, *selected),
         Some(Modal::Setups { selected }) => draw_setups(frame, state, *selected),
+        Some(Modal::FindSet { query, selected }) => draw_find_set(frame, state, query, *selected),
         Some(Modal::Report(draft)) => draw_report(frame, state, draft),
         Some(Modal::Help) => draw_help(frame),
         None => {}
@@ -141,7 +142,7 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMill
             setups,
             short_name(&entry.bracket).to_owned(),
             entry.round_text.clone(),
-            entry.players.clone(),
+            show_players(state, &entry.players),
             format!("{:.0}", entry.candidate.score),
             components.depth.to_string(),
             components.ironman.to_string(),
@@ -330,7 +331,7 @@ fn draw_call_picker(
                     format!("{}", ix + 1),
                     short_name(&entry.bracket).to_owned(),
                     entry.round_text.clone(),
-                    entry.players.clone(),
+                    show_players(state, &entry.players),
                     components.depth.to_string(),
                     components.ironman.to_string(),
                     components.unblock.to_string(),
@@ -556,7 +557,7 @@ fn draw_notices(frame: &mut Frame<'_>, state: &AppState, selected: usize, now: U
         Constraint::Min(40),
     ];
     let unread = state.notices.iter().filter(|n| !n.acked && n.level != NoticeLevel::Info).count();
-    let title = format!("Notices ({unread} unread) — Enter acks, Esc closes");
+    let title = format!("Notices ({unread} unread) — Enter acks, c clears all, Esc closes");
     render_with_selection(
         frame,
         area,
@@ -709,7 +710,18 @@ fn draw_setups(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
             row
         }
     });
-    let title = "Stations — Enter retires (free only) / adds, Esc closes";
+    let title = if state.ui.setups_count_entry.is_empty() {
+        "Stations — Enter retires (free only) / adds · digits set a count · Esc closes".to_owned()
+    } else {
+        let target_type = match setups_rows(state).into_iter().nth(selected) {
+            Some(SetupsRow::Retire(_, ty) | SetupsRow::Add(ty)) => ty,
+            None => "?".to_owned(),
+        };
+        format!(
+            "Stations — set {target_type} to {}_ stations (Enter applies)",
+            state.ui.setups_count_entry
+        )
+    };
     render_with_selection(
         frame,
         area,
@@ -743,20 +755,63 @@ fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(Confli
     );
 }
 
+fn draw_find_set(frame: &mut Frame<'_>, state: &AppState, query: &str, selected: usize) {
+    let area = centered_rect(frame.area(), 60, 60);
+    frame.render_widget(Clear, area);
+
+    let rows = find_set_rows(state, query).into_iter().enumerate().map(|(ix, row)| {
+        let cells = [
+            format!("{}", row.setup.0),
+            row.status.to_owned(),
+            short_name(&row.bracket).to_owned(),
+            row.round_text,
+            row.players,
+        ];
+        let row = Row::new(cells);
+        if ix == selected {
+            row.style(SELECTED)
+        } else {
+            row
+        }
+    });
+    let title = format!("Find set — filter: {query}_ (Enter reports, Esc closes)");
+    render_with_selection(
+        frame,
+        area,
+        Table::new(
+            rows,
+            [
+                Constraint::Length(3),
+                Constraint::Length(7),
+                Constraint::Length(12),
+                Constraint::Length(18),
+                Constraint::Min(20),
+            ],
+        )
+        .block(Block::bordered().title(title)),
+        selected,
+        &state.ui.modal_view,
+    );
+}
+
 fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
     let area = centered_rect(frame.area(), 60, 60);
     frame.render_widget(Clear, area);
 
     let best_of = draft.best_of.map(|n| format!(" (Bo{n})")).unwrap_or_default();
-    let title = format!("Report — {} vs {}{best_of}", draft.left.name, draft.right.name);
+    let title = format!(
+        "Report — {} vs {}{best_of}",
+        show_tag(state, &draft.left.name),
+        show_tag(state, &draft.right.name)
+    );
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.push(Line::from(format!(
         "score: {} {} — {} {}",
-        draft.left.name,
+        show_tag(state, &draft.left.name),
         draft.wins(Side::Left),
         draft.wins(Side::Right),
-        draft.right.name
+        show_tag(state, &draft.right.name)
     )));
     for (ix, game) in draft.games.iter().enumerate() {
         let chars = match (game.chars[0], game.chars[1]) {
@@ -767,7 +822,12 @@ fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
                 character_name(state, draft, &game.chars, Side::Right)
             ),
         };
-        let line = Line::from(format!("game {}: {}{}", ix + 1, draft.side(game.winner).name, chars));
+        let line = Line::from(format!(
+            "game {}: {}{}",
+            ix + 1,
+            show_tag(state, &draft.side(game.winner).name),
+            chars
+        ));
         // The cursor marks which game `c` re-characters (that game onward).
         let targeted = matches!(draft.stage, ReportStage::Games) && ix == draft.game_cursor;
         lines.push(if targeted { line.style(SELECTED) } else { line });
@@ -783,7 +843,11 @@ fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
 
     match &draft.stage {
         ReportStage::Games => {
-            lines.push(Line::from(format!("1 = {} won · 2 = {} won", draft.left.name, draft.right.name)));
+            lines.push(Line::from(format!(
+                "1 = {} won · 2 = {} won",
+                show_tag(state, &draft.left.name),
+                show_tag(state, &draft.right.name)
+            )));
             let chars_hint = if draft.games.len() > 1 {
                 format!("c characters (game {}+, Up/Down aim)", draft.game_cursor + 1)
             } else {
@@ -819,7 +883,7 @@ fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
         }
         ReportStage::Confirm { dq } => {
             lines.push(Line::from(format!("submit: {}?", draft.summary(*dq))).style(Style::new().add_modifier(Modifier::BOLD)));
-            lines.push(Line::from("y/Enter submit · Esc back"));
+            lines.push(Line::from("y/Enter submit · Esc back (add more games)"));
         }
     }
 
@@ -853,12 +917,14 @@ fn draw_help(frame: &mut Frame<'_>) {
         "f         selected setup: free, awaiting remote result",
         "r         selected setup: un-call, set returns to the queue",
         "g         report the selected setup's set (games + characters + DQ)",
+        "/         find an on-station set by player name (Enter reports it)",
+        "t         toggle sponsor prefixes on player names",
         "z         snooze the highlighted queue entry (5m)",
         "d         player flags for the highlighted entry (rest/depart)",
         "a         reassign the selected setup's pool (redeploy)",
         "s         stations: add/retire setups mid-event",
         "i         inspect blocked sets (why not callable)",
-        "n         notices page (Enter acks)",
+        "n         notices page (Enter acks, c clears all)",
         "w         pending writes + divergence ledger",
         "Up/Down   move the queue highlight (PgUp/PgDn jump 10)",
         "u         undo the last local action (single level)",
@@ -871,6 +937,23 @@ fn draw_help(frame: &mut Frame<'_>) {
     frame.render_widget(help, area);
 }
 
+/// Sponsor-prefix-aware display of one tag (`t` toggle).
+fn show_tag<'a>(state: &AppState, name: &'a str) -> &'a str {
+    if state.hide_sponsors {
+        strip_sponsor(name)
+    } else {
+        name
+    }
+}
+
+/// The toggle applied to an already-joined "A vs B" string.
+fn show_players(state: &AppState, joined: &str) -> String {
+    if !state.hide_sponsors {
+        return joined.to_owned();
+    }
+    joined.split(" vs ").map(strip_sponsor).collect::<Vec<_>>().join(" vs ")
+}
+
 fn players_for(state: &AppState, bracket: &BracketId, key: &crate::model::SetKey) -> String {
     state
         .brackets
@@ -879,7 +962,7 @@ fn players_for(state: &AppState, bracket: &BracketId, key: &crate::model::SetKey
         .and_then(|b| b.state.sets.iter().find(|s| &s.key == key))
         .map(|set| {
             set.occupants()
-                .map(|o| truncate(&o.display_name, 10))
+                .map(|o| truncate(show_tag(state, &o.display_name), 10))
                 .collect::<Vec<_>>()
                 .join(" v ")
         })

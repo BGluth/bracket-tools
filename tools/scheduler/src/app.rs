@@ -17,13 +17,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{referenced_types, resolve_roster, BracketMode, SchedulerConfig, SetupId, FALLBACK_SETUPS_PER_TYPE},
+    config::{referenced_types, resolve_roster, BracketMode, CallAction, SchedulerConfig, SetupId, FALLBACK_SETUPS_PER_TYPE},
     conflict::{
         callable, effective_pool, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView, CallableSet, ConflictIndex,
         ConflictInputs, ConflictKey, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones, UnixMillis,
     },
     duration::{diff_snapshots, DurationModel},
-    model::{BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
+    model::{strip_sponsor, BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
     persist::{BracketSnapshot, OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     ranker::GreedyRanker,
     world::{assigned_sets, recompute, BracketState, QueueEntry, RolloutRankings, RolloutRow, SimSnapshot, World, WorldInputs},
@@ -261,6 +261,12 @@ pub enum Modal {
     },
     /// Game-by-game set reporting for the selected setup's set (`g`).
     Report(Box<ReportDraft>),
+    /// `/`: case-insensitive player-name filter over every on-station set;
+    /// Enter opens the report modal for the selected one.
+    FindSet {
+        query: String,
+        selected: usize,
+    },
     Help,
 }
 
@@ -463,6 +469,9 @@ pub struct UiState {
     /// Enter, on becoming unambiguous, or on the next tick past the grace
     /// window.
     pub setup_entry: Option<PendingSetupEntry>,
+    /// Digits typed in the stations modal toward a per-type target count;
+    /// Enter applies it to the highlighted row's type.
+    pub setups_count_entry: String,
 }
 
 /// A partially-typed setup number (boards past ten stations need two keys).
@@ -612,6 +621,9 @@ pub struct AppState {
     no_show_alerted: HashSet<(BracketId, SetKey)>,
 
     pub world: World,
+    /// Display polish: strip "SPONSOR | " team prefixes off player tags
+    /// everywhere names render (`t` toggles; persisted in the overlay).
+    pub hide_sponsors: bool,
     /// Latest background rollout evaluation (the call-picker's preferred
     /// ranking source; greedy is the fallback and the permanent revert).
     pub rollout: Option<RolloutRankings>,
@@ -686,6 +698,7 @@ impl AppState {
             clock_offset: None,
             no_show_alerted: HashSet::new(),
             world: World::default(),
+            hide_sponsors: false,
             rollout: None,
             rollout_pending: None,
             dirty: false,
@@ -740,6 +753,7 @@ impl AppState {
             callable_since: self.callable_since.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             called_at: flatten_pair_map(&self.called_at),
             last_characters: self.last_characters.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            hide_sponsors: self.hide_sponsors,
             called_ints: self.called_ints.clone(),
             in_progress_ints: self.in_progress_ints.clone(),
             soft_busy: self.soft_busy.clone(),
@@ -825,6 +839,7 @@ impl AppState {
         self.callable_since = doc.callable_since.into_iter().collect();
         self.called_at = doc.called_at.into_iter().map(|(b, k, v)| ((b, k), v)).collect();
         self.last_characters = doc.last_characters.into_iter().collect();
+        self.hide_sponsors = doc.hide_sponsors;
         // Union so a config pin added since the last run is never dropped.
         merge_ints(&mut self.called_ints, doc.called_ints);
         merge_ints(&mut self.in_progress_ints, doc.in_progress_ints);
@@ -1042,13 +1057,31 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
         KeyCode::Char('r') => requeue_selected(state, now, effects),
         KeyCode::Char('z') => snooze_selected(state, now),
         KeyCode::Char('u') => undo(state, now),
-        KeyCode::Char('s') => state.ui.modal = Some(Modal::Setups { selected: 0 }),
+        KeyCode::Char('s') => {
+            state.ui.setups_count_entry.clear();
+            state.ui.modal = Some(Modal::Setups { selected: 0 });
+        }
         KeyCode::Char('i') => state.ui.modal = Some(Modal::Inspection { selected: 0 }),
         KeyCode::Char('n') => state.ui.modal = Some(Modal::Notices { selected: 0 }),
         KeyCode::Char('w') => state.ui.modal = Some(Modal::PendingWrites { selected: 0 }),
         KeyCode::Char('d') => open_flags_modal(state, now),
         KeyCode::Char('a') => open_reassign_modal(state, now),
         KeyCode::Char('g') => open_report_modal(state, now),
+        KeyCode::Char('/') => {
+            state.ui.modal = Some(Modal::FindSet {
+                query: String::new(),
+                selected: 0,
+            })
+        }
+        KeyCode::Char('t') => {
+            state.hide_sponsors = !state.hide_sponsors;
+            let text = if state.hide_sponsors {
+                "sponsor prefixes hidden (t restores)"
+            } else {
+                "sponsor prefixes shown"
+            };
+            state.notice(now, NoticeLevel::Info, text);
+        }
         KeyCode::Up => state.ui.queue_ix = state.ui.queue_ix.saturating_sub(1),
         KeyCode::Down => {
             state.ui.queue_ix = (state.ui.queue_ix + 1).min(state.world.queue.len().saturating_sub(1));
@@ -1112,6 +1145,10 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
         }
         Some(Modal::Notices { selected }) => match key.code {
             KeyCode::Enter => ack_notice(state, selected),
+            KeyCode::Char('c') => {
+                state.notices.clear();
+                state.ui.modal = Some(Modal::Notices { selected: 0 });
+            }
             code => match scroll(state, code, selected, state.notices.len()) {
                 Some(next) => state.ui.modal = Some(Modal::Notices { selected: next }),
                 None => state.ui.modal = None,
@@ -1139,8 +1176,34 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
                 None => state.ui.modal = None,
             },
         },
+        Some(Modal::FindSet { mut query, selected }) => match key.code {
+            KeyCode::Enter => open_found_set(state, selected, &query, now),
+            KeyCode::Char(c) => {
+                query.push(c);
+                state.ui.modal = Some(Modal::FindSet { query, selected: 0 });
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                state.ui.modal = Some(Modal::FindSet { query, selected: 0 });
+            }
+            code => match scroll(state, code, selected, find_set_rows(state, &query).len()) {
+                Some(next) => state.ui.modal = Some(Modal::FindSet { query, selected: next }),
+                None => state.ui.modal = None,
+            },
+        },
         Some(Modal::Setups { selected }) => match key.code {
-            KeyCode::Enter => apply_setups_row(state, selected, now, effects),
+            KeyCode::Char(c @ '0'..='9') if state.ui.setups_count_entry.len() < 3 => {
+                state.ui.setups_count_entry.push(c);
+                state.ui.modal = Some(Modal::Setups { selected });
+            }
+            KeyCode::Backspace if !state.ui.setups_count_entry.is_empty() => {
+                state.ui.setups_count_entry.pop();
+                state.ui.modal = Some(Modal::Setups { selected });
+            }
+            KeyCode::Enter => match std::mem::take(&mut state.ui.setups_count_entry).parse::<u32>() {
+                Ok(target) => apply_setups_count(state, selected, target, now, effects),
+                Err(_) => apply_setups_row(state, selected, now, effects),
+            },
             code => match scroll(state, code, selected, setups_rows(state).len()) {
                 Some(next) => state.ui.modal = Some(Modal::Setups { selected: next }),
                 None => state.ui.modal = None,
@@ -1304,20 +1367,91 @@ fn commit_entry(state: &mut AppState, setup: SetupId, entry: QueueEntry, now: Un
     }
 
     push_undo(state, format!("call {} on setup {}", entry.players, setup.0));
-    state.board.set_status(
-        setup,
-        SetupStatus::Called {
-            bracket: entry.bracket.clone(),
-            set: entry.key.clone(),
-        },
-    );
+    let (status, kind, verb) = match state.config.call_action {
+        CallAction::Called => (
+            SetupStatus::Called {
+                bracket: entry.bracket.clone(),
+                set: entry.key.clone(),
+            },
+            WriteKind::Called,
+            "called",
+        ),
+        // Chaotic-event mode: the call seats players directly, so the set is
+        // started the moment it's committed (and never no-show-alerts).
+        CallAction::InProgress => (
+            SetupStatus::InProgress {
+                bracket: entry.bracket.clone(),
+                set: entry.key.clone(),
+            },
+            WriteKind::InProgress,
+            "started",
+        ),
+    };
+    state.board.set_status(setup, status);
     state.called_at.insert((entry.bracket.clone(), entry.key.clone()), now);
     state.ui.selected_setup = Some(setup);
     state.dirty = true;
 
-    enqueue_write(state, effects, &entry.bracket, &entry.key, &entry.id.0, WriteKind::Called, now);
-    let text = format!("called {} ({}) on setup {}", entry.players, entry.round_text, setup.0);
+    enqueue_write(state, effects, &entry.bracket, &entry.key, &entry.id.0, kind, now);
+    let text = format!("{verb} {} ({}) on setup {}", entry.players, entry.round_text, setup.0);
     state.notice(now, NoticeLevel::Info, text);
+}
+
+/// One on-station set for the `/` finder.
+#[derive(Debug, Clone)]
+pub struct FindRow {
+    pub setup: SetupId,
+    pub players: String,
+    pub round_text: String,
+    pub bracket: BracketId,
+    pub status: &'static str,
+}
+
+/// Every Called/InProgress station whose players match the filter, in board
+/// order. Matching is a case-insensitive substring over the FULL names (a
+/// sponsor still finds its players while prefixes are display-hidden).
+pub fn find_set_rows(state: &AppState, query: &str) -> Vec<FindRow> {
+    let needle = query.to_lowercase();
+    state
+        .board
+        .setups()
+        .iter()
+        .filter_map(|s| {
+            let (status, bracket, set) = match &s.status {
+                SetupStatus::Called { bracket, set } => ("called", bracket, set),
+                SetupStatus::InProgress { bracket, set } => ("playing", bracket, set),
+                _ => return None,
+            };
+            let live = state.find_set(bracket, set)?;
+            let full: Vec<&str> = live.occupants().map(|o| o.display_name.as_str()).collect();
+            if !needle.is_empty() && !full.join(" vs ").to_lowercase().contains(&needle) {
+                return None;
+            }
+            let shown: Vec<&str> = if state.hide_sponsors {
+                full.iter().map(|name| strip_sponsor(name)).collect()
+            } else {
+                full
+            };
+            Some(FindRow {
+                setup: s.id,
+                players: shown.join(" vs "),
+                round_text: live.full_round_text.clone().unwrap_or_else(|| format!("Round {}", set.round)),
+                bracket: bracket.clone(),
+                status,
+            })
+        })
+        .collect()
+}
+
+/// Enter in the finder: jump the selection to that station and open the
+/// ordinary report modal on it (same gating as `g`).
+fn open_found_set(state: &mut AppState, selected: usize, query: &str, now: UnixMillis) {
+    let Some(row) = find_set_rows(state, query).into_iter().nth(selected) else {
+        return;
+    };
+    state.ui.modal = None;
+    state.ui.selected_setup = Some(row.setup);
+    open_report_modal(state, now);
 }
 
 /// The status the hot keys act on, with its set identity.
@@ -1612,6 +1746,65 @@ fn apply_setups_row(state: &mut AppState, selected: usize, now: UnixMillis, effe
     });
 }
 
+/// Typed-count form of the stations modal: adds or retires (free stations,
+/// highest placard first) until the highlighted row's type has `target`
+/// stations. Occupied stations never retire — the shortfall warns instead.
+fn apply_setups_count(state: &mut AppState, selected: usize, target: u32, now: UnixMillis, effects: &mut UpdateEffects) {
+    let setup_type = match setups_rows(state).get(selected) {
+        Some(SetupsRow::Retire(_, ty) | SetupsRow::Add(ty)) => ty.clone(),
+        None => return,
+    };
+    let count = state.board.setups().iter().filter(|s| s.setup_type == setup_type).count() as u32;
+    if count == target {
+        state.notice(now, NoticeLevel::Info, format!("{setup_type}: already {target} stations"));
+        return;
+    }
+
+    push_undo(state, format!("set {setup_type} stations to {target}"));
+    let mut kept_occupied = 0u32;
+    if target > count {
+        for _ in 0..(target - count) {
+            let id = state.board.lowest_unused_id();
+            state.board.add_setup(id, setup_type.clone());
+        }
+    } else {
+        let mut frees: Vec<SetupId> = state
+            .board
+            .setups()
+            .iter()
+            .filter(|s| s.setup_type == setup_type && s.status == SetupStatus::Free)
+            .map(|s| s.id)
+            .collect();
+        frees.sort_unstable();
+        let mut remaining = count;
+        for id in frees.into_iter().rev() {
+            if remaining <= target {
+                break;
+            }
+            state.board.remove_setup(id);
+            state.pool_overrides.remove(&id);
+            if state.ui.selected_setup == Some(id) {
+                state.ui.selected_setup = None;
+            }
+            remaining -= 1;
+        }
+        kept_occupied = remaining.saturating_sub(target);
+    }
+
+    state.dirty = true;
+    effects.want_sim(SimUrgency::Immediate);
+    let final_count = state.board.setups().iter().filter(|s| s.setup_type == setup_type).count();
+    state.notice(now, NoticeLevel::Info, format!("{setup_type}: {final_count} stations"));
+    if kept_occupied > 0 {
+        let text = format!("{kept_occupied} occupied {setup_type} station(s) kept — free them (f/r) and re-enter the count");
+        state.notice(now, NoticeLevel::Warn, text);
+    }
+    let len = setups_rows(state).len();
+    state.ui.modal = Some(Modal::Setups {
+        selected: selected.min(len.saturating_sub(1)),
+    });
+}
+
 fn retire_setup(state: &mut AppState, id: SetupId, now: UnixMillis, effects: &mut UpdateEffects) {
     let Some(setup) = state.board.setups().iter().find(|s| s.id == id) else {
         return;
@@ -1639,13 +1832,6 @@ fn add_setup_station(state: &mut AppState, setup_type: String, now: UnixMillis, 
     let id = state.board.lowest_unused_id();
     push_undo(state, format!("add setup {}", id.0));
     state.board.add_setup(id, setup_type.clone());
-    if id.0 > 10 {
-        let text = format!(
-            "setup {} is beyond digit selection (1-9, 0 = 10) — free/retire a lower number to use it",
-            id.0
-        );
-        state.notice(now, NoticeLevel::Warn, text);
-    }
     state.dirty = true;
     effects.want_sim(SimUrgency::Immediate);
     state.notice(now, NoticeLevel::Info, format!("added setup {} ({setup_type})", id.0));
@@ -1781,10 +1967,13 @@ fn record_game(state: &mut AppState, mut draft: ReportDraft, winner: Side) {
     // A new game assumes the previous game's characters (the TO edits the
     // exceptions).
     let chars = draft.games.last().map_or(draft.chars, |g| g.chars);
+    let already_clinched = draft.clinched();
     draft.games.push(GameDraft { winner, chars });
     draft.game_cursor = draft.games.len() - 1;
-    // A clinched best-of needs no further entry; jump to the summary.
-    if draft.clinched() {
+    // Reaching the clinch jumps to the summary — but only on the transition,
+    // so stepping back (Esc) to record extra games (the best-of assumption
+    // was wrong, or a mid-set format change) keeps accepting taps.
+    if draft.clinched() && !already_clinched {
         draft.stage = ReportStage::Confirm { dq: None };
     }
     state.ui.modal = Some(Modal::Report(Box::new(draft)));
@@ -2465,11 +2654,12 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        recompute_world, setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus, PollFailure, PollOutcome,
-        PollResult, SetupsRow, SimUrgency, StructureUpdate, WriteIntent, WriteKind, WriteOutcome, WriteResult, WORLD_REFRESH_MS,
+        find_set_rows, recompute_world, setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus,
+        PollFailure, PollOutcome, PollResult, SetupsRow, SimUrgency, StructureUpdate, WriteIntent, WriteKind, WriteOutcome, WriteResult,
+        WORLD_REFRESH_MS,
     };
     use crate::{
-        config::{BracketConfig, BracketMode, OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
+        config::{BracketConfig, BracketMode, CallAction, OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
         conflict::{BlockReason, PoolOverride, SetupBoard, SetupStatus},
         fixture_source::FixtureSource,
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
@@ -2594,6 +2784,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn call_action_in_progress_starts_sets_immediately() {
+        let mut state = se4_app(true);
+        state.config.call_action = CallAction::InProgress;
+        let effects = call_top_candidate(&mut state, '1');
+
+        assert!(
+            matches!(state.board.setups()[0].status, SetupStatus::InProgress { .. }),
+            "{:?}",
+            state.board.setups()[0].status
+        );
+        assert_eq!(effects.writes.len(), 1);
+        assert_eq!(effects.writes[0].kind, WriteKind::InProgress);
+        // The call moment is still the duration anchor.
+        assert_eq!(state.called_at.len(), 1);
+        // In-progress stations never no-show-alert.
+        update(&mut state, Msg::Tick, NOW + 100 * 60 * 1000);
+        assert!(state.no_show_alerted.is_empty());
+    }
+
+    #[test]
+    fn clinch_backstep_keeps_accepting_games() {
+        let mut state = reporting_app();
+        match &mut state.ui.modal {
+            Some(Modal::Report(d)) => d.best_of = Some(3),
+            _ => unreachable!(),
+        }
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        assert!(
+            matches!(draft(&state).stage, super::ReportStage::Confirm { dq: None }),
+            "clinch jumps once"
+        );
+
+        // It was really a Bo5: step back and record the remaining games.
+        update(&mut state, key(KeyCode::Esc), NOW);
+        for _ in 0..3 {
+            update(&mut state, key(KeyCode::Char('2')), NOW);
+            assert!(
+                matches!(draft(&state).stage, super::ReportStage::Games),
+                "already-clinched drafts stay on the game taps"
+            );
+        }
+        assert_eq!(draft(&state).games.len(), 5);
+
+        update(&mut state, key(KeyCode::Enter), NOW);
+        let (right_entrant, summary) = match &state.ui.modal {
+            Some(Modal::Report(d)) => (d.right.entrant_id.clone(), d.summary(None)),
+            other => panic!("expected confirm, got {other:?}"),
+        };
+        assert!(summary.contains("3-2"), "{summary}");
+        let effects = update(&mut state, key(KeyCode::Char('y')), NOW);
+        assert_eq!(
+            report_payload(&effects).winner_entrant_id,
+            Some(right_entrant),
+            "extra games can flip the winner"
+        );
+    }
+
+    #[test]
+    fn find_set_modal_filters_and_opens_the_report() {
+        let mut state = se4_app(true);
+        call_top_candidate(&mut state, '1');
+
+        update(&mut state, key(KeyCode::Char('/')), NOW);
+        assert!(matches!(state.ui.modal, Some(Modal::FindSet { .. })));
+        let rows = find_set_rows(&state, "");
+        assert_eq!(rows.len(), 1, "one on-station set: {rows:?}");
+        let called_setup = rows[0].setup;
+
+        // A miss keeps the modal open; Enter on a miss is a no-op.
+        update(&mut state, key(KeyCode::Char('z')), NOW);
+        update(&mut state, key(KeyCode::Char('z')), NOW);
+        assert!(find_set_rows(&state, "zz").is_empty());
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert!(matches!(state.ui.modal, Some(Modal::FindSet { .. })));
+
+        // Trim back to a hit and report it.
+        update(&mut state, key(KeyCode::Backspace), NOW);
+        update(&mut state, key(KeyCode::Backspace), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        match &state.ui.modal {
+            Some(Modal::Report(d)) => assert_eq!(d.setup, called_setup),
+            other => panic!("expected the report modal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sponsor_toggle_flips_and_rides_the_overlay() {
+        let mut state = se4_app(true);
+        update(&mut state, key(KeyCode::Char('t')), NOW);
+        assert!(state.hide_sponsors);
+        assert!(state.to_overlay().hide_sponsors);
+
+        let doc = state.to_overlay();
+        let mut fresh = se4_app(true);
+        fresh.apply_overlay(doc, NOW, true);
+        assert!(fresh.hide_sponsors);
+
+        update(&mut state, key(KeyCode::Char('t')), NOW);
+        assert!(!state.hide_sponsors);
+    }
+
+    #[test]
+    fn setups_count_entry_sets_a_type_total() {
+        let mut state = se4_app(true);
+        assert_eq!(state.board.setups().len(), 2);
+
+        // 6 on the highlighted (default-type) row: adds four stations.
+        update(&mut state, key(KeyCode::Char('s')), NOW);
+        update(&mut state, key(KeyCode::Char('6')), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(state.board.setups().len(), 6);
+        assert!(matches!(state.ui.modal, Some(Modal::Setups { .. })), "modal stays for batch edits");
+
+        // Occupy a station, then ask for 1: free stations retire, the
+        // occupied one is kept with a warning.
+        update(&mut state, key(KeyCode::Esc), NOW);
+        call_top_candidate(&mut state, '1');
+        update(&mut state, key(KeyCode::Char('s')), NOW);
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(state.board.setups().len(), 1, "{:?}", state.board.setups());
+        assert!(
+            !matches!(state.board.setups()[0].status, SetupStatus::Free),
+            "the occupied station survives"
+        );
+
+        update(&mut state, key(KeyCode::Char('0')), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        assert_eq!(state.board.setups().len(), 1);
+        assert!(state.notices.iter().any(|n| n.text.contains("occupied")), "shortfall warns");
+    }
+
+    #[test]
+    fn notices_clear_from_the_modal() {
+        let mut state = se4_app(true);
+        update(&mut state, key(KeyCode::Char('t')), NOW);
+        update(&mut state, key(KeyCode::Char('t')), NOW);
+        assert!(state.notices.len() >= 2);
+
+        update(&mut state, key(KeyCode::Char('n')), NOW);
+        update(&mut state, key(KeyCode::Char('c')), NOW);
+        assert!(state.notices.is_empty());
+        assert!(matches!(state.ui.modal, Some(Modal::Notices { .. })));
     }
 
     fn call_top_candidate(state: &mut AppState, setup_digit: char) -> super::UpdateEffects {

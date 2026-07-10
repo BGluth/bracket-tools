@@ -138,6 +138,12 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
         events.len()
     );
     let _ = writeln!(out, "tournament_slug = \"{tournament_slug}\"\n");
+    let _ = writeln!(
+        out,
+        "# Chaotic-event option: calls mark sets started immediately (no\n\
+         # called/waiting phase, no no-show alerts).\n\
+         # call_action = \"in_progress\"\n"
+    );
     let _ = write!(
         out,
         "# Per-tournament state (crash recovery + offline cold-start cache).\n\

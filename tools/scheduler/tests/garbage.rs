@@ -181,7 +181,7 @@ fn adversarial_snapshot_survives_the_full_pipeline() {
 
     // Keys, picker, ticks, and rendering must all survive the nonsense.
     render(&state);
-    for key in ['1', 'z', 'u', 'p', 'f', 'r'] {
+    for key in ['1', 'z', 'u', 'p', 'f', 'r', '/', 'x', 't'] {
         update(
             &mut state,
             Msg::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),

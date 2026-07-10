@@ -28,6 +28,11 @@ pub const STARTER_TEMPLATE: &str = r#"# scheduler — starter config (auto-creat
 # sessions never mutate start.gg regardless of token permissions.
 advisor_only = true
 
+# What committing a call marks the set as: "called" (default; players are
+# summoned, `p` marks started on arrival) or "in_progress" (chaotic events:
+# the caller seats players directly — one less keypress, no no-show alerts).
+# call_action = "in_progress"
+
 # How many stations the desk starts with. A single number means one shared
 # pool; stations can be added/retired live in the TUI ('s'), and the counts
 # here are optional — omit them and the last session's roster carries over.
@@ -193,6 +198,11 @@ pub enum OneOrMany {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
     pub brackets: Vec<BracketConfig>,
+    /// What committing a call (Enter / the picker) marks the set as.
+    /// Chaotic events skip the called/waiting phase and go straight to
+    /// started — no no-show alerts, one less keypress per set.
+    #[serde(default)]
+    pub call_action: CallAction,
     /// How many stations of each type the desk starts with. `None` defers to
     /// the persisted roster / defaults file / fallback (see `resolve_roster`).
     #[serde(default)]
@@ -268,6 +278,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             brackets: Vec::new(),
+            call_action: CallAction::default(),
             setups: None,
             player_aliases: Vec::new(),
             rest_window_secs: 0,
@@ -480,6 +491,17 @@ impl BracketConfig {
 }
 
 /// How much scheduling a bracket gets.
+/// The board status + mutation a committed call applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallAction {
+    /// Players are summoned; `p` marks the set started when they arrive.
+    #[default]
+    Called,
+    /// Straight to started (chaotic events: callers seat players directly).
+    InProgress,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BracketMode {
