@@ -1924,7 +1924,7 @@ fn handle_report_key(state: &mut AppState, mut draft: ReportDraft, code: KeyCode
                     draft.stage = ReportStage::Characters {
                         side: Side::Left,
                         filter: String::new(),
-                        cursor: 0,
+                        cursor: character_cursor(state, &draft, Side::Left),
                     };
                 }
                 state.ui.modal = Some(Modal::Report(Box::new(draft)));
@@ -1995,10 +1995,10 @@ fn handle_character_key(state: &mut AppState, mut draft: ReportDraft, side: Side
                 }
                 state.last_characters.insert(draft.side(side).sticky_key.clone(), id);
             }
-            advance_character_stage(&mut draft, side);
+            advance_character_stage(state, &mut draft, side);
         }
         // Tab keeps whatever the side already had (sticky or nothing).
-        KeyCode::Tab => advance_character_stage(&mut draft, side),
+        KeyCode::Tab => advance_character_stage(state, &mut draft, side),
         KeyCode::Up => {
             draft.stage = ReportStage::Characters {
                 side,
@@ -2027,15 +2027,25 @@ fn handle_character_key(state: &mut AppState, mut draft: ReportDraft, side: Side
 }
 
 /// Left picks first, then right, then back to the game taps.
-fn advance_character_stage(draft: &mut ReportDraft, side: Side) {
+fn advance_character_stage(state: &AppState, draft: &mut ReportDraft, side: Side) {
     draft.stage = match side {
         Side::Left => ReportStage::Characters {
             side: Side::Right,
             filter: String::new(),
-            cursor: 0,
+            cursor: character_cursor(state, draft, Side::Right),
         },
         Side::Right => ReportStage::Games,
     };
+}
+
+/// Where the picker's cursor opens: the side's currently-assigned character
+/// (the targeted game's pick, else the set-level sticky one), found in the
+/// unfiltered roster — re-picking after a switch starts from what's on
+/// screen instead of the top of the cast.
+fn character_cursor(state: &AppState, draft: &ReportDraft, side: Side) -> usize {
+    let current = draft.games.get(draft.game_cursor).map_or(draft.chars, |g| g.chars)[side.ix()];
+    let Some(id) = current else { return 0 };
+    report_roster(state, &draft.bracket).iter().position(|c| c.id == id).unwrap_or(0)
 }
 
 /// The roster the report modal picks characters from.
@@ -2948,6 +2958,52 @@ mod tests {
         assert!(state.world.overall_projected_finish.is_none());
         assert!(!state.world.queue.is_empty(), "greedy rankings survive");
         assert!(!snapshot_within_sim_ceiling(&state.sim_snapshot(NOW)));
+    }
+
+    #[test]
+    fn character_picker_opens_on_the_current_pick() {
+        use bracket_tools_startgg::CharacterInfo;
+
+        let bracket = se4();
+        let config = test_config(&[1, 2], &["ultimate"]);
+        let mut boots = bootstrap(vec![("ultimate", &bracket)]);
+        boots[0].characters = (1..=3)
+            .map(|i| CharacterInfo {
+                id: i,
+                name: format!("Char {i}"),
+            })
+            .collect();
+        let mut state = AppState::new(config, true, boots, NOW);
+        call_top_candidate(&mut state, '1');
+        update(&mut state, key(KeyCode::Char('g')), NOW);
+
+        // Nothing picked yet: the cast opens at the top.
+        update(&mut state, key(KeyCode::Char('c')), NOW);
+        assert!(matches!(
+            draft(&state).stage,
+            super::ReportStage::Characters {
+                side: super::Side::Left,
+                cursor: 0,
+                ..
+            }
+        ));
+
+        // Pick the third character for left, keep right unset.
+        update(&mut state, key(KeyCode::Down), NOW);
+        update(&mut state, key(KeyCode::Down), NOW);
+        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(KeyCode::Tab), NOW);
+        assert!(matches!(draft(&state).stage, super::ReportStage::Games));
+
+        // Reopening starts on the current pick, not the top of the cast.
+        update(&mut state, key(KeyCode::Char('c')), NOW);
+        match &draft(&state).stage {
+            super::ReportStage::Characters { side, cursor, .. } => {
+                assert_eq!(*side, super::Side::Left);
+                assert_eq!(*cursor, 2, "cursor opens on Char 3");
+            }
+            other => panic!("expected the character stage, got {other:?}"),
+        }
     }
 
     fn call_top_candidate(state: &mut AppState, setup_digit: char) -> super::UpdateEffects {
