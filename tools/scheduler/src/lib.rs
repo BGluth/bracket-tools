@@ -14,6 +14,7 @@ pub mod ranker;
 pub mod rehearsal;
 pub mod replay;
 pub mod rollout;
+pub mod roster_cache;
 pub mod set_source;
 pub mod simulator;
 #[doc(hidden)]

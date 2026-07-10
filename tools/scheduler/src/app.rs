@@ -78,8 +78,20 @@ pub enum PollOutcome {
         sets: Vec<LiveSet>,
         warnings: Vec<ModelWarning>,
         skipped: Vec<SkippedSet>,
+        /// Present when the poller back-filled structure for an event that
+        /// launched without it (its preflight structure fetch failed, e.g.
+        /// rate limited).
+        structure: Option<StructureUpdate>,
     },
     Failed(PollFailure),
+}
+
+/// A late-arriving event structure (see [`PollOutcome::Snapshot`]).
+#[derive(Debug)]
+pub struct StructureUpdate {
+    pub groups: Vec<PhaseGroupInfo>,
+    /// Unix seconds.
+    pub event_start_at: Option<i64>,
 }
 
 /// The three-bucket read-error classification.
@@ -87,8 +99,12 @@ pub enum PollOutcome {
 pub enum PollFailure {
     /// Connectivity (connect/timeout): likely offline, retry silently.
     Offline,
-    /// Transient server trouble (429/5xx): failed cycle, retry next tick.
+    /// Transient server trouble (5xx): failed cycle, retry next tick.
     Transient,
+    /// The token's start.gg quota window is spent (server 429 or the local
+    /// cross-process gate). The poller retries next tick; preflight waits
+    /// the window out instead of launching the event empty.
+    RateLimited,
     /// Persistent request problem (other 4xx): banner until it changes.
     Persistent(String),
 }
@@ -496,6 +512,7 @@ pub enum PollHealth {
     Ok,
     Offline,
     Transient,
+    RateLimited,
     Persistent(String),
 }
 
@@ -2044,6 +2061,7 @@ fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, effects:
             let health = match &failure {
                 PollFailure::Offline => PollHealth::Offline,
                 PollFailure::Transient => PollHealth::Transient,
+                PollFailure::RateLimited => PollHealth::RateLimited,
                 PollFailure::Persistent(e) => PollHealth::Persistent(e.clone()),
             };
             let escalated = matches!(health, PollHealth::Persistent(_)) && runtime.health != health;
@@ -2053,7 +2071,17 @@ fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, effects:
                 state.notice(now, NoticeLevel::Error, text);
             }
         }
-        PollOutcome::Snapshot { sets, warnings, skipped } => {
+        PollOutcome::Snapshot {
+            sets,
+            warnings,
+            skipped,
+            structure,
+        } => {
+            // Installed even when the snapshot itself is seq-rejected: the
+            // poller stops re-fetching structure once it delivered one.
+            if let Some(update) = structure {
+                install_structure(state, ix, update, now);
+            }
             if poll.seq <= state.brackets[ix].applied_seq {
                 return;
             }
@@ -2072,6 +2100,28 @@ fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, effects:
             }
         }
     }
+}
+
+/// Installs a late-arriving structure into an event that launched without
+/// one. Group kinds drive the depth model, so recovery warrants a recompute.
+fn install_structure(state: &mut AppState, ix: usize, update: StructureUpdate, now: UnixMillis) {
+    if !state.brackets[ix].state.groups.is_empty() || update.groups.is_empty() {
+        return;
+    }
+    {
+        let runtime = &mut state.brackets[ix];
+        runtime.state.groups = update.groups;
+        if runtime.state.start_at.is_none() {
+            runtime.state.start_at = update.event_start_at;
+        }
+    }
+    let text = format!(
+        "{}: structure recovered ({} groups)",
+        state.brackets[ix].state.id.0,
+        state.brackets[ix].state.groups.len()
+    );
+    state.notice(now, NoticeLevel::Info, text);
+    state.dirty = true;
 }
 
 fn apply_snapshot(
@@ -2416,7 +2466,7 @@ mod tests {
 
     use super::{
         recompute_world, setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus, PollFailure, PollOutcome,
-        PollResult, SetupsRow, SimUrgency, WriteIntent, WriteKind, WriteOutcome, WriteResult, WORLD_REFRESH_MS,
+        PollResult, SetupsRow, SimUrgency, StructureUpdate, WriteIntent, WriteKind, WriteOutcome, WriteResult, WORLD_REFRESH_MS,
     };
     use crate::{
         config::{BracketConfig, BracketMode, OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
@@ -2473,12 +2523,51 @@ mod tests {
         AppState::new(config, writes_armed, boots, NOW)
     }
 
+    #[test]
+    fn late_structure_installs_once_with_a_notice() {
+        let bracket = se4();
+        let config = test_config(&[1], &["ultimate"]);
+        let mut boots = bootstrap(vec![("ultimate", &bracket)]);
+        // Launched structure-less (preflight's structure fetch failed).
+        boots[0].groups = Vec::new();
+        let mut state = AppState::new(config, false, boots, NOW);
+        assert!(state.brackets[0].state.groups.is_empty());
+
+        let poll = |seq: u64, start_at: Option<i64>| {
+            Msg::Poll(PollResult {
+                bracket: BracketId("ultimate".to_owned()),
+                seq,
+                captured_at: NOW + seq as i64,
+                outcome: PollOutcome::Snapshot {
+                    structure: Some(StructureUpdate {
+                        groups: vec![bracket.info.clone()],
+                        event_start_at: start_at,
+                    }),
+                    sets: bracket.sets.clone(),
+                    warnings: Vec::new(),
+                    skipped: Vec::new(),
+                },
+            })
+        };
+        update(&mut state, poll(1, Some(123)), NOW + 1);
+        assert_eq!(state.brackets[0].state.groups.len(), 1);
+        assert_eq!(state.brackets[0].state.start_at, Some(123));
+        assert!(state.notices.iter().any(|n| n.text.contains("structure recovered")));
+
+        // Redelivery (e.g. after a poller respawn) is a no-op.
+        update(&mut state, poll(2, Some(456)), NOW + 2);
+        assert_eq!(state.brackets[0].state.start_at, Some(123));
+        let recoveries = state.notices.iter().filter(|n| n.text.contains("structure recovered")).count();
+        assert_eq!(recoveries, 1);
+    }
+
     fn snapshot_msg(bracket: &str, seq: u64, sets: Vec<LiveSet>) -> Msg {
         Msg::Poll(PollResult {
             bracket: BracketId(bracket.to_owned()),
             seq,
             captured_at: NOW + seq as i64 * 30_000,
             outcome: PollOutcome::Snapshot {
+                structure: None,
                 sets,
                 warnings: Vec::new(),
                 skipped: Vec::new(),

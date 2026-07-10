@@ -170,6 +170,7 @@ fn adversarial_snapshot_survives_the_full_pipeline() {
             seq: 1,
             captured_at: NOW,
             outcome: PollOutcome::Snapshot {
+                structure: None,
                 sets: garbage,
                 warnings: Vec::new(),
                 skipped: Vec::new(),
@@ -202,6 +203,7 @@ fn empty_snapshot_after_data_is_tolerated() {
             seq,
             captured_at: NOW + seq as i64 * 1000,
             outcome: PollOutcome::Snapshot {
+                structure: None,
                 sets: Vec::new(),
                 warnings: Vec::new(),
                 skipped: Vec::new(),

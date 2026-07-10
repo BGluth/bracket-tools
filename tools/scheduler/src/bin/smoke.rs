@@ -22,6 +22,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use bracket_tools_cache::null_storage::NullStorage;
+use bracket_tools_scheduler::cli::rate_journal_path;
 use bracket_tools_startgg::{conversions::extract_event_sets_page, types::GGRestToken, GGProvider, STARTGG_API_URL};
 use bracket_tools_startgg_schema::{
     enums::BracketType,
@@ -148,7 +149,10 @@ struct Capture<'a> {
 async fn main() -> Result<()> {
     let args = SmokeArgs::parse();
     let token = resolve_token(&args)?;
-    let provider = GGProvider::builder(token.clone()).page_size(args.per_page).build()?;
+    let provider = GGProvider::builder(token.clone())
+        .page_size(args.per_page)
+        .limit_journal(rate_journal_path(&token))
+        .build()?;
     let raw_client = build_raw_client(&token)?;
     fs::create_dir_all(&args.out).with_context(|| format!("creating {}", args.out.display()))?;
 

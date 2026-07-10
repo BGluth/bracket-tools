@@ -187,8 +187,9 @@ pub fn extract_report_bracket_set(response: ReportBracketSet, reported_id: Start
 }
 
 /// One playable character of an event's videogame. `id` is the numeric
-/// vocabulary `reportBracketSet` selections use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// vocabulary `reportBracketSet` selections use. Serde: rosters are static
+/// per videogame, so callers cache them on disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CharacterInfo {
     pub id: i32,
     pub name: String,

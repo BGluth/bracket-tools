@@ -9,7 +9,7 @@ use bracket_tools_scheduler::{
     fixture_source::{classify_fixture_error, FixtureSource},
     model::{live_sets_from_schema, BracketId},
     poller::{poll_cycle, PollerConfig},
-    preflight::preflight,
+    preflight::{preflight, PreflightEnv},
     rehearsal::install_rehearsal,
     set_source::SetSource,
     ui, SchedulerConfig,
@@ -85,7 +85,15 @@ async fn app_ingests_a_paced_rehearsal_across_poll_cycles() {
     let config = example_config();
     let report = install_rehearsal(&mut source, &config, 60.0, NOW).await.unwrap();
 
-    let pre = preflight(&source, &config, Duration::from_secs(5), false, classify_fixture_error).await;
+    let pre = preflight(
+        &source,
+        &config,
+        Duration::from_secs(5),
+        false,
+        classify_fixture_error,
+        &PreflightEnv::silent(),
+    )
+    .await;
     assert!(pre.fatal.is_none(), "{}", pre.render());
     let mut state = AppState::new(config, pre.writes_armed, pre.into_bootstraps(), NOW);
 
@@ -108,7 +116,7 @@ async fn app_ingests_a_paced_rehearsal_across_poll_cycles() {
     // t0: the initial world — nothing completed, but callable (the whole
     // point of a rehearsal is a drillable opening rush).
     source.rewind_clock(Duration::ZERO);
-    for result in poll_cycle(&source, &events, 1, &poller_config, &classify).await {
+    for result in poll_cycle(&source, &events, 1, &poller_config, &classify, &Default::default()).await {
         update(&mut state, Msg::Poll(result), NOW + 1_000);
     }
     assert_eq!(completed(&state), 0);
@@ -117,7 +125,7 @@ async fn app_ingests_a_paced_rehearsal_across_poll_cycles() {
     // Mid-script: completions have arrived.
     let wall = (report.finishes_at - report.started_at) as u64;
     source.rewind_clock(Duration::from_millis(wall / 2));
-    for result in poll_cycle(&source, &events, 2, &poller_config, &classify).await {
+    for result in poll_cycle(&source, &events, 2, &poller_config, &classify, &Default::default()).await {
         update(&mut state, Msg::Poll(result), NOW + 2_000);
     }
     let midway = completed(&state);
@@ -125,7 +133,7 @@ async fn app_ingests_a_paced_rehearsal_across_poll_cycles() {
 
     // Past the end: the whole corpus has played out.
     source.rewind_clock(Duration::from_millis(wall + 1_000));
-    for result in poll_cycle(&source, &events, 3, &poller_config, &classify).await {
+    for result in poll_cycle(&source, &events, 3, &poller_config, &classify, &Default::default()).await {
         update(&mut state, Msg::Poll(result), NOW + 3_000);
     }
     let done = completed(&state);

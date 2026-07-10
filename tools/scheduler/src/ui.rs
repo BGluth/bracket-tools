@@ -900,6 +900,7 @@ fn health_badge(state: &AppState, bracket: &BracketId, now: UnixMillis) -> Strin
         }
         PollHealth::Offline => "OFF".to_owned(),
         PollHealth::Transient => "retry".to_owned(),
+        PollHealth::RateLimited => "429".to_owned(),
         PollHealth::Persistent(_) => "FAIL".to_owned(),
     }
 }

@@ -6,7 +6,7 @@
 //! so tests drive it without a terminal or network.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -17,7 +17,7 @@ use std::{
 use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
     app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
-    cli::{build_live_source, default_config_dir, default_data_dir, resolve_token, tournaments_dir, Cli},
+    cli::{build_live_source, default_config_dir, default_data_dir, rate_journal_path, resolve_token, tournaments_dir, Cli},
     config::{referenced_types, resolve_roster, write_starter_template, SetupCounts},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
@@ -28,7 +28,7 @@ use bracket_tools_scheduler::{
         Lockfile,
     },
     poller::{classify_provider_error, run_poller, PollerConfig},
-    preflight::preflight,
+    preflight::{preflight, PreflightEnv},
     rehearsal::install_rehearsal,
     replay::{generate_replay, play_replay, render_replay},
     set_source::SetSource,
@@ -157,7 +157,11 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
     let target = cli.config.clone().unwrap_or_else(|| tournaments_dir().join(format!("{bare}.toml")));
 
     let token = resolve_token(cli.token.as_deref(), &SchedulerConfig::default())?;
-    let provider = GGProvider::builder(token).build().context("building the start.gg client")?;
+    let journal = rate_journal_path(&token);
+    let provider = GGProvider::builder(token)
+        .limit_journal(journal)
+        .build()
+        .context("building the start.gg client")?;
     let events = provider
         .fetch_tournament_events(&slug)
         .await
@@ -349,7 +353,16 @@ where
     let _lock = Lockfile::acquire(&sibling_with_suffix(&state_path, "lock"))?;
 
     let arm_writes = !(cli.advisor_only || config.advisor_only);
-    let report = preflight(&*source, &config, PREFLIGHT_TIMEOUT, arm_writes, classify.clone()).await;
+    // Rate-limit pauses only make sense live (fixtures never throttle), and
+    // only live rosters may refresh the cache — an offline placeholder roster
+    // must not clobber a real one.
+    let preflight_env = PreflightEnv {
+        notify: &|line: &str| println!("{line}"),
+        roster_dir: Some(default_data_dir()),
+        roster_write: !cli.offline(),
+        rate_limit_waits: if cli.offline() { 0 } else { 4 },
+    };
+    let report = preflight(&*source, &config, PREFLIGHT_TIMEOUT, arm_writes, classify.clone(), &preflight_env).await;
     print!("{}", report.render());
     if report.fatal.is_some() {
         bail!("preflight failed");
@@ -370,6 +383,9 @@ where
     // snapshot (stale-flagged) instead of a blank table.
     let seeded = seed_from_snapshot(&mut bootstraps, &snapshot_path);
     let events: Vec<BracketId> = bootstraps.iter().map(|b| b.id.clone()).collect();
+    // Events whose preflight structure fetch failed (rate limit, blip)
+    // launched without phase groups; the poller back-fills them.
+    let needs_structure: HashSet<BracketId> = bootstraps.iter().filter(|b| b.groups.is_empty()).map(|b| b.id.clone()).collect();
     let mut state = AppState::new(config.clone(), writes_armed, bootstraps, now_millis());
     // --setups pins the roster for this run; otherwise the persisted board
     // (crash recovery / cross-session carryover) wins.
@@ -377,7 +393,14 @@ where
     mark_seeded_stale(&mut state, &seeded);
 
     let (tx, rx) = unbounded_channel::<Msg>();
-    let mut tasks = Tasks::new(source, PollerConfig::from_scheduler(&config), events, classify, tx.clone());
+    let mut tasks = Tasks::new(
+        source,
+        PollerConfig::from_scheduler(&config),
+        events,
+        classify,
+        tx.clone(),
+        needs_structure,
+    );
     spawn_input_thread(tx.clone());
 
     install_panic_hook();
@@ -661,6 +684,7 @@ where
     events: Vec<BracketId>,
     classify: F,
     tx: UnboundedSender<Msg>,
+    needs_structure: HashSet<BracketId>,
 }
 
 impl<S, F> Tasks<S, F>
@@ -668,7 +692,14 @@ where
     S: SetSource + Send + Sync + 'static,
     F: Fn(&S::Error) -> PollFailure + Send + Sync + Clone + 'static,
 {
-    fn new(source: Arc<S>, poller_config: PollerConfig, events: Vec<BracketId>, classify: F, tx: UnboundedSender<Msg>) -> Self {
+    fn new(
+        source: Arc<S>,
+        poller_config: PollerConfig,
+        events: Vec<BracketId>,
+        classify: F,
+        tx: UnboundedSender<Msg>,
+        needs_structure: HashSet<BracketId>,
+    ) -> Self {
         let (force_tx, _unused_force) = unbounded_channel();
         let (write_tx, _unused_write) = unbounded_channel();
         let (sim_tx, _unused_sim) = unbounded_channel();
@@ -682,6 +713,7 @@ where
             events,
             classify,
             tx,
+            needs_structure,
         };
         tasks.spawn_poller();
         tasks.spawn_writer();
@@ -700,8 +732,9 @@ where
             self.classify.clone(),
             self.tx.clone(),
         );
+        let needs_structure = self.needs_structure.clone();
         self.join_set.spawn(async move {
-            run_poller(&*source, events, config, classify, tx, force_rx).await;
+            run_poller(&*source, events, config, classify, tx, force_rx, needs_structure).await;
             "poller"
         });
     }

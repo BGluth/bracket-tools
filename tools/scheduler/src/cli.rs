@@ -3,6 +3,7 @@
 
 use std::{
     env, fs,
+    hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -206,9 +207,20 @@ pub fn resolve_token(cli_token: Option<&str>, config: &SchedulerConfig) -> Resul
 }
 
 /// Builds the live start.gg source. The builder's timeout and burst defaults
-/// are already tuned for the scheduler's polling profile.
+/// are already tuned for the scheduler's polling profile; the limit journal
+/// makes restarts share one per-minute budget with recent runs (start.gg's
+/// window is per token and survives our process).
 pub fn build_live_source(token: GGRestToken) -> Result<StartggSource, reqwest::Error> {
-    Ok(StartggSource::new(GGProvider::builder(token).build()?))
+    let journal = rate_journal_path(&token);
+    Ok(StartggSource::new(GGProvider::builder(token).limit_journal(journal).build()?))
+}
+
+/// The token's shared request-window journal, keyed by a token fingerprint
+/// (never token material) so two tokens don't throttle each other.
+pub fn rate_journal_path(token: &GGRestToken) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    token.as_bearer_value().hash(&mut hasher);
+    default_data_dir().join(format!("rate-window-{:016x}.json", hasher.finish()))
 }
 
 fn resolve_token_from(cli: Option<&str>, env: Option<&str>, token_file: Option<&Path>) -> Result<GGRestToken, TokenError> {

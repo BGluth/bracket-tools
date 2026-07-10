@@ -24,9 +24,9 @@ use tokio::{
 };
 
 use crate::{
-    app::{Msg, PollFailure, PollOutcome, PollResult},
+    app::{Msg, PollFailure, PollOutcome, PollResult, StructureUpdate},
     conflict::UnixMillis,
-    model::{live_sets_from_schema, BracketId},
+    model::{live_sets_from_schema, phase_groups_from_schema, BracketId},
     set_source::SetSource,
 };
 
@@ -57,6 +57,7 @@ pub async fn poll_cycle<S: SetSource>(
     seq: u64,
     config: &PollerConfig,
     classify: &impl Fn(&S::Error) -> PollFailure,
+    needs_structure: &HashSet<BracketId>,
 ) -> Vec<PollResult> {
     stream::iter(events.iter().cloned())
         .map(|bracket| async move {
@@ -65,7 +66,17 @@ pub async fn poll_cycle<S: SetSource>(
                 Ok(Err(error)) => PollOutcome::Failed(classify(&error)),
                 Ok(Ok(schema_sets)) => {
                     let (sets, warnings, skipped) = live_sets_from_schema(schema_sets);
-                    PollOutcome::Snapshot { sets, warnings, skipped }
+                    let structure = if needs_structure.contains(&bracket) {
+                        fetch_structure(source, &bracket, config).await
+                    } else {
+                        None
+                    };
+                    PollOutcome::Snapshot {
+                        sets,
+                        warnings,
+                        skipped,
+                        structure,
+                    }
                 }
             };
             PollResult {
@@ -80,9 +91,26 @@ pub async fn poll_cycle<S: SetSource>(
         .await
 }
 
+/// Best-effort structure back-fill for an event that launched without one
+/// (its preflight structure fetch failed); a miss just tries again next
+/// cycle. Group warnings recur every fetch and preflight already surfaces
+/// them, so they're dropped here.
+async fn fetch_structure<S: SetSource>(source: &S, bracket: &BracketId, config: &PollerConfig) -> Option<StructureUpdate> {
+    match timeout(config.request_timeout, source.fetch_event_structure(&bracket.0)).await {
+        Ok(Ok(structure)) => {
+            let event_start_at = structure.start_at.map(|ts| ts.0);
+            let (groups, _warnings) = phase_groups_from_schema(&structure);
+            Some(StructureUpdate { groups, event_start_at })
+        }
+        _ => None,
+    }
+}
+
 /// The long-running poll loop: a full cycle per interval, with queued
 /// force-poll targets serviced immediately between cycles. Exits when the
-/// app side of either channel closes.
+/// app side of either channel closes. `needs_structure` names events that
+/// launched without structure; each keeps re-fetching it alongside its sets
+/// until one lands.
 pub async fn run_poller<S, F>(
     source: &S,
     events: Vec<BracketId>,
@@ -90,6 +118,7 @@ pub async fn run_poller<S, F>(
     classify: F,
     tx: UnboundedSender<Msg>,
     mut force_rx: UnboundedReceiver<BracketId>,
+    mut needs_structure: HashSet<BracketId>,
 ) where
     S: SetSource,
     F: Fn(&S::Error) -> PollFailure,
@@ -97,7 +126,10 @@ pub async fn run_poller<S, F>(
     let mut seq = 0u64;
     loop {
         seq += 1;
-        for result in poll_cycle(source, &events, seq, &config, &classify).await {
+        for result in poll_cycle(source, &events, seq, &config, &classify, &needs_structure).await {
+            if let PollOutcome::Snapshot { structure: Some(_), .. } = &result.outcome {
+                needs_structure.remove(&result.bracket);
+            }
             if tx.send(Msg::Poll(result)).is_err() {
                 return;
             }
@@ -116,7 +148,10 @@ pub async fn run_poller<S, F>(
                     }
                     let targets: Vec<BracketId> = targets.into_iter().collect();
                     seq += 1;
-                    for result in poll_cycle(source, &targets, seq, &config, &classify).await {
+                    for result in poll_cycle(source, &targets, seq, &config, &classify, &needs_structure).await {
+                        if let PollOutcome::Snapshot { structure: Some(_), .. } = &result.outcome {
+                            needs_structure.remove(&result.bracket);
+                        }
                         if tx.send(Msg::Poll(result)).is_err() {
                             return;
                         }
@@ -132,8 +167,11 @@ pub fn classify_provider_error(error: &GGProviderError) -> PollFailure {
     match error {
         GGProviderError::Http(CynicReqwestError::ReqwestError(e)) if e.is_connect() || e.is_timeout() => PollFailure::Offline,
         GGProviderError::Http(CynicReqwestError::ReqwestError(_)) => PollFailure::Transient,
+        GGProviderError::RateLimited { .. } => PollFailure::RateLimited,
         GGProviderError::Http(CynicReqwestError::ErrorResponse(status, body)) => {
-            if *status == 429 || status.is_server_error() {
+            if *status == 429 {
+                PollFailure::RateLimited
+            } else if status.is_server_error() {
                 PollFailure::Transient
             } else {
                 PollFailure::Persistent(format!("{status}: {body:.120}"))
@@ -153,7 +191,7 @@ fn now_millis() -> UnixMillis {
 
 #[cfg(test)]
 mod tests {
-    use std::{slice::from_ref, str::FromStr, sync::Arc, time::Duration};
+    use std::{collections::HashSet, slice::from_ref, str::FromStr, sync::Arc, time::Duration};
 
     use bracket_tools_startgg::{types::GGRestToken, GGProvider};
     use tokio::sync::mpsc::unbounded_channel;
@@ -197,7 +235,7 @@ mod tests {
         source.set_hang(HANG_SLUG);
         let events = vec![BracketId(SLUG.to_owned()), BracketId(HANG_SLUG.to_owned())];
 
-        let results = poll_cycle(&source, &events, 1, &config(50), &classify).await;
+        let results = poll_cycle(&source, &events, 1, &config(50), &classify, &HashSet::new()).await;
 
         assert_eq!(results.len(), 2);
         let healthy = results.iter().find(|r| r.bracket.0 == SLUG).unwrap();
@@ -215,7 +253,7 @@ mod tests {
         let source = two_event_source();
         let events = vec![BracketId("tournament/synth/event/nonexistent".to_owned())];
 
-        let results = poll_cycle(&source, &events, 7, &config(1000), &classify).await;
+        let results = poll_cycle(&source, &events, 7, &config(1000), &classify, &HashSet::new()).await;
         assert!(matches!(
             &results[0].outcome,
             PollOutcome::Failed(PollFailure::Persistent(msg)) if msg == "unknown event"
@@ -236,9 +274,50 @@ mod tests {
         let (_force_tx, force_rx) = unbounded_channel();
 
         let handle = tokio::spawn(async move {
-            run_poller(&*source, Vec::new(), config(1000), classify_provider_error, tx, force_rx).await;
+            run_poller(
+                &*source,
+                Vec::new(),
+                config(1000),
+                classify_provider_error,
+                tx,
+                force_rx,
+                HashSet::new(),
+            )
+            .await;
         });
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn flagged_event_gets_structure_back_filled() {
+        let source = two_event_source();
+        let events = vec![BracketId(SLUG.to_owned())];
+        let flagged: HashSet<BracketId> = events.iter().cloned().collect();
+
+        let results = poll_cycle(&source, &events, 1, &config(1000), &classify, &flagged).await;
+        let PollOutcome::Snapshot { structure, .. } = &results[0].outcome else {
+            panic!("expected a snapshot");
+        };
+        let update = structure.as_ref().expect("flagged event fetches structure");
+        assert!(!update.groups.is_empty());
+
+        // Unflagged events don't pay the extra fetch.
+        let results = poll_cycle(&source, &events, 2, &config(1000), &classify, &HashSet::new()).await;
+        let PollOutcome::Snapshot { structure, .. } = &results[0].outcome else {
+            panic!("expected a snapshot");
+        };
+        assert!(structure.is_none());
+    }
+
+    #[test]
+    fn rate_limit_errors_classify_distinctly() {
+        use bracket_tools_startgg::GGProviderError;
+
+        let local = GGProviderError::RateLimited {
+            retry_after: Duration::from_secs(30),
+        };
+        assert_eq!(classify_provider_error(&local), PollFailure::RateLimited);
+        assert!(local.is_rate_limited());
     }
 
     #[tokio::test(start_paused = true)]
@@ -250,7 +329,7 @@ mod tests {
 
         let poller_source = source.clone();
         let handle = tokio::spawn(async move {
-            run_poller(&*poller_source, events, config(1000), classify, tx, force_rx).await;
+            run_poller(&*poller_source, events, config(1000), classify, tx, force_rx, HashSet::new()).await;
         });
 
         // Cycle 1 covers both events.

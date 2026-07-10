@@ -135,7 +135,9 @@ where
         Err(_elapsed) => Err(AttemptFailure::Connectivity("request timed out".to_owned())),
         Ok(Err(error)) => match classify(&error) {
             PollFailure::Offline => Err(AttemptFailure::Connectivity(error.to_string())),
-            PollFailure::Transient => Err(AttemptFailure::Retryable(error.to_string())),
+            // A throttled window clears within a minute; the linear backoff
+            // retry path fits it.
+            PollFailure::Transient | PollFailure::RateLimited => Err(AttemptFailure::Retryable(error.to_string())),
             PollFailure::Persistent(msg) => Err(AttemptFailure::Definitive(msg)),
         },
         Ok(Ok(payload)) => {

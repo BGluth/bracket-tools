@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     num::NonZeroU32,
+    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -42,6 +43,7 @@ use crate::{
         SetQueryResult,
     },
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
+    limit_journal::{LimitJournal, JOURNAL_CAPACITY_MARGIN},
     types::GGRestToken,
 };
 
@@ -53,6 +55,11 @@ const DEFAULT_PAGE_SIZE: i32 = 25;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_BURST: u32 = 20;
+/// start.gg's window is one minute; the journal mirrors it.
+const LIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// How long a server-side 429 parks every process sharing the journal. The
+/// server gives no reset time, so assume a whole window plus slack.
+const SERVER_REJECTION_HOLD: Duration = Duration::from_secs(65);
 
 /// The cached entity kinds. Each is its own cache-key namespace and TTL bucket.
 #[derive(Clone, Copy)]
@@ -158,6 +165,29 @@ pub enum GGProviderError {
 
     #[error("cache deserialization error: {0}")]
     CacheDeserialization(String),
+
+    /// The cross-process limit journal says the shared window is spent (or a
+    /// recent 429 parked it). No request was sent.
+    #[error("rate-limit window exhausted locally; retry in ~{}s", .retry_after.as_secs().max(1))]
+    RateLimited { retry_after: Duration },
+}
+
+impl GGProviderError {
+    /// True when the token is throttled — either start.gg answered 429 or the
+    /// local journal refused to send.
+    pub fn is_rate_limited(&self) -> bool {
+        self.rate_limit_backoff().is_some()
+    }
+
+    /// How long a caller should wait before retrying a throttled request.
+    /// `None` when the error isn't rate limiting.
+    pub fn rate_limit_backoff(&self) -> Option<Duration> {
+        match self {
+            GGProviderError::RateLimited { retry_after } => Some(*retry_after),
+            GGProviderError::Http(CynicReqwestError::ErrorResponse(status, _)) if *status == 429 => Some(SERVER_REJECTION_HOLD),
+            _ => None,
+        }
+    }
 }
 
 fn format_graphql_errors(errors: &[GraphQlError]) -> String {
@@ -176,6 +206,7 @@ fn format_graphql_errors(errors: &[GraphQlError]) -> String {
 pub struct GGProvider<S: Storage> {
     client: Client,
     rate_limiter: Arc<DefaultDirectRateLimiter>,
+    limit_journal: Option<LimitJournal>,
     page_size: i32,
     ttls: EntityTtls,
     storage: S,
@@ -200,9 +231,23 @@ impl<S: Storage> GGProvider<S> {
         Vars: Serialize,
         ResponseData: DeserializeOwned + 'static,
     {
+        if let Some(journal) = &self.limit_journal {
+            if let Some(retry_after) = journal.gate(SystemTime::now()) {
+                return Err(GGProviderError::RateLimited { retry_after });
+            }
+        }
         self.rate_limiter.until_ready().await;
+        if let Some(journal) = &self.limit_journal {
+            journal.record_sent(SystemTime::now());
+        }
 
-        let response: GraphQlResponse<ResponseData> = self.client.post(STARTGG_API_URL).run_graphql(operation).await?;
+        let result = self.client.post(STARTGG_API_URL).run_graphql(operation).await;
+        if let (Some(journal), Err(CynicReqwestError::ErrorResponse(status, _))) = (&self.limit_journal, &result) {
+            if *status == 429 {
+                journal.record_rejected(SystemTime::now(), SERVER_REJECTION_HOLD);
+            }
+        }
+        let response: GraphQlResponse<ResponseData> = result?;
 
         if let Some(errors) = response.errors {
             if !errors.is_empty() {
@@ -514,6 +559,7 @@ pub struct GGProviderBuilder<S: Storage> {
     request_timeout: Duration,
     page_size: i32,
     ttls: EntityTtls,
+    limit_journal_path: Option<PathBuf>,
     storage: S,
 }
 
@@ -527,8 +573,19 @@ impl<S: Storage> GGProviderBuilder<S> {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             page_size: DEFAULT_PAGE_SIZE,
             ttls: EntityTtls::default(),
+            limit_journal_path: None,
             storage,
         }
+    }
+
+    /// Persists the rolling request window at `path`, shared by every process
+    /// using the same file. start.gg enforces its quota per token server-side
+    /// and never reports the window's state, so without this a restarted
+    /// process replays its full per-minute budget into an already-spent
+    /// window and eats 429s. Give each token its own file. Off by default.
+    pub fn limit_journal(mut self, path: PathBuf) -> Self {
+        self.limit_journal_path = Some(path);
+        self
     }
 
     pub fn requests_per_minute(mut self, rpm: u32) -> Self {
@@ -602,9 +659,17 @@ impl<S: Storage> GGProviderBuilder<S> {
         let quota = Quota::per_minute(rpm).allow_burst(burst);
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
 
+        // The journal capacity sits under the configured rate so clock skew
+        // between processes can't nudge the shared count past the server's.
+        let journal_capacity = rpm.get().saturating_sub(JOURNAL_CAPACITY_MARGIN).max(1) as usize;
+        let limit_journal = self
+            .limit_journal_path
+            .map(|path| LimitJournal::new(path, LIMIT_WINDOW, journal_capacity));
+
         Ok(GGProvider {
             client,
             rate_limiter,
+            limit_journal,
             page_size: self.page_size,
             ttls: self.ttls,
             storage: self.storage,
@@ -623,13 +688,35 @@ mod tests {
     use serde::Serialize;
 
     use super::{
-        is_stale, CacheEntity, CacheFreshness, EntityTtls, GGProvider, DEFAULT_BURST, DEFAULT_CONNECT_TIMEOUT, DEFAULT_PAGE_SIZE,
-        DEFAULT_REQUESTS_PER_MINUTE, DEFAULT_REQUEST_TIMEOUT,
+        is_stale, CacheEntity, CacheFreshness, EntityTtls, GGProvider, GGProviderError, DEFAULT_BURST, DEFAULT_CONNECT_TIMEOUT,
+        DEFAULT_PAGE_SIZE, DEFAULT_REQUESTS_PER_MINUTE, DEFAULT_REQUEST_TIMEOUT,
     };
+    use crate::limit_journal::LimitJournal;
     use crate::{
         gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData, StartGgId},
         types::GGRestToken,
     };
+
+    #[tokio::test]
+    async fn exhausted_journal_gates_before_any_request() {
+        let dir = std::env::temp_dir().join(format!("bt-provider-journal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("window.json");
+
+        // Another "process" spent the whole window moments ago.
+        let filler = LimitJournal::new(path.clone(), Duration::from_secs(60), 1);
+        for _ in 0..100 {
+            filler.record_sent(SystemTime::now());
+        }
+
+        let provider = GGProvider::builder(test_token()).limit_journal(path).build().unwrap();
+        // Errors locally — were the gate broken, this would attempt a real
+        // network call and fail with a connect error instead.
+        let err = provider.fetch_event_structure("tournament/x/event/y").await.unwrap_err();
+        assert!(matches!(err, GGProviderError::RateLimited { .. }), "{err:?}");
+        assert!(err.is_rate_limited());
+        assert!(err.rate_limit_backoff().unwrap() <= Duration::from_secs(60));
+    }
 
     fn test_token() -> GGRestToken {
         GGRestToken::from_str("91b0c4b4aeae0a040d5b2c0e4d8861c2").unwrap()

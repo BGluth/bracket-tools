@@ -14,7 +14,7 @@ use bracket_tools_scheduler::{
     fixture_source::{classify_fixture_error, FixtureSource},
     model::BracketId,
     poller::{poll_cycle, PollerConfig},
-    preflight::preflight,
+    preflight::{preflight, PreflightEnv},
     ui,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -65,7 +65,15 @@ async fn full_fbr_world_boots_polls_and_renders() {
     let config = fbr_config();
 
     // Preflight over all 7 real events.
-    let report = preflight(&source, &config, Duration::from_secs(5), true, classify_fixture_error).await;
+    let report = preflight(
+        &source,
+        &config,
+        Duration::from_secs(5),
+        true,
+        classify_fixture_error,
+        &PreflightEnv::silent(),
+    )
+    .await;
     assert!(report.fatal.is_none(), "{}", report.render());
     assert!(report.writes_armed);
     let rendered = report.render();
@@ -87,7 +95,7 @@ async fn full_fbr_world_boots_polls_and_renders() {
         concurrency: 3,
     };
     let classify = |e: &_| -> PollFailure { classify_fixture_error(e) };
-    let results = poll_cycle(&source, &events, 1, &poller_config, &classify).await;
+    let results = poll_cycle(&source, &events, 1, &poller_config, &classify, &Default::default()).await;
     assert_eq!(results.len(), 7);
     for result in results {
         update(&mut state, Msg::Poll(result), NOW + 30_000);

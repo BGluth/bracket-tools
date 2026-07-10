@@ -18,18 +18,24 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Write as _,
+    path::PathBuf,
     time::Duration,
 };
 
 use bracket_tools_startgg::{CharacterInfo, StartGgId};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::{
     app::{BracketBootstrap, PollFailure},
     config::{BracketConfig, BracketMode, SchedulerConfig},
     model::{live_sets_from_schema, phase_groups_from_schema, LiveSet, PhaseGroupInfo, PlayerId},
+    roster_cache,
     set_source::SetSource,
 };
+
+/// How long one rate-limit pause lasts: start.gg's window is a minute and
+/// gives no reset time, so a full window plus slack always clears it.
+const RATE_LIMIT_PAUSE: Duration = Duration::from_secs(65);
 
 #[derive(Debug)]
 pub struct PreflightReport {
@@ -86,20 +92,54 @@ pub struct IdentitySplit {
     pub identities: Vec<(String, BTreeSet<PlayerId>)>,
 }
 
+/// Preflight's connections to the world outside the fetches: operator
+/// progress lines, the roster cache, and the rate-limit wait budget.
+pub struct PreflightEnv<'a> {
+    /// Progress/alert lines, printed before the TUI owns the screen.
+    pub notify: &'a (dyn Fn(&str) + Sync),
+    /// Character-roster cache directory (the XDG data dir); `None` disables
+    /// the cache entirely.
+    pub roster_dir: Option<PathBuf>,
+    /// Live runs persist fetched rosters; offline replays must not overwrite
+    /// real rosters with fixture placeholders.
+    pub roster_write: bool,
+    /// How many rate-limit pauses (~65s each) the whole preflight may spend
+    /// before falling back to Offline outcomes.
+    pub rate_limit_waits: u32,
+}
+
+fn no_notify(_: &str) {}
+
+impl PreflightEnv<'static> {
+    /// No output, no cache, no waiting.
+    pub fn silent() -> Self {
+        Self {
+            notify: &no_notify,
+            roster_dir: None,
+            roster_write: false,
+            rate_limit_waits: 0,
+        }
+    }
+}
+
 pub async fn preflight<S, F>(
     source: &S,
     config: &SchedulerConfig,
     request_timeout: Duration,
     arm_writes: bool,
     classify: F,
+    env: &PreflightEnv<'_>,
 ) -> PreflightReport
 where
     S: SetSource,
     F: Fn(&S::Error) -> PollFailure,
 {
+    // One shared budget across every event: a throttled token throttles them
+    // all, so per-event budgets would multiply the worst-case stall.
+    let mut waits_left = env.rate_limit_waits;
     let mut brackets = Vec::new();
     for bracket_config in &config.brackets {
-        brackets.push(preflight_bracket(source, bracket_config, request_timeout, &classify).await);
+        brackets.push(preflight_bracket(source, bracket_config, request_timeout, &classify, env, &mut waits_left).await);
     }
 
     let mut fatal = None;
@@ -160,7 +200,7 @@ where
     match timeout(request_timeout, source.probe_admin(id)).await {
         Err(_elapsed) => (true, Some("admin probe timed out — armed on the fetch-success proxy".to_owned())),
         Ok(Err(error)) => match classify(&error) {
-            PollFailure::Offline | PollFailure::Transient => (
+            PollFailure::Offline | PollFailure::Transient | PollFailure::RateLimited => (
                 true,
                 Some(format!("admin probe unreachable ({error}) — armed on the fetch-success proxy")),
             ),
@@ -181,45 +221,73 @@ where
     }
 }
 
-async fn preflight_bracket<S, F>(source: &S, config: &BracketConfig, request_timeout: Duration, classify: &F) -> BracketPreflight
+/// Announces a throttled fetch the moment it happens and spends one pause
+/// from the shared budget. Returns whether the caller should retry.
+async fn rate_limit_pause(env: &PreflightEnv<'_>, waits_left: &mut u32, slug: &str, what: &str) -> bool {
+    if *waits_left == 0 {
+        return false;
+    }
+    *waits_left -= 1;
+    (env.notify)(&format!(
+        "start.gg RATE LIMIT hit ({what} fetch, {slug}) — waiting {}s for the window to clear, then retrying",
+        RATE_LIMIT_PAUSE.as_secs()
+    ));
+    sleep(RATE_LIMIT_PAUSE).await;
+    true
+}
+
+async fn preflight_bracket<S, F>(
+    source: &S,
+    config: &BracketConfig,
+    request_timeout: Duration,
+    classify: &F,
+    env: &PreflightEnv<'_>,
+    waits_left: &mut u32,
+) -> BracketPreflight
 where
     S: SetSource,
     F: Fn(&S::Error) -> PollFailure,
 {
     let mut warnings = Vec::new();
 
-    let structure = match timeout(request_timeout, source.fetch_event_structure(&config.slug)).await {
-        Err(_elapsed) => {
-            return BracketPreflight {
-                config: config.clone(),
-                outcome: BracketOutcome::Offline {
-                    groups: Vec::new(),
-                    error: "structure fetch timed out".to_owned(),
-                },
-                warnings,
-                tournament: None,
-                characters: Vec::new(),
+    let structure = loop {
+        match timeout(request_timeout, source.fetch_event_structure(&config.slug)).await {
+            Err(_elapsed) => {
+                return BracketPreflight {
+                    config: config.clone(),
+                    outcome: BracketOutcome::Offline {
+                        groups: Vec::new(),
+                        error: "structure fetch timed out".to_owned(),
+                    },
+                    warnings,
+                    tournament: None,
+                    characters: Vec::new(),
+                }
             }
+            Ok(Err(error)) => {
+                let failure = classify(&error);
+                if failure == PollFailure::RateLimited && rate_limit_pause(env, waits_left, &config.slug, "structure").await {
+                    continue;
+                }
+                let outcome = match failure {
+                    PollFailure::Persistent(msg) => BracketOutcome::Failed {
+                        error: format!("structure fetch failed definitively: {msg}"),
+                    },
+                    _ => BracketOutcome::Offline {
+                        groups: Vec::new(),
+                        error: format!("structure fetch failed: {error}"),
+                    },
+                };
+                return BracketPreflight {
+                    config: config.clone(),
+                    outcome,
+                    warnings,
+                    tournament: None,
+                    characters: Vec::new(),
+                };
+            }
+            Ok(Ok(structure)) => break structure,
         }
-        Ok(Err(error)) => {
-            let outcome = match classify(&error) {
-                PollFailure::Offline | PollFailure::Transient => BracketOutcome::Offline {
-                    groups: Vec::new(),
-                    error: format!("structure fetch failed: {error}"),
-                },
-                PollFailure::Persistent(msg) => BracketOutcome::Failed {
-                    error: format!("structure fetch failed definitively: {msg}"),
-                },
-            };
-            return BracketPreflight {
-                config: config.clone(),
-                outcome,
-                warnings,
-                tournament: None,
-                characters: Vec::new(),
-            };
-        }
-        Ok(Ok(structure)) => structure,
     };
 
     let (groups, group_warnings) = phase_groups_from_schema(&structure);
@@ -236,54 +304,72 @@ where
     let tournament = structure.tournament.as_ref();
     let tournament_pair = tournament.and_then(|t| Some((t.id.as_ref()?.inner().to_owned(), t.slug.clone().unwrap_or_default())));
 
-    let outcome = match timeout(request_timeout, source.fetch_event_sets(&config.slug)).await {
-        Err(_elapsed) => BracketOutcome::Offline {
-            groups,
-            error: "set fetch timed out".to_owned(),
-        },
-        Ok(Err(error)) => match classify(&error) {
-            PollFailure::Offline | PollFailure::Transient => BracketOutcome::Offline {
-                groups,
-                error: format!("set fetch failed: {error}"),
-            },
-            PollFailure::Persistent(msg) => BracketOutcome::Failed {
-                error: format!("set fetch failed definitively: {msg}"),
-            },
-        },
-        Ok(Ok(schema_sets)) => {
-            let (sets, model_warnings, skipped) = live_sets_from_schema(schema_sets);
-            if !skipped.is_empty() {
-                warnings.push(format!("{} sets skipped in conversion", skipped.len()));
-            }
-            for warning in &model_warnings {
-                if let crate::model::ModelWarning::UnsupportedGroup { phase_group, raw } = warning {
-                    warnings.push(format!("unsupported group {phase_group}: {raw}"));
+    let outcome = loop {
+        match timeout(request_timeout, source.fetch_event_sets(&config.slug)).await {
+            Err(_elapsed) => {
+                break BracketOutcome::Offline {
+                    groups,
+                    error: "set fetch timed out".to_owned(),
                 }
             }
-            BracketOutcome::Ready {
-                sets,
-                groups,
-                event_start_at,
+            Ok(Err(error)) => {
+                let failure = classify(&error);
+                if failure == PollFailure::RateLimited && rate_limit_pause(env, waits_left, &config.slug, "set").await {
+                    continue;
+                }
+                break match failure {
+                    PollFailure::Persistent(msg) => BracketOutcome::Failed {
+                        error: format!("set fetch failed definitively: {msg}"),
+                    },
+                    _ => BracketOutcome::Offline {
+                        groups,
+                        error: format!("set fetch failed: {error}"),
+                    },
+                };
+            }
+            Ok(Ok(schema_sets)) => {
+                let (sets, model_warnings, skipped) = live_sets_from_schema(schema_sets);
+                if !skipped.is_empty() {
+                    warnings.push(format!("{} sets skipped in conversion", skipped.len()));
+                }
+                for warning in &model_warnings {
+                    if let crate::model::ModelWarning::UnsupportedGroup { phase_group, raw } = warning {
+                        warnings.push(format!("unsupported group {phase_group}: {raw}"));
+                    }
+                }
+                break BracketOutcome::Ready {
+                    sets,
+                    groups,
+                    event_start_at,
+                };
             }
         }
     };
 
     // Best-effort roster fetch for healthy events (the reporting vocabulary);
     // an event without one still schedules — reporting just skips characters.
-    let characters = match &outcome {
-        BracketOutcome::Ready { .. } => match timeout(request_timeout, source.fetch_event_characters(&config.slug)).await {
-            Ok(Ok(characters)) => characters,
-            Ok(Err(error)) => {
-                warnings.push(format!("character roster unavailable: {error}"));
-                Vec::new()
-            }
-            Err(_elapsed) => {
-                warnings.push("character roster fetch timed out".to_owned());
-                Vec::new()
+    let fetched = match &outcome {
+        BracketOutcome::Ready { .. } => loop {
+            match timeout(request_timeout, source.fetch_event_characters(&config.slug)).await {
+                Ok(Ok(characters)) => break Some(characters),
+                Ok(Err(error)) => {
+                    if classify(&error) == PollFailure::RateLimited
+                        && rate_limit_pause(env, waits_left, &config.slug, "character roster").await
+                    {
+                        continue;
+                    }
+                    warnings.push(format!("character roster unavailable: {error}"));
+                    break None;
+                }
+                Err(_elapsed) => {
+                    warnings.push("character roster fetch timed out".to_owned());
+                    break None;
+                }
             }
         },
-        _ => Vec::new(),
+        _ => None,
     };
+    let characters = resolve_roster(env, &config.slug, fetched, &mut warnings);
 
     BracketPreflight {
         config: config.clone(),
@@ -291,6 +377,46 @@ where
         warnings,
         tournament: tournament_pair,
         characters,
+    }
+}
+
+/// Picks the roster to carry: live fetches win and refresh the cache;
+/// otherwise (fetch failed, or an offline source answered its placeholder)
+/// a previously cached real roster steps in.
+fn resolve_roster(
+    env: &PreflightEnv<'_>,
+    slug: &str,
+    fetched: Option<Vec<CharacterInfo>>,
+    warnings: &mut Vec<String>,
+) -> Vec<CharacterInfo> {
+    let cached = env.roster_dir.as_deref().and_then(|dir| roster_cache::load(dir, slug));
+    match fetched {
+        Some(roster) if !roster.is_empty() && env.roster_write => {
+            if let Some(dir) = env.roster_dir.as_deref() {
+                roster_cache::save(dir, slug, &roster);
+            }
+            roster
+        }
+        Some(roster) if !roster.is_empty() => match cached {
+            Some(real) => {
+                warnings.push(format!(
+                    "roster from local cache ({} characters; offline placeholder overridden)",
+                    real.len()
+                ));
+                real
+            }
+            None => roster,
+        },
+        _ => match cached {
+            Some(real) => {
+                warnings.push(format!(
+                    "roster unavailable live — using the local cache ({} characters)",
+                    real.len()
+                ));
+                real
+            }
+            None => Vec::new(),
+        },
     }
 }
 
@@ -475,7 +601,9 @@ impl PreflightReport {
 mod tests {
     use std::{slice::from_ref, time::Duration};
 
-    use super::{preflight, BracketOutcome};
+    use bracket_tools_startgg::CharacterInfo;
+
+    use super::{preflight, resolve_roster, BracketOutcome, PreflightEnv};
     use crate::{
         app::PollFailure,
         config::{BracketConfig, BracketMode, ExpectedKind, SchedulerConfig, SetupCounts},
@@ -513,7 +641,7 @@ mod tests {
         let source = two_event_source();
         let config = config_for(&[ULTIMATE, MELEE]);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
 
         assert!(report.fatal.is_none(), "{report:?}");
         assert!(report.writes_armed);
@@ -535,7 +663,7 @@ mod tests {
         let source = two_event_source();
         let config = config_for(&[ULTIMATE, "tournament/fbr/event/nonexistent"]);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
 
         assert!(report.fatal.is_none(), "one healthy event still launches");
         assert!(!report.writes_armed, "a failed event disarms writes");
@@ -555,7 +683,7 @@ mod tests {
         source.set_hang(MELEE);
         let config = config_for(&[ULTIMATE, MELEE]);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
 
         assert!(report.fatal.is_none());
         let offline = &report.brackets[1];
@@ -577,7 +705,7 @@ mod tests {
         });
         let config = config_for(&[ULTIMATE, MELEE]);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
 
         assert!(report.fatal.is_none());
         assert!(!report.writes_armed, "non-admin token must not arm writes");
@@ -594,7 +722,7 @@ mod tests {
         });
         let config = config_for(&[ULTIMATE, MELEE]);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
         assert!(!report.writes_armed);
         assert!(report.admin_probe.as_deref().is_some_and(|p| p.contains("hidden")));
     }
@@ -609,7 +737,7 @@ mod tests {
 
         // Not asking for writes at all: escalation still arms (detection is
         // just as blind), and the report says so.
-        let report = preflight(&source, &config, TIMEOUT, false, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, false, classify, &PreflightEnv::silent()).await;
         assert!(!report.writes_armed);
         assert!(report.escalate_soft_busy);
         assert!(report.render().contains("remote-call detection degraded"));
@@ -617,8 +745,84 @@ mod tests {
         // The (default) pinned int quiets it.
         let pinned = config_for(&[ULTIMATE, MELEE]);
         assert_eq!(pinned.known_called_state_int, Some(6));
-        let report = preflight(&source, &pinned, TIMEOUT, false, classify).await;
+        let report = preflight(&source, &pinned, TIMEOUT, false, classify, &PreflightEnv::silent()).await;
         assert!(!report.escalate_soft_busy);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_fetches_alert_pause_and_fall_back_offline() {
+        let source = two_event_source();
+        let config = config_for(&[ULTIMATE, "tournament/fbr/event/throttled"]);
+        let classify_throttled = |_: &FixtureError| PollFailure::RateLimited;
+
+        let alerts = std::sync::Mutex::new(Vec::<String>::new());
+        let notify = |line: &str| alerts.lock().unwrap().push(line.to_owned());
+        let env = PreflightEnv {
+            notify: &notify,
+            rate_limit_waits: 2,
+            ..PreflightEnv::silent()
+        };
+        let report = preflight(&source, &config, TIMEOUT, false, classify_throttled, &env).await;
+
+        assert!(
+            matches!(report.brackets[0].outcome, BracketOutcome::Ready { .. }),
+            "healthy event unaffected"
+        );
+        assert!(
+            matches!(report.brackets[1].outcome, BracketOutcome::Offline { .. }),
+            "budget exhausted → offline (poller keeps trying), never a downgrade: {:?}",
+            report.brackets[1].outcome
+        );
+        let alerts = alerts.lock().unwrap();
+        assert_eq!(alerts.len(), 2, "one alert per pause: {alerts:?}");
+        assert!(alerts[0].contains("RATE LIMIT"), "{alerts:?}");
+    }
+
+    #[tokio::test]
+    async fn zero_wait_budget_is_the_old_offline_behavior() {
+        let source = two_event_source();
+        let config = config_for(&["tournament/fbr/event/throttled"]);
+        let classify_throttled = |_: &FixtureError| PollFailure::RateLimited;
+
+        let report = preflight(&source, &config, TIMEOUT, false, classify_throttled, &PreflightEnv::silent()).await;
+        assert!(matches!(report.brackets[0].outcome, BracketOutcome::Offline { .. }));
+    }
+
+    #[test]
+    fn roster_resolution_prefers_live_then_cache() {
+        let dir = std::env::temp_dir().join(format!("bt-preflight-roster-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let live = PreflightEnv {
+            roster_dir: Some(dir.clone()),
+            roster_write: true,
+            ..PreflightEnv::silent()
+        };
+        let offline = PreflightEnv {
+            roster_dir: Some(dir.clone()),
+            roster_write: false,
+            ..PreflightEnv::silent()
+        };
+        let real = vec![CharacterInfo {
+            id: 1,
+            name: "Mario".to_owned(),
+        }];
+        let placeholder = vec![CharacterInfo {
+            id: 9,
+            name: "Placeholder".to_owned(),
+        }];
+        let mut warnings = Vec::new();
+
+        // A live fetch wins and seeds the cache.
+        assert_eq!(resolve_roster(&live, "slug", Some(real.clone()), &mut warnings), real);
+        // An offline placeholder is overridden by the cached real roster...
+        assert_eq!(resolve_roster(&offline, "slug", Some(placeholder.clone()), &mut warnings), real);
+        // ...and must not have clobbered it.
+        assert_eq!(resolve_roster(&offline, "slug", None, &mut warnings), real);
+        // A failed live fetch (rate limit) falls back to the cache too.
+        assert_eq!(resolve_roster(&live, "slug", None, &mut warnings), real);
+        // Nothing anywhere → empty, reporting just skips characters.
+        assert!(resolve_roster(&live, "other-slug", None, &mut warnings).is_empty());
+        assert_eq!(warnings.len(), 3, "cache substitutions say so: {warnings:?}");
     }
 
     #[tokio::test]
@@ -626,7 +830,7 @@ mod tests {
         let source = two_event_source();
         let config = config_for(&["tournament/fbr/event/nope1", "tournament/fbr/event/nope2"]);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
         assert!(report.fatal.is_some());
         assert!(!report.writes_armed);
     }
@@ -640,7 +844,7 @@ mod tests {
         source.add_synth_event("tournament/other/event/melee", from_ref(&other.info), vec![other.sets]);
         let config = config_for(&[ULTIMATE, "tournament/other/event/melee"]);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
         assert!(
             report.fatal.as_deref().is_some_and(|f| f.contains("identity mismatch")),
             "{report:?}"
@@ -653,7 +857,7 @@ mod tests {
         let mut config = config_for(&[ULTIMATE, MELEE]);
         config.tournament_slug = Some("tournament/some-other-major".to_owned());
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
         assert!(report.fatal.as_deref().is_some_and(|f| f.contains("tournament_slug")));
     }
 
@@ -663,7 +867,7 @@ mod tests {
         let mut config = config_for(&[ULTIMATE]);
         config.brackets[0].expected_kind = Some(ExpectedKind::Swiss);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
         assert!(report.fatal.is_none());
         assert!(matches!(report.brackets[0].outcome, BracketOutcome::Ready { .. }));
         assert!(report.brackets[0].warnings.iter().any(|w| w.contains("expected_kind")));
@@ -690,7 +894,7 @@ mod tests {
         source.add_synth_event(MELEE, from_ref(&melee.info), vec![melee.sets]);
         let config = config_for(&[ULTIMATE, MELEE]);
 
-        let report = preflight(&source, &config, TIMEOUT, true, classify).await;
+        let report = preflight(&source, &config, TIMEOUT, true, classify, &PreflightEnv::silent()).await;
 
         assert_eq!(report.identity_splits.len(), 1, "{:?}", report.identity_splits);
         assert_eq!(report.identity_splits[0].tag, "wobbles");
