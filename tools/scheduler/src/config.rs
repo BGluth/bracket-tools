@@ -462,6 +462,12 @@ pub struct BracketConfig {
     /// union of those types' stations). Omitted = the implicit default type.
     #[serde(default)]
     pub setup_type: Option<OneOrMany>,
+    /// The start.gg videogame name (`--init-tournament` fills it in). Keys
+    /// the character-roster cache: rosters are per game, not per tournament,
+    /// so a brand-new event of a known game reports with the right cast even
+    /// when its roster fetch fails.
+    #[serde(default)]
+    pub videogame: Option<String>,
 }
 
 impl BracketConfig {
@@ -476,7 +482,14 @@ impl BracketConfig {
             duration_prior_secs: DEFAULT_DURATION_PRIOR_SECS,
             prior_weight: DEFAULT_PRIOR_WEIGHT,
             setup_type: None,
+            videogame: None,
         }
+    }
+
+    /// What the roster cache files this bracket under: the videogame when
+    /// known (shared across tournaments), else the event slug.
+    pub fn roster_cache_key(&self) -> &str {
+        self.videogame.as_deref().unwrap_or(&self.slug)
     }
 
     pub fn id(&self) -> BracketId {

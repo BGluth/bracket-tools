@@ -369,7 +369,7 @@ where
         },
         _ => None,
     };
-    let characters = resolve_roster(env, &config.slug, fetched, &mut warnings);
+    let characters = resolve_roster(env, config.roster_cache_key(), fetched, &mut warnings);
 
     BracketPreflight {
         config: config.clone(),
@@ -385,15 +385,15 @@ where
 /// a previously cached real roster steps in.
 fn resolve_roster(
     env: &PreflightEnv<'_>,
-    slug: &str,
+    cache_key: &str,
     fetched: Option<Vec<CharacterInfo>>,
     warnings: &mut Vec<String>,
 ) -> Vec<CharacterInfo> {
-    let cached = env.roster_dir.as_deref().and_then(|dir| roster_cache::load(dir, slug));
+    let cached = env.roster_dir.as_deref().and_then(|dir| roster_cache::load(dir, cache_key));
     match fetched {
         Some(roster) if !roster.is_empty() && env.roster_write => {
             if let Some(dir) = env.roster_dir.as_deref() {
-                roster_cache::save(dir, slug, &roster);
+                roster_cache::save(dir, cache_key, &roster);
             }
             roster
         }
@@ -786,6 +786,37 @@ mod tests {
 
         let report = preflight(&source, &config, TIMEOUT, false, classify_throttled, &PreflightEnv::silent()).await;
         assert!(matches!(report.brackets[0].outcome, BracketOutcome::Offline { .. }));
+    }
+
+    #[test]
+    fn rosters_are_shared_per_videogame_across_tournaments() {
+        let dir = std::env::temp_dir().join(format!("bt-roster-game-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let live = PreflightEnv {
+            roster_dir: Some(dir.clone()),
+            roster_write: true,
+            ..PreflightEnv::silent()
+        };
+        let cast = vec![CharacterInfo {
+            id: 1,
+            name: "Mario".to_owned(),
+        }];
+
+        // This week's tournament fetched the roster live...
+        let mut this_week = BracketConfig::new("tournament/fbr-100/event/ultimate");
+        this_week.videogame = Some("Super Smash Bros. Ultimate".to_owned());
+        let mut warnings = Vec::new();
+        resolve_roster(&live, this_week.roster_cache_key(), Some(cast.clone()), &mut warnings);
+
+        // ...so next week's brand-new event of the same game has it even
+        // when its own fetch fails.
+        let mut next_week = BracketConfig::new("tournament/fbr-101/event/ultimate-singles");
+        next_week.videogame = Some("Super Smash Bros. Ultimate".to_owned());
+        assert_eq!(resolve_roster(&live, next_week.roster_cache_key(), None, &mut warnings), cast);
+
+        // A config without the videogame field keys by slug, as before.
+        let legacy = BracketConfig::new("tournament/fbr-101/event/melee");
+        assert!(resolve_roster(&live, legacy.roster_cache_key(), None, &mut warnings).is_empty());
     }
 
     #[test]

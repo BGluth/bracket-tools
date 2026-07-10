@@ -165,6 +165,9 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
             let _ = writeln!(out, "{title}");
         }
         let _ = writeln!(out, "slug = \"{}\"", event.slug);
+        if let Some(game) = event.videogame.as_deref() {
+            let _ = writeln!(out, "videogame = \"{}\"", game.replace('"', "\\\""));
+        }
         match event.videogame.as_deref().and_then(|game| setups.match_game(game)) {
             Some(entry) => {
                 match entry.setup_types.as_slice() {

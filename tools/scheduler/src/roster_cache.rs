@@ -45,8 +45,11 @@ pub fn save(data_dir: &Path, slug: &str, characters: &[CharacterInfo]) {
     }
 }
 
-fn roster_path(data_dir: &Path, slug: &str) -> PathBuf {
-    let stem: String = slug.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+fn roster_path(data_dir: &Path, key: &str) -> PathBuf {
+    let stem: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
     data_dir.join(ROSTER_DIR).join(format!("{stem}.toml"))
 }
 

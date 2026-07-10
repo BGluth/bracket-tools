@@ -136,7 +136,7 @@ pub async fn seed_fixture_from_live<S: SetSource>(
         if let Ok(Ok(roster)) = timeout(request_timeout, source.fetch_event_characters(&bracket.slug)).await {
             if !roster.is_empty() {
                 if let Some(dir) = roster_dir {
-                    roster_cache::save(dir, &bracket.slug, &roster);
+                    roster_cache::save(dir, bracket.roster_cache_key(), &roster);
                 }
                 fixture.set_event_roster(&bracket.slug, roster);
             }
@@ -389,6 +389,7 @@ mod tests {
             duration_prior_secs: 480,
             prior_weight: 3.0,
             setup_type: None,
+            videogame: None,
         }
     }
 
