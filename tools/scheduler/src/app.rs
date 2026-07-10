@@ -366,6 +366,25 @@ impl ReportDraft {
         }
     }
 
+    /// Confirm-stage sanity check: a game tally that couldn't have ended a
+    /// known best-of (short of the clinch, or past it — 4-0 in a Bo5) is
+    /// probably an entry mistake. Flags, never blocks: DQs carry no games,
+    /// ties are already blocked at Enter, unknown best-ofs can't be judged.
+    pub fn tally_warning(&self, dq: Option<Side>) -> Option<String> {
+        if dq.is_some() {
+            return None;
+        }
+        let best_of = self.best_of?;
+        let winner = self.leader()?;
+        let (w, l) = (self.wins(winner), self.wins(winner.other()));
+        let needed = (best_of as usize) / 2 + 1;
+        match w {
+            short if short < needed => Some(format!("{w}-{l} doesn't decide a Bo{best_of} (first to {needed})")),
+            long if long > needed => Some(format!("{w}-{l} overshoots a Bo{best_of} (first to {needed})")),
+            _ => None,
+        }
+    }
+
     /// True once a side has the majority of a known best-of.
     fn clinched(&self) -> bool {
         let Some(best_of) = self.best_of else { return false };
@@ -3004,6 +3023,43 @@ mod tests {
             }
             other => panic!("expected the character stage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn implausible_tallies_warn_on_confirm() {
+        let mut state = reporting_app();
+        match &mut state.ui.modal {
+            Some(Modal::Report(d)) => d.best_of = Some(5),
+            _ => unreachable!(),
+        }
+
+        // 2-1 doesn't decide a Bo5: warned, not blocked.
+        for k in ['1', '1', '2'] {
+            update(&mut state, key(KeyCode::Char(k)), NOW);
+        }
+        update(&mut state, key(KeyCode::Enter), NOW);
+        let warn = draft(&state).tally_warning(None).expect("short tally warns");
+        assert!(warn.contains("2-1") && warn.contains("Bo5"), "{warn}");
+
+        // Completing the clinch clears it.
+        update(&mut state, key(KeyCode::Esc), NOW);
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        assert!(matches!(draft(&state).stage, super::ReportStage::Confirm { dq: None }));
+        assert_eq!(draft(&state).tally_warning(None), None, "3-1 decides a Bo5");
+
+        // Going past the clinch warns again (4-1), and a DQ never does.
+        update(&mut state, key(KeyCode::Esc), NOW);
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        let warn = draft(&state).tally_warning(None).expect("overshoot warns");
+        assert!(warn.contains("4-1") && warn.contains("overshoots"), "{warn}");
+        assert_eq!(draft(&state).tally_warning(Some(super::Side::Left)), None);
+
+        // Unknown best-of: nothing to judge against.
+        match &mut state.ui.modal {
+            Some(Modal::Report(d)) => d.best_of = None,
+            _ => unreachable!(),
+        }
+        assert_eq!(draft(&state).tally_warning(None), None);
     }
 
     fn call_top_candidate(state: &mut AppState, setup_digit: char) -> super::UpdateEffects {

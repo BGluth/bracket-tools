@@ -883,6 +883,9 @@ fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
         }
         ReportStage::Confirm { dq } => {
             lines.push(Line::from(format!("submit: {}?", draft.summary(*dq))).style(Style::new().add_modifier(Modifier::BOLD)));
+            if let Some(warning) = draft.tally_warning(*dq) {
+                lines.push(Line::from(format!("⚠ {warning} — submit anyway?")).style(Style::new().fg(Color::Yellow)));
+            }
             lines.push(Line::from("y/Enter submit · Esc back (add more games)"));
         }
     }
