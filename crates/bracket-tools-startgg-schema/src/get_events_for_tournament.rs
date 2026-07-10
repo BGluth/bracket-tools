@@ -27,6 +27,13 @@ pub struct Event {
     pub id: Option<Id>,
     pub slug: Option<String>,
     pub name: Option<String>,
+    pub videogame: Option<Videogame>,
+}
+
+#[derive(cynic::QueryFragment, Debug, Clone)]
+pub struct Videogame {
+    pub id: Option<Id>,
+    pub name: Option<String>,
 }
 
 #[cfg(test)]
@@ -43,5 +50,6 @@ mod tests {
 
         assert!(operation.query.contains("tournament"));
         assert!(operation.query.contains("events"));
+        assert!(operation.query.contains("videogame"));
     }
 }

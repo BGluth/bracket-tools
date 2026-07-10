@@ -214,11 +214,12 @@ pub fn extract_event_characters(response: GetEventCharacters) -> Vec<CharacterIn
 }
 
 /// One event listed by a tournament: the full event slug (the form every
-/// per-event query takes) plus its display name.
+/// per-event query takes) plus its display name and videogame name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventInfo {
     pub slug: String,
     pub name: Option<String>,
+    pub videogame: Option<String>,
 }
 
 /// Flattens a tournament-events response; infallible by design (an unknown
@@ -230,7 +231,13 @@ pub fn extract_tournament_events(response: GetEventsForTournament) -> Vec<EventI
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|e| Some(EventInfo { slug: e.slug?, name: e.name }))
+        .filter_map(|e| {
+            Some(EventInfo {
+                slug: e.slug?,
+                name: e.name,
+                videogame: e.videogame.and_then(|v| v.name),
+            })
+        })
         .collect()
 }
 

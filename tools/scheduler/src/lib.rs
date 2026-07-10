@@ -5,6 +5,7 @@ pub mod conflict;
 pub mod duration;
 pub mod fixture_source;
 pub mod graph;
+pub mod init;
 pub mod model;
 pub mod persist;
 pub mod poller;

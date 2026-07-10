@@ -17,10 +17,11 @@ use std::{
 use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
     app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
-    cli::{build_live_source, default_data_dir, resolve_token, Cli},
+    cli::{build_live_source, default_config_dir, default_data_dir, resolve_token, Cli, CONFIG_FILE},
     config::{referenced_types, resolve_roster, write_starter_template, SetupCounts},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
+    init::{generate_config, parse_tournament_slug, GameSetups, InitError, GAME_SETUPS_FILE, GAME_SETUPS_TEMPLATE},
     model::BracketId,
     persist::{
         load_overlay, load_setup_defaults, load_snapshot, save_overlay, save_setup_defaults, save_snapshot, sibling_with_suffix, Load,
@@ -37,6 +38,7 @@ use bracket_tools_scheduler::{
     writer::{run_writer, WriterConfig},
     SchedulerConfig,
 };
+use bracket_tools_startgg::GGProvider;
 use clap::Parser;
 use crossterm::event::{Event, KeyEventKind};
 use tokio::{
@@ -60,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     if let Some(path) = &cli.replay {
         return play_replay(path, cli.frame_ms).with_context(|| format!("playing {}", path.display()));
+    }
+    if let Some(input) = &cli.init_tournament {
+        return init_tournament(&cli, input).await;
     }
     let config_path = cli.config_path();
 
@@ -96,6 +101,66 @@ fn build_offline_source(cli: &Cli) -> anyhow::Result<FixtureSource> {
         let spec = cli.synth.as_deref().expect("offline() implies a synth spec");
         FixtureSource::from_synth_spec(spec).context("building the --synth world")
     }
+}
+
+/// `--init-tournament`: fetch the event list, seed setup types from the
+/// operator's game mapping, write a per-tournament config, and exit.
+async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
+    let slug = parse_tournament_slug(input)?;
+    let target = cli.config.clone().unwrap_or_else(|| PathBuf::from(CONFIG_FILE));
+    if target.exists() {
+        bail!(InitError::ConfigExists {
+            path: target.display().to_string()
+        });
+    }
+
+    let token = resolve_token(cli.token.as_deref(), &SchedulerConfig::default())?;
+    let provider = GGProvider::builder(token).build().context("building the start.gg client")?;
+    let events = provider
+        .fetch_tournament_events(&slug)
+        .await
+        .with_context(|| format!("listing events for {slug}"))?;
+    if events.is_empty() {
+        bail!(InitError::NoEvents { slug });
+    }
+
+    let mapping_path = default_config_dir().join(GAME_SETUPS_FILE);
+    if !mapping_path.exists() {
+        if let Some(parent) = mapping_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(&mapping_path, GAME_SETUPS_TEMPLATE).with_context(|| format!("writing {}", mapping_path.display()))?;
+        println!(
+            "wrote a game-setups template to {} — fill in your games' setup types\n\
+             and re-run to get typed pools (this run uses one shared default pool)\n",
+            mapping_path.display()
+        );
+    }
+    let mapping = GameSetups::load(&mapping_path);
+
+    let text = generate_config(&slug, &events, &mapping, &default_data_dir());
+    fs::write(&target, &text).with_context(|| format!("writing {}", target.display()))?;
+    SchedulerConfig::load(&target).context("the generated config failed validation (bug — please report)")?;
+
+    println!("{slug}: {} event(s)", events.len());
+    for event in &events {
+        let game = event.videogame.as_deref().unwrap_or("<unknown game>");
+        let types = event
+            .videogame
+            .as_deref()
+            .and_then(|g| mapping.match_game(g))
+            .map(|entry| entry.setup_types.join(", "));
+        match types {
+            Some(types) => println!("  {} — {game} → [{types}]", event.slug),
+            None => println!("  {} — {game} → default pool (no game-setups.toml match)", event.slug),
+        }
+    }
+    println!(
+        "\nwrote {} — review it (delete events you are not calling), then run\n\
+         `scheduler` here. Station counts come from your saved defaults + the 's' modal.",
+        target.display()
+    );
+    Ok(())
 }
 
 /// Picks the offline run's config. A *discovered* config (no `--config`
@@ -217,9 +282,15 @@ where
     F: Fn(&S::Error) -> PollFailure + Send + Sync + Clone + 'static,
 {
     // Single-instance guard, held for the process lifetime. An offline run
-    // uses sibling paths so a rehearsal never touches (or races) live state.
-    let state_path = persisted_path(config.state_file.as_deref(), DEFAULT_STATE_FILE, cli.offline());
-    let snapshot_path = persisted_path(config.snapshot_file.as_deref(), DEFAULT_SNAPSHOT_FILE, cli.offline());
+    // uses sibling paths so a rehearsal never touches (or races) live state;
+    // default names carry the world tag so two tournaments never share state.
+    let tag = world_tag(&cli, &config);
+    let state_path = persisted_path(config.state_file.as_deref(), &format!("{tag}-{DEFAULT_STATE_FILE}"), cli.offline());
+    let snapshot_path = persisted_path(
+        config.snapshot_file.as_deref(),
+        &format!("{tag}-{DEFAULT_SNAPSHOT_FILE}"),
+        cli.offline(),
+    );
     if let Some(parent) = state_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -279,6 +350,42 @@ where
     drop(guard);
     tasks.join_set.abort_all();
     Ok(())
+}
+
+/// What this session is running, for default state-file names: the synth
+/// spec, else the tournament (config pin or the first bracket slug's
+/// `tournament/<x>` segment), else the legacy bare prefix.
+fn world_tag(cli: &Cli, config: &SchedulerConfig) -> String {
+    if let Some(spec) = &cli.synth {
+        return sanitize_tag(&format!("synth-{spec}"));
+    }
+    let tournament = config
+        .tournament_slug
+        .as_deref()
+        .or_else(|| config.brackets.first().map(|b| b.slug.as_str()))
+        .and_then(|slug| {
+            let mut parts = slug.split('/');
+            match (parts.next(), parts.next()) {
+                (Some("tournament"), Some(name)) => Some(name.to_owned()),
+                (Some(name), _) if !name.is_empty() => Some(name.to_owned()),
+                _ => None,
+            }
+        });
+    tournament.map(|t| sanitize_tag(&t)).unwrap_or_else(|| "default".to_owned())
+}
+
+/// Filesystem-safe tag: alphanumerics pass, runs of anything else collapse
+/// to one dash.
+fn sanitize_tag(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
 }
 
 /// Where a persisted document lives: the configured path, else the default
@@ -632,10 +739,36 @@ fn now_millis() -> UnixMillis {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{env, fs, path::PathBuf, process};
+mod world_tag_tests {
+    use bracket_tools_scheduler::config::BracketConfig;
+    use clap::Parser;
 
-    use std::collections::BTreeMap;
+    use super::{world_tag, Cli, SchedulerConfig};
+
+    #[test]
+    fn tags_follow_synth_spec_then_tournament_then_legacy() {
+        let synth = Cli::try_parse_from(["scheduler", "--synth", "de:32,rr:8"]).unwrap();
+        assert_eq!(world_tag(&synth, &SchedulerConfig::default()), "synth-de-32-rr-8");
+
+        let live = Cli::try_parse_from(["scheduler"]).unwrap();
+        let mut config = SchedulerConfig {
+            tournament_slug: Some("tournament/french-bread-rumble-100".to_owned()),
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(world_tag(&live, &config), "french-bread-rumble-100");
+
+        config.tournament_slug = None;
+        config.brackets = vec![BracketConfig::new("tournament/fbr/event/melee")];
+        assert_eq!(world_tag(&live, &config), "fbr");
+
+        config.brackets.clear();
+        assert_eq!(world_tag(&live, &config), "default");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, env, fs, path::PathBuf, process};
 
     use bracket_tools_scheduler::{
         config::{BracketConfig, OneOrMany, SchedulerConfig, SetupCounts},

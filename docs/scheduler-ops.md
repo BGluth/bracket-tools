@@ -10,6 +10,17 @@ authoritative for sets the desk manages.** Everything here protects that.
 
 ## Before doors (Thursday night + Friday morning)
 
+0. **Config from the live tournament (recommended).** `scheduler --init-tournament
+   <start.gg URL or tournament/slug>` fetches the published event list and writes a
+   ready-to-review `./scheduler.toml`: one `[[brackets]]` per event, each event's
+   `setup_type` seeded from the global `~/.config/bracket-tools/game-setups.toml`
+   mapping (videogame → your setup-type labels; a template is written on first run).
+   Re-running it right before doors picks up late bracket changes — delete the old
+   scheduler.toml first, and delete generated events you are not calling (e.g. a
+   matchmaking ladder). Station counts are never in the config: the tool uses your
+   saved per-type defaults and the in-tool `s` modal, which persists new counts.
+   State/snapshot files default to per-tournament names (`<tournament>-scheduler-
+   state.json`), so two tournaments never share crash-recovery state.
 1. **Token.** The API token lives at `~/work/tokens/scraper_gg.token` (or point `token_file`
    in the config, or pass `-t`, or set `STARTGG_TOKEN`). Never commit it. Never run two
    things on the same token during the event (see lockfile + rate budget below).
@@ -95,6 +106,11 @@ rights — the safe default for a review/rehearsal). The tool opens on the setup
   cross-tournament defaults, so the next run assumes today's counts. **u** undoes.
 - **i** inspect (why a set is not callable) · **n** notices/log · **w** pending writes +
   divergence ledger · **?** context help.
+- **Enter** on the queue quick-calls the highlighted set onto its lowest-numbered free
+  candidate setup (for when the station doesn't matter). **PgUp/PgDn** page the queue and
+  every list modal by one box height. Boards past ten stations buffer digit keys
+  (`1` `4` = setup 14; Enter commits early, Esc clears — the pending digits show in the
+  status line).
 
 Calls happen by **voice**; the start.gg writes are bookkeeping and never block advising. If
 writes are parked (non-admin, or a mutation failed), keep calling — the queue keeps working.

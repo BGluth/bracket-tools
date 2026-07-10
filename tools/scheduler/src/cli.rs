@@ -104,6 +104,17 @@ pub struct Cli {
     /// Run the startup preflight, print its report, and exit.
     #[arg(long)]
     pub preflight_only: bool,
+
+    /// Generate a per-tournament config from a start.gg tournament URL (or
+    /// `tournament/<slug>`): lists its events, seeds each event's setup
+    /// types from the global game-setups.toml mapping, and writes
+    /// ./scheduler.toml (or --config's path) for review. Exits after writing.
+    #[arg(
+        long,
+        value_name = "URL_OR_SLUG",
+        conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "replay", "preflight_only"]
+    )]
+    pub init_tournament: Option<String>,
 }
 
 impl Cli {
@@ -135,6 +146,15 @@ impl Cli {
 pub fn default_data_dir() -> PathBuf {
     match project_dirs() {
         Some(dirs) => dirs.data_dir().to_path_buf(),
+        None => PathBuf::from("."),
+    }
+}
+
+/// XDG config dir (scheduler.toml's default home, and the global
+/// game-setups mapping); the working directory stands in when no home exists.
+pub fn default_config_dir() -> PathBuf {
+    match project_dirs() {
+        Some(dirs) => dirs.config_dir().to_path_buf(),
         None => PathBuf::from("."),
     }
 }
