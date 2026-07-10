@@ -14,6 +14,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
+    path::Path,
     time::Duration,
 };
 
@@ -27,6 +28,7 @@ use crate::{
     duration::DurationModel,
     fixture_source::{schema_set_from_live, FixtureError, FixtureSource},
     model::{live_sets_from_schema, phase_groups_from_schema, BracketId, EntrantId, LiveSet, PlayerId, Prereq, SetId, SlotOccupant},
+    roster_cache,
     set_source::SetSource,
     simulator::{simulate_recorded, ScriptFrame, SimBracket, SimWorld},
 };
@@ -107,6 +109,7 @@ pub async fn seed_fixture_from_live<S: SetSource>(
     source: &S,
     config: &SchedulerConfig,
     request_timeout: Duration,
+    roster_dir: Option<&Path>,
 ) -> Result<FixtureSource, RehearsalError> {
     let mut fixture = FixtureSource::new();
     for bracket in &config.brackets {
@@ -126,6 +129,18 @@ pub async fn seed_fixture_from_live<S: SetSource>(
         let (groups, _) = phase_groups_from_schema(&structure);
         let (live, _warnings, _skipped) = live_sets_from_schema(sets);
         fixture.add_synth_event(&bracket.slug, &groups, vec![live]);
+
+        // Real reporting vocabulary, best-effort: a rehearsal without one
+        // falls back to the placeholder roster. Fetched live, so it also
+        // warms the roster cache for later runs.
+        if let Ok(Ok(roster)) = timeout(request_timeout, source.fetch_event_characters(&bracket.slug)).await {
+            if !roster.is_empty() {
+                if let Some(dir) = roster_dir {
+                    roster_cache::save(dir, &bracket.slug, &roster);
+                }
+                fixture.set_event_roster(&bracket.slug, roster);
+            }
+        }
     }
     Ok(fixture)
 }
@@ -351,6 +366,8 @@ fn rebase(ts_secs: i64, anchor_secs: i64, speed: f64) -> i64 {
 mod tests {
     use std::{slice::from_ref, time::Duration};
 
+    use bracket_tools_startgg::CharacterInfo;
+
     use super::{install_rehearsal, seed_fixture_from_live, RehearsalError};
     use crate::{
         config::{BracketConfig, SchedulerConfig, SetupCounts},
@@ -446,8 +463,16 @@ mod tests {
     async fn seeds_a_fixture_from_a_live_source_and_rehearses_it() {
         // The "live API" is itself a fixture — SetSource is the only seam
         // seed_fixture_from_live uses.
-        let (live, config) = synth_setup(&[SLUG]);
-        let mut seeded = seed_fixture_from_live(&live, &config, Duration::from_secs(1)).await.unwrap();
+        let (mut live, config) = synth_setup(&[SLUG]);
+        let ultimate_cast = vec![CharacterInfo {
+            id: 1386,
+            name: "Banjo & Kazooie".to_owned(),
+        }];
+        live.set_event_roster(SLUG, ultimate_cast.clone());
+        let mut seeded = seed_fixture_from_live(&live, &config, Duration::from_secs(1), None).await.unwrap();
+
+        // The live source's real roster rides along instead of the placeholder.
+        assert_eq!(seeded.fetch_event_characters(SLUG).await.unwrap(), ultimate_cast);
 
         let report = install_rehearsal(&mut seeded, &config, 60.0, NOW).await.unwrap();
         assert!(report.blocked.is_empty());
@@ -456,10 +481,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seeding_warms_the_roster_cache() {
+        let dir = std::env::temp_dir().join(format!("bt-rehearse-roster-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut live, config) = synth_setup(&[SLUG]);
+        let cast = vec![CharacterInfo {
+            id: 7,
+            name: "Fox".to_owned(),
+        }];
+        live.set_event_roster(SLUG, cast.clone());
+
+        seed_fixture_from_live(&live, &config, Duration::from_secs(1), Some(&dir))
+            .await
+            .unwrap();
+        assert_eq!(crate::roster_cache::load(&dir, SLUG), Some(cast));
+    }
+
+    #[tokio::test]
     async fn seeding_a_missing_event_names_it() {
         let (live, mut config) = synth_setup(&[SLUG]);
         config.brackets.push(bracket_config("tournament/other/event/x"));
-        let Err(err) = seed_fixture_from_live(&live, &config, Duration::from_secs(1)).await else {
+        let Err(err) = seed_fixture_from_live(&live, &config, Duration::from_secs(1), None).await else {
             panic!("expected the missing event to error");
         };
         assert!(matches!(err, RehearsalError::LiveFetch { .. }), "{err:?}");

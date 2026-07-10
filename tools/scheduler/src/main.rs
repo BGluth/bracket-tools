@@ -115,7 +115,7 @@ async fn rehearse(cli: Cli, config_path: &Path) -> anyhow::Result<()> {
     let token = resolve_token(cli.token.as_deref(), &config)?;
     let live = build_live_source(token)?;
     println!("rehearse: fetching {} event(s) from live start.gg…", config.brackets.len());
-    let mut source = seed_fixture_from_live(&live, &config, PREFLIGHT_TIMEOUT)
+    let mut source = seed_fixture_from_live(&live, &config, PREFLIGHT_TIMEOUT, Some(&default_data_dir()))
         .await
         .context("seeding the rehearsal world")?;
     if cli.autoplay {

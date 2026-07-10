@@ -142,6 +142,9 @@ struct EventFixture {
 #[derive(Default)]
 pub struct FixtureSource {
     events: Mutex<HashMap<String, EventFixture>>,
+    /// Real per-event rosters (`--rehearse` seeds them from the live API);
+    /// events without one answer the FIXTURE_ROSTER placeholder.
+    rosters: Mutex<HashMap<String, Vec<CharacterInfo>>>,
     mutations: Mutex<Vec<MutationRecord>>,
     reports: Mutex<Vec<ReportRecord>>,
     /// Scripted admin-probe answer; unset answers as a full admin (id 1) so
@@ -286,6 +289,12 @@ impl FixtureSource {
     }
 
     /// Makes every fetch for `slug` hang forever (wedged-host fixture).
+    /// Installs an event's real character roster; its `fetch_event_characters`
+    /// answers this instead of the placeholder.
+    pub fn set_event_roster(&mut self, slug: &str, roster: Vec<CharacterInfo>) {
+        self.rosters.lock().unwrap().insert(capture_key(slug), roster);
+    }
+
     pub fn set_hang(&mut self, slug: &str) {
         self.events
             .get_mut()
@@ -448,6 +457,9 @@ impl SetSource for FixtureSource {
     async fn fetch_event_characters(&self, event_slug: &str) -> Result<Vec<CharacterInfo>, FixtureError> {
         if !self.events.lock().unwrap().contains_key(&capture_key(event_slug)) {
             return Err(FixtureError::UnknownEvent(event_slug.to_owned()));
+        }
+        if let Some(roster) = self.rosters.lock().unwrap().get(&capture_key(event_slug)) {
+            return Ok(roster.clone());
         }
         Ok(FIXTURE_ROSTER
             .iter()
