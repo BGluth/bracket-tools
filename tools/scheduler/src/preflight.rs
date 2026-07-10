@@ -601,9 +601,11 @@ mod tests {
 
     #[tokio::test]
     async fn advisor_only_without_pinned_called_int_escalates_soft_busy() {
+        // The CALLED int is pinned by default now; blindness needs an
+        // explicit unpin.
         let source = two_event_source();
-        let config = config_for(&[ULTIMATE, MELEE]);
-        assert_eq!(config.known_called_state_int, None);
+        let mut config = config_for(&[ULTIMATE, MELEE]);
+        config.known_called_state_int = None;
 
         // Not asking for writes at all: escalation still arms (detection is
         // just as blind), and the report says so.
@@ -612,9 +614,9 @@ mod tests {
         assert!(report.escalate_soft_busy);
         assert!(report.render().contains("remote-call detection degraded"));
 
-        // A pinned int quiets it.
-        let mut pinned = config_for(&[ULTIMATE, MELEE]);
-        pinned.known_called_state_int = Some(6);
+        // The (default) pinned int quiets it.
+        let pinned = config_for(&[ULTIMATE, MELEE]);
+        assert_eq!(pinned.known_called_state_int, Some(6));
         let report = preflight(&source, &pinned, TIMEOUT, false, classify).await;
         assert!(!report.escalate_soft_busy);
     }

@@ -17,7 +17,7 @@ use std::{
 use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
     app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
-    cli::{build_live_source, default_config_dir, default_data_dir, resolve_token, Cli, CONFIG_FILE},
+    cli::{build_live_source, default_config_dir, default_data_dir, resolve_token, tournaments_dir, Cli},
     config::{referenced_types, resolve_roster, write_starter_template, SetupCounts},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
@@ -66,7 +66,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(input) = &cli.init_tournament {
         return init_tournament(&cli, input).await;
     }
-    let config_path = cli.config_path();
+    let config_path = match &cli.tournament {
+        Some(slug) => tournament_config_path(slug)?,
+        None => cli.config_path(),
+    };
 
     if cli.offline() {
         let mut source = build_offline_source(&cli)?;
@@ -103,16 +106,43 @@ fn build_offline_source(cli: &Cli) -> anyhow::Result<FixtureSource> {
     }
 }
 
+/// Resolves `--tournament <slug>` to its config under the tournaments dir;
+/// a unique filename prefix also works. Misses list what is available.
+fn tournament_config_path(slug: &str) -> anyhow::Result<PathBuf> {
+    let dir = tournaments_dir();
+    let exact = dir.join(format!("{slug}.toml"));
+    if exact.exists() {
+        return Ok(exact);
+    }
+    let known: Vec<String> = fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".toml").map(str::to_owned)
+        })
+        .collect();
+    let mut matches = known.iter().filter(|name| name.starts_with(slug));
+    match (matches.next(), matches.next()) {
+        (Some(only), None) => {
+            println!("--tournament {slug}: using {only}");
+            Ok(dir.join(format!("{only}.toml")))
+        }
+        _ => bail!(
+            "no tournament config for {slug:?} under {} (known: {}) — run --init-tournament first",
+            dir.display(),
+            if known.is_empty() { "none".to_owned() } else { known.join(", ") }
+        ),
+    }
+}
+
 /// `--init-tournament`: fetch the event list, seed setup types from the
 /// operator's game mapping, write a per-tournament config, and exit.
 async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
     let slug = parse_tournament_slug(input)?;
-    let target = cli.config.clone().unwrap_or_else(|| PathBuf::from(CONFIG_FILE));
-    if target.exists() {
-        bail!(InitError::ConfigExists {
-            path: target.display().to_string()
-        });
-    }
+    let bare = slug.strip_prefix("tournament/").unwrap_or(&slug).to_owned();
+    let target = cli.config.clone().unwrap_or_else(|| tournaments_dir().join(format!("{bare}.toml")));
 
     let token = resolve_token(cli.token.as_deref(), &SchedulerConfig::default())?;
     let provider = GGProvider::builder(token).build().context("building the start.gg client")?;
@@ -139,6 +169,15 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
     let mapping = GameSetups::load(&mapping_path);
 
     let text = generate_config(&slug, &events, &mapping, &default_data_dir());
+    if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    // Regenerating is the expected refresh flow; the old file survives as .bak.
+    if target.exists() {
+        let backup = sibling_with_suffix(&target, "bak");
+        let _ = fs::rename(&target, &backup);
+        println!("previous config kept at {}", backup.display());
+    }
     fs::write(&target, &text).with_context(|| format!("writing {}", target.display()))?;
     SchedulerConfig::load(&target).context("the generated config failed validation (bug — please report)")?;
 
@@ -156,8 +195,9 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
         }
     }
     println!(
-        "\nwrote {} — review it (delete events you are not calling), then run\n\
-         `scheduler` here. Station counts come from your saved defaults + the 's' modal.",
+        "\nwrote {} — review it (delete events you are not calling), then run:\n\
+         \n    scheduler --tournament {bare}\n\
+         \nStation counts come from your saved defaults + the 's' modal.",
         target.display()
     );
     Ok(())

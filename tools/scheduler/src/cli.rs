@@ -108,13 +108,25 @@ pub struct Cli {
     /// Generate a per-tournament config from a start.gg tournament URL (or
     /// `tournament/<slug>`): lists its events, seeds each event's setup
     /// types from the global game-setups.toml mapping, and writes
-    /// ./scheduler.toml (or --config's path) for review. Exits after writing.
+    /// <config-dir>/tournaments/<slug>.toml (or --config's path) for review,
+    /// overwriting any previous one (kept as .bak). Exits after writing;
+    /// launch with --tournament <slug>.
     #[arg(
         long,
         value_name = "URL_OR_SLUG",
-        conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "replay", "preflight_only"]
+        conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "replay", "preflight_only", "tournament"]
     )]
     pub init_tournament: Option<String>,
+
+    /// Run a tournament initialized with --init-tournament: resolves the
+    /// config at <config-dir>/tournaments/<slug>.toml (a unique prefix of
+    /// the slug works too).
+    #[arg(
+        long,
+        value_name = "SLUG",
+        conflicts_with_all = ["simulate", "synth", "autoplay", "pace", "replay", "config"]
+    )]
+    pub tournament: Option<String>,
 }
 
 impl Cli {
@@ -157,6 +169,12 @@ pub fn default_config_dir() -> PathBuf {
         Some(dirs) => dirs.config_dir().to_path_buf(),
         None => PathBuf::from("."),
     }
+}
+
+/// Where `--init-tournament` writes and `--tournament` looks up per-
+/// tournament configs.
+pub fn tournaments_dir() -> PathBuf {
+    default_config_dir().join("tournaments")
 }
 
 fn project_dirs() -> Option<ProjectDirs> {

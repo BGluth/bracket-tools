@@ -12,15 +12,18 @@ authoritative for sets the desk manages.** Everything here protects that.
 
 0. **Config from the live tournament (recommended).** `scheduler --init-tournament
    <start.gg URL or tournament/slug>` fetches the published event list and writes a
-   ready-to-review `./scheduler.toml`: one `[[brackets]]` per event, each event's
-   `setup_type` seeded from the global `~/.config/bracket-tools/game-setups.toml`
-   mapping (videogame → your setup-type labels; a template is written on first run).
-   Re-running it right before doors picks up late bracket changes — delete the old
-   scheduler.toml first, and delete generated events you are not calling (e.g. a
-   matchmaking ladder). Station counts are never in the config: the tool uses your
-   saved per-type defaults and the in-tool `s` modal, which persists new counts.
-   State/snapshot files default to per-tournament names (`<tournament>-scheduler-
-   state.json`), so two tournaments never share crash-recovery state.
+   ready-to-review config to `~/.config/bracket-tools/tournaments/<slug>.toml`: one
+   `[[brackets]]` per event, each event's `setup_type` seeded from the global
+   `~/.config/bracket-tools/game-setups.toml` mapping (videogame → your setup-type
+   labels; a template is written on first run; optional per-game minutes seed
+   duration priors). Launch it with `scheduler --tournament <slug>` (a unique prefix
+   works). Re-running init right before doors picks up late bracket changes — it
+   overwrites, keeping the old file as `.bak`; re-delete generated events you are
+   not calling (e.g. a matchmaking ladder). Station counts are never in the config:
+   the tool uses your saved per-type defaults and the in-tool `s` modal, which
+   persists new counts. State/snapshot files default to per-tournament names
+   (`<tournament>-scheduler-state.json`), so two tournaments never share
+   crash-recovery state.
 1. **Token.** The API token lives at `~/work/tokens/scraper_gg.token` (or point `token_file`
    in the config, or pass `-t`, or set `STARTGG_TOKEN`). Never commit it. Never run two
    things on the same token during the event (see lockfile + rate budget below).

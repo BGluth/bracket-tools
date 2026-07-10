@@ -51,9 +51,6 @@ pub enum InitError {
     #[error("cannot read a tournament slug out of {input:?} (expected a start.gg URL or a `tournament/<slug>`)")]
     BadSlug { input: String },
 
-    #[error("{path} already exists — move or delete it first, then re-run --init-tournament")]
-    ConfigExists { path: String },
-
     #[error("tournament {slug:?} answered no events (slug typo, or a hidden/unpublished tournament?)")]
     NoEvents { slug: String },
 }
@@ -141,20 +138,13 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
         events.len()
     );
     let _ = writeln!(out, "tournament_slug = \"{tournament_slug}\"\n");
-    let _ = writeln!(
+    let _ = write!(
         out,
         "# Per-tournament state (crash recovery + offline cold-start cache).\n\
          state_file = \"{}\"\n\
-         snapshot_file = \"{}\"\n",
+         snapshot_file = \"{}\"",
         data_dir.join(format!("{bare}-state.json")).display(),
         data_dir.join(format!("{bare}-snapshot.json")).display(),
-    );
-    let _ = writeln!(
-        out,
-        "# start.gg's observed set-state vocabulary (1=pending 2=in-progress\n\
-         # 3=completed 6=called).\n\
-         known_called_state_int = 6\n\
-         known_in_progress_state_int = 2"
     );
 
     for event in events {

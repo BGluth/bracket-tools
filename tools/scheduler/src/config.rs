@@ -61,9 +61,10 @@ rest_window_secs = 300
 #state_file = "scheduler-state.json"
 #snapshot_file = "scheduler-snapshot.json"
 
-# Live-observed start.gg state ints; leave pinned unless start.gg changes.
-known_called_state_int = 6
-known_in_progress_state_int = 2
+# Live-observed start.gg state ints (1=pending 2=in-progress 3=completed
+# 6=called). Already the defaults; override only if start.gg changes.
+#known_called_state_int = 6
+#known_in_progress_state_int = 2
 
 # Same-human links across events, by player id: fill from the preflight
 # identity-split report.
@@ -239,13 +240,13 @@ pub struct SchedulerConfig {
     /// 3=completed); CALLED is pinned separately.
     #[serde(default = "default_benign_state_ints")]
     pub known_benign_state_ints: Vec<i32>,
-    /// Pinned CALLED state int (live-observed: 6). Learned from write
-    /// responses when unset.
-    #[serde(default)]
+    /// Pinned CALLED state int. start.gg's vocabulary is stable, so the
+    /// live-observed value is the default; override only if the platform
+    /// changes.
+    #[serde(default = "default_called_state_int")]
     pub known_called_state_int: Option<i32>,
-    /// Pinned IN_PROGRESS state int (live-observed: 2). Learned from write
-    /// responses when unset.
-    #[serde(default)]
+    /// Pinned IN_PROGRESS state int (same story as CALLED).
+    #[serde(default = "default_in_progress_state_int")]
     pub known_in_progress_state_int: Option<i32>,
     /// Overlay (local operator state) path; defaults to ./scheduler-state.json
     /// beside the tool. The single-instance lockfile lives beside it.
@@ -280,8 +281,8 @@ impl Default for SchedulerConfig {
             tournament_slug: None,
             advisor_only: false,
             known_benign_state_ints: default_benign_state_ints(),
-            known_called_state_int: None,
-            known_in_progress_state_int: None,
+            known_called_state_int: default_called_state_int(),
+            known_in_progress_state_int: default_in_progress_state_int(),
             state_file: None,
             snapshot_file: None,
             log_file: None,
@@ -416,11 +417,7 @@ pub fn resolve_roster(config: &SchedulerConfig) -> RosterResolution {
 /// The stations a bracket's types entitle it to, before per-setup overrides
 /// (those fold in via `conflict::effective_pool`).
 pub fn pool_for_types(setup_types: &[String], roster: &[(SetupId, String)]) -> Vec<SetupId> {
-    let mut pool: Vec<SetupId> = roster
-        .iter()
-        .filter(|(_, t)| setup_types.contains(t))
-        .map(|(id, _)| *id)
-        .collect();
+    let mut pool: Vec<SetupId> = roster.iter().filter(|(_, t)| setup_types.contains(t)).map(|(id, _)| *id).collect();
     pool.sort();
     pool
 }
@@ -579,6 +576,16 @@ fn default_benign_state_ints() -> Vec<i32> {
     vec![1, 2, 3]
 }
 
+// start.gg's live-observed vocabulary (1=pending 2=in-progress 3=completed
+// 6=called) — platform-wide, not per-tournament.
+fn default_called_state_int() -> Option<i32> {
+    Some(6)
+}
+
+fn default_in_progress_state_int() -> Option<i32> {
+    Some(2)
+}
+
 fn default_rest_sim_horizon_secs() -> u64 {
     DEFAULT_REST_SIM_HORIZON_SECS
 }
@@ -639,7 +646,8 @@ mod tests {
         assert_eq!(config.poll_interval_secs, DEFAULT_POLL_INTERVAL_SECS);
         assert_eq!(config.per_page, DEFAULT_PER_PAGE);
         assert!(!config.advisor_only);
-        assert_eq!(config.known_called_state_int, None);
+        assert_eq!(config.known_called_state_int, Some(6), "live vocabulary is the default");
+        assert_eq!(config.known_in_progress_state_int, Some(2));
     }
 
     #[test]
