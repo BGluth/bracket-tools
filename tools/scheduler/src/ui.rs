@@ -225,6 +225,13 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMil
         ));
     }
 
+    if let Some(pending) = &state.ui.setup_entry {
+        spans.push(Span::styled(
+            format!(" setup {}_ ", pending.digits),
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let healthy = state.brackets.iter().filter(|b| b.health == PollHealth::Ok).count();
     let oldest = state
         .brackets
@@ -796,7 +803,9 @@ fn draw_help(frame: &mut Frame<'_>) {
     frame.render_widget(Clear, area);
     let text = [
         "1-9/0     pick a free setup (call picker) / select an occupied one",
-        "Enter     commit the selected call (in picker)",
+        "          (boards past 10 stations buffer digits: 1 4 = setup 14)",
+        "Enter     call the highlighted queue entry on its first free setup",
+        "          (in picker: commit the selected call)",
         "p         selected setup: called -> in progress",
         "f         selected setup: free, awaiting remote result",
         "r         selected setup: un-call, set returns to the queue",

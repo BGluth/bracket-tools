@@ -25,12 +25,15 @@ use crate::{
     model::{BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
     persist::{BracketSnapshot, OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     ranker::GreedyRanker,
-    world::{assigned_sets, recompute, BracketState, RolloutRankings, RolloutRow, SimSnapshot, World, WorldInputs},
+    world::{assigned_sets, recompute, BracketState, QueueEntry, RolloutRankings, RolloutRow, SimSnapshot, World, WorldInputs},
 };
 
 /// How long `z` parks a queue entry.
 pub const SNOOZE_SECS: i64 = 300;
 const NOTICE_CAP: usize = 200;
+/// How long a buffered setup digit waits for a second keystroke before the
+/// next tick commits it as-is.
+const SETUP_ENTRY_GRACE_MS: i64 = 800;
 /// Idle refresh cadence for the time-derived world terms (rest windows,
 /// snooze expiry, wait credit). A recompute runs a full forward sim, so a
 /// bare tick only triggers one when the world is at least this stale;
@@ -433,6 +436,17 @@ pub struct UiState {
     pub selected_setup: Option<SetupId>,
     /// Cursor into `world.queue` (snooze target / inspection).
     pub queue_ix: usize,
+    /// Digits typed toward a setup number on a >10-station board; commits on
+    /// Enter, on becoming unambiguous, or on the next tick past the grace
+    /// window.
+    pub setup_entry: Option<PendingSetupEntry>,
+}
+
+/// A partially-typed setup number (boards past ten stations need two keys).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingSetupEntry {
+    pub digits: String,
+    pub at: UnixMillis,
 }
 
 /// Per-bracket poll bookkeeping around the recompute-facing [`BracketState`].
@@ -910,6 +924,16 @@ pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateE
         Msg::SimResult(rankings) => apply_sim_result(state, rankings),
         Msg::Tick => {
             scan_no_shows(state, now_millis);
+            // Digits waiting on a possible second keystroke commit once the
+            // grace window passes.
+            if state
+                .ui
+                .setup_entry
+                .as_ref()
+                .is_some_and(|p| now_millis - p.at >= SETUP_ENTRY_GRACE_MS)
+            {
+                commit_setup_entry(state, now_millis, &mut effects);
+            }
             // A recompute runs a full forward sim; only refresh the
             // time-derived terms once they're meaningfully stale.
             if now_millis - state.last_recompute >= WORLD_REFRESH_MS {
@@ -966,7 +990,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
     match key.code {
         KeyCode::Char('q') => effects.quit = true,
         KeyCode::Char('?') => state.ui.modal = Some(Modal::Help),
-        KeyCode::Char(c @ '0'..='9') => select_setup(state, c, now, effects),
+        KeyCode::Char(c @ '0'..='9') => enter_setup_digit(state, c, now, effects),
+        KeyCode::Enter if state.ui.setup_entry.is_some() => commit_setup_entry(state, now, effects),
+        KeyCode::Enter => quick_call_selected(state, now, effects),
+        KeyCode::Esc => state.ui.setup_entry = None,
         KeyCode::Char('p') => progress_selected(state, now, effects),
         KeyCode::Char('f') => free_selected(state, now, effects),
         KeyCode::Char('r') => requeue_selected(state, now, effects),
@@ -1115,8 +1142,36 @@ pub(crate) fn picker_rows(state: &AppState, setup: SetupId) -> (Vec<RolloutRow>,
 }
 
 /// Digits map straight to the TO's setup numbering (`SetupId(d)`, `0` = 10).
-fn select_setup(state: &mut AppState, digit: char, now: UnixMillis, effects: &mut UpdateEffects) {
-    let number = digit.to_digit(10).map(|d| if d == 0 { 10 } else { d }).unwrap_or(0);
+/// One digit toward a setup number. Boards of ten or fewer stations keep the
+/// classic instant keys (`1`-`9`, `0` = 10); bigger boards buffer digits
+/// until the number can no longer grow into a station (or Enter / the tick
+/// grace window commits it).
+fn enter_setup_digit(state: &mut AppState, digit: char, now: UnixMillis, effects: &mut UpdateEffects) {
+    let max_station = state.board.setups().iter().map(|s| s.id.0).max().unwrap_or(0);
+    let mut digits = state.ui.setup_entry.take().map(|p| p.digits).unwrap_or_default();
+    digits.push(digit);
+    let number = parse_setup_digits(&digits);
+    if max_station > 10 && number != 10 && number * 10 <= max_station {
+        state.ui.setup_entry = Some(PendingSetupEntry { digits, at: now });
+        return;
+    }
+    select_setup(state, number, now, effects);
+}
+
+/// A lone `0` keeps meaning setup 10.
+fn parse_setup_digits(digits: &str) -> u32 {
+    match digits.parse().unwrap_or(0) {
+        0 if digits.len() == 1 => 10,
+        n => n,
+    }
+}
+
+fn commit_setup_entry(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(pending) = state.ui.setup_entry.take() else { return };
+    select_setup(state, parse_setup_digits(&pending.digits), now, effects);
+}
+
+fn select_setup(state: &mut AppState, number: u32, now: UnixMillis, effects: &mut UpdateEffects) {
     let setup = SetupId(number);
     let Some(status) = state.board.setups().iter().find(|s| s.id == setup).map(|s| s.status.clone()) else {
         state.notice(now, NoticeLevel::Warn, format!("no setup {number} configured"));
@@ -1158,7 +1213,26 @@ fn commit_call(state: &mut AppState, setup: SetupId, selected: usize, now: UnixM
             return;
         }
     };
+    commit_entry(state, setup, entry, now, effects);
+}
 
+/// Enter on the queue: call the highlighted entry on its lowest-numbered
+/// free candidate setup — the TO often doesn't care which station.
+fn quick_call_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(entry) = state.world.queue.get(state.ui.queue_ix).cloned() else {
+        state.notice(now, NoticeLevel::Warn, "nothing in the queue to call");
+        return;
+    };
+    let Some(setup) = entry.candidate_setups.first().copied() else {
+        state.notice(now, NoticeLevel::Warn, format!("no free setup can take {}", entry.players));
+        return;
+    };
+    commit_entry(state, setup, entry, now, effects);
+}
+
+/// Re-verifies and commits one queue entry onto a setup (the picker's Enter
+/// and the queue's quick-call share this).
+fn commit_entry(state: &mut AppState, setup: SetupId, entry: QueueEntry, now: UnixMillis, effects: &mut UpdateEffects) {
     // Re-verify against *current* state: the world snapshot may predate a
     // poll or another local action.
     if assigned_sets(&state.board).contains(&(entry.bracket.clone(), entry.key.clone())) {
@@ -3615,5 +3689,64 @@ mod tests {
         let right_char = |ix: usize| report.games[ix].selections[1].character_id;
         assert_eq!([left_char(0), left_char(1), left_char(2)], [Some(2), Some(1), Some(1)]);
         assert_eq!([right_char(0), right_char(1), right_char(2)], [Some(3), Some(3), Some(3)]);
+    }
+
+    fn twelve_station_app() -> AppState {
+        let config = test_config(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], &["ultimate"]);
+        let boots = bootstrap(vec![("ultimate", &se4())]);
+        AppState::new(config, true, boots, NOW)
+    }
+
+    #[test]
+    fn big_boards_buffer_setup_digits() {
+        let mut state = twelve_station_app();
+
+        // "1" is ambiguous while stations 10-12 exist: it buffers…
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        assert!(state.ui.modal.is_none());
+        assert_eq!(state.ui.setup_entry.as_ref().map(|p| p.digits.as_str()), Some("1"));
+        // …and "12" cannot grow further, so it selects setup 12.
+        update(&mut state, key(KeyCode::Char('2')), NOW);
+        assert!(state.ui.setup_entry.is_none());
+        assert!(matches!(state.ui.modal, Some(Modal::CallPicker { setup: SetupId(12), .. })));
+    }
+
+    #[test]
+    fn buffered_setup_digit_commits_on_the_grace_tick() {
+        let mut state = twelve_station_app();
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, Msg::Tick, NOW + 200);
+        assert!(state.ui.setup_entry.is_some(), "inside the grace window");
+        update(&mut state, Msg::Tick, NOW + super::SETUP_ENTRY_GRACE_MS);
+        assert!(state.ui.setup_entry.is_none());
+        assert!(matches!(state.ui.modal, Some(Modal::CallPicker { setup: SetupId(1), .. })));
+    }
+
+    #[test]
+    fn small_boards_keep_instant_digit_selection() {
+        let mut state = se4_app(true);
+        update(&mut state, key(KeyCode::Char('1')), NOW);
+        assert!(state.ui.setup_entry.is_none(), "two stations: no buffering");
+        assert!(matches!(state.ui.modal, Some(Modal::CallPicker { setup: SetupId(1), .. })));
+    }
+
+    #[test]
+    fn enter_quick_calls_the_highlighted_entry() {
+        let mut state = se4_app(true);
+        let players = state.world.queue.first().map(|e| e.players.clone()).expect("a callable entry");
+
+        let effects = update(&mut state, key(KeyCode::Enter), NOW);
+        let called = state
+            .board
+            .setups()
+            .iter()
+            .find(|s| matches!(s.status, SetupStatus::Called { .. }))
+            .expect("a station took the call");
+        assert_eq!(called.id, SetupId(1), "lowest-numbered free station");
+        assert_eq!(effects.writes.len(), 1);
+        assert!(
+            state.notices.iter().any(|n| n.text.contains(&players)),
+            "call notice names the players"
+        );
     }
 }
