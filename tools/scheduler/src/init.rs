@@ -177,8 +177,19 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
                         let _ = writeln!(out, "setup_type = [{list}]");
                     }
                 }
-                if let Some(prior) = entry.prior_secs() {
-                    let _ = writeln!(out, "duration_prior_secs = {prior} # seeded from game-setups.toml");
+                match entry.prior_secs() {
+                    Some(prior) => {
+                        let _ = writeln!(out, "duration_prior_secs = {prior} # seeded from game-setups.toml");
+                    }
+                    // Silence here reads as "8:00 forever" at the desk; say
+                    // where the estimate comes from and how to improve it.
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "# duration_prior_secs = 480  # default 8m/bo3 — set game_minutes/setup_minutes\n\
+                             #   in game-setups.toml and re-init (or edit here); live results refine it"
+                        );
+                    }
                 }
             }
             None => {
