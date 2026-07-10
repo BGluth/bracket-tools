@@ -27,6 +27,14 @@ use crate::{
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
+/// Renders a table whose `selected` row must stay visible: stateful render
+/// scrolls the viewport with the highlight (a stateless one lets the cursor
+/// walk off-screen — long boards made the setups modal's add row unreachable).
+fn render_with_selection(frame: &mut Frame<'_>, area: Rect, table: Table<'_>, selected: usize) {
+    let mut table_state = TableState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(table, area, &mut table_state);
+}
+
 pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
     let [setup_area, queue_area, summary_area, status_area] = Layout::vertical([
         Constraint::Length(4),
@@ -156,10 +164,7 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMill
     ];
     let title = format!("Call queue ({} ready)", state.world.queue.len());
     let table = Table::new(rows, widths).header(header).block(Block::bordered().title(title));
-    // Stateful render so a highlight below the visible window scrolls the
-    // table to keep itself on screen.
-    let mut table_state = TableState::default().with_selected(Some(state.ui.queue_ix));
-    frame.render_stateful_widget(table, area, &mut table_state);
+    render_with_selection(frame, area, table, state.ui.queue_ix);
 }
 
 fn draw_summaries(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -375,7 +380,7 @@ fn draw_call_picker(
     };
     let title = format!("Call on setup {} [{ranking}] — Enter commits, Esc cancels", setup.0);
     let table = Table::new(table_rows, widths).header(header).block(Block::bordered().title(title));
-    frame.render_widget(table, area);
+    render_with_selection(frame, area, table, selected);
 }
 
 fn draw_inspection(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
@@ -410,9 +415,11 @@ fn draw_inspection(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
         Constraint::Min(24),
     ];
     let title = format!("Blocked sets ({}) — Up/Down, Esc closes", entries.len());
-    frame.render_widget(
-        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+    render_with_selection(
+        frame,
         list_area,
+        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+        selected,
     );
 
     let detail: Vec<Line<'_>> = entries
@@ -543,7 +550,12 @@ fn draw_notices(frame: &mut Frame<'_>, state: &AppState, selected: usize, now: U
     ];
     let unread = state.notices.iter().filter(|n| !n.acked && n.level != NoticeLevel::Info).count();
     let title = format!("Notices ({unread} unread) — Enter acks, Esc closes");
-    frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), area);
+    render_with_selection(
+        frame,
+        area,
+        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+        selected,
+    );
 }
 
 fn draw_pending_writes(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
@@ -585,9 +597,11 @@ fn draw_pending_writes(frame: &mut Frame<'_>, state: &AppState, selected: usize)
         "Pending writes ({}) — Enter retries parked, d discards, Esc closes",
         state.pending_writes.len()
     );
-    frame.render_widget(
-        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+    render_with_selection(
+        frame,
         writes_area,
+        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+        selected,
     );
 
     // The divergence ledger: sets the desk re-queued that the site still
@@ -652,7 +666,12 @@ fn draw_reassign(frame: &mut Frame<'_>, state: &AppState, setup: crate::config::
         }
     });
     let title = format!("Reassign setup {} — Enter applies, Esc cancels", setup.0);
-    frame.render_widget(Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)), area);
+    render_with_selection(
+        frame,
+        area,
+        Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)),
+        selected,
+    );
 }
 
 fn draw_setups(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
@@ -681,7 +700,12 @@ fn draw_setups(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
         }
     });
     let title = "Stations — Enter retires (free only) / adds, Esc closes";
-    frame.render_widget(Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)), area);
+    render_with_selection(
+        frame,
+        area,
+        Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)),
+        selected,
+    );
 }
 
 fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(ConflictKey, String)], selected: usize) {
@@ -699,7 +723,12 @@ fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(Confli
     });
     let widths = [Constraint::Min(20), Constraint::Length(16)];
     let title = "Player flags — Enter cycles rest/depart/force-avail, Esc closes";
-    frame.render_widget(Table::new(rows, widths).header(header).block(Block::bordered().title(title)), area);
+    render_with_selection(
+        frame,
+        area,
+        Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
+        selected,
+    );
 }
 
 fn draw_report(frame: &mut Frame<'_>, state: &AppState, draft: &ReportDraft) {
@@ -1140,6 +1169,23 @@ mod tests {
 
         let text = render(&state);
         assert!(text.contains("snooze the highlighted queue entry"), "help body:\n{text}");
+    }
+
+    #[test]
+    fn setups_modal_scrolls_the_add_row_into_view() {
+        // A tall board: the add row sits at the very bottom of the list; the
+        // modal must scroll it into view once the cursor reaches it.
+        let mut state = test_state(false);
+        for id in 3..=30 {
+            state.board.add_setup(crate::config::SetupId(id), "default".to_owned());
+        }
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)), NOW);
+        for _ in 0..30 {
+            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), NOW);
+        }
+
+        let text = render(&state);
+        assert!(text.contains("+ add a default station"), "add row visible:\n{text}");
     }
 
     #[test]
