@@ -196,6 +196,7 @@ pub enum OneOrMany {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
     pub brackets: Vec<BracketConfig>,
     /// What committing a call (Enter / the picker) marks the set as.
@@ -440,6 +441,7 @@ pub fn write_starter_template(path: &Path) -> io::Result<()> {
 
 /// One scheduled bracket (a start.gg event).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BracketConfig {
     /// The event slug, e.g. `tournament/french-bread-rumble-100/event/melee-singles`.
     pub slug: String,
@@ -535,6 +537,7 @@ impl ExpectedKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SimConfig {
     /// Relative makespan band within which two projected outcomes count as a
     /// tie (rollout HOLD gating and greedy fallback).
@@ -631,11 +634,43 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        pool_for_types, referenced_types, resolve_roster, write_starter_template, BracketConfig, BracketMode, ConfigError, ExpectedKind,
-        OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_DURATION_PRIOR_SECS, DEFAULT_PER_PAGE, DEFAULT_POLL_INTERVAL_SECS,
-        DEFAULT_REST_SIM_HORIZON_SECS, FALLBACK_SETUPS_PER_TYPE, STARTER_TEMPLATE,
+        pool_for_types, referenced_types, resolve_roster, write_starter_template, BracketConfig, BracketMode, CallAction, ConfigError,
+        ExpectedKind, OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_DURATION_PRIOR_SECS, DEFAULT_PER_PAGE,
+        DEFAULT_POLL_INTERVAL_SECS, DEFAULT_REST_SIM_HORIZON_SECS, FALLBACK_SETUPS_PER_TYPE, STARTER_TEMPLATE,
     };
     use crate::model::GroupKind;
+
+    #[test]
+    fn unknown_or_misplaced_keys_fail_loudly() {
+        // The classic TOML trap: a top-level key written after a
+        // [[brackets]] header belongs to that bracket. Loud beats silent.
+        let misplaced = r#"
+setups = 2
+
+[[brackets]]
+slug = "tournament/t/event/melee"
+call_action = "in_progress"
+"#;
+        let err = toml::from_str::<SchedulerConfig>(misplaced).unwrap_err();
+        assert!(err.to_string().contains("call_action"), "{err}");
+
+        let typo = "setups = 2\ncall_actoin = \"in_progress\"\n";
+        assert!(toml::from_str::<SchedulerConfig>(typo).is_err());
+    }
+
+    #[test]
+    fn call_action_parses_top_level() {
+        let good = r#"
+call_action = "in_progress"
+setups = 2
+
+[[brackets]]
+slug = "tournament/t/event/melee"
+"#;
+        let config: SchedulerConfig = toml::from_str(good).unwrap();
+        assert_eq!(config.call_action, CallAction::InProgress);
+        assert!(config.validate().is_ok());
+    }
 
     fn valid_config() -> SchedulerConfig {
         SchedulerConfig {

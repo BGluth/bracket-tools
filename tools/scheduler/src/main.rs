@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         let Some(mut config) = SchedulerConfig::load_if_present(&config_path)? else {
             return bootstrap_starter_config(&config_path);
         };
+        println!("config: {}", config_path.display());
         resolve_setup_counts(&cli, &mut config)?;
         let token = resolve_token(cli.token.as_deref(), &config)?;
         let source = Arc::new(build_live_source(token)?);
@@ -118,6 +119,7 @@ async fn rehearse(cli: Cli, config_path: &Path) -> anyhow::Result<()> {
             config_path.display()
         );
     };
+    println!("config: {}", config_path.display());
     apply_noise_overrides(&cli, &mut config)?;
     resolve_setup_counts(&cli, &mut config)?;
     let token = resolve_token(cli.token.as_deref(), &config)?;
