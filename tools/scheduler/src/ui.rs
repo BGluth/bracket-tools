@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 
@@ -154,7 +154,10 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMill
     ];
     let title = format!("Call queue ({} ready)", state.world.queue.len());
     let table = Table::new(rows, widths).header(header).block(Block::bordered().title(title));
-    frame.render_widget(table, area);
+    // Stateful render so a highlight below the visible window scrolls the
+    // table to keep itself on screen.
+    let mut table_state = TableState::default().with_selected(Some(state.ui.queue_ix));
+    frame.render_stateful_widget(table, area, &mut table_state);
 }
 
 fn draw_summaries(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
