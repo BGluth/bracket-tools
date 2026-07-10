@@ -1,0 +1,29 @@
+# game-setups.toml — maps start.gg videogames to the setup types their
+# events run on. `--init-tournament` reads this to seed each generated
+# event's `setup_type`.
+#
+# A table's key matches case-insensitively as a SUBSTRING of the start.gg
+# videogame name, so [game.smash] matches every "Super Smash Bros. …" title
+# (the longest matching key wins). Setup type names are your own labels;
+# station counts per type live in setup-defaults.toml and the in-tool 's'
+# modal, not here.
+#
+# Optional minutes seed each event's duration prior (used until live
+# completions teach the model): prior = setup_minutes + 2.5 * game_minutes.
+# Left unset, events keep the default prior (8 min per bo3 set).
+#
+# Pre-filled from the FBR 100 setup map (smash-likes share the switch pool
+# and may borrow the pokemon stations; Pokémon Champions is pokemon-only) —
+# adjust for other venues.
+
+[game.smash]
+setup_types = ["switch", "pokemon"]
+
+[game.rivals]
+setup_types = ["pc"]
+
+[game."m.u.g.e.n"]
+setup_types = ["pc"]
+
+[game."pokémon"]
+setup_types = ["pokemon"]
