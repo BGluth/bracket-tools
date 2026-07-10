@@ -161,7 +161,7 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMill
         Constraint::Length(3),
         Constraint::Length(6),
         Constraint::Length(14),
-        Constraint::Length(18),
+        Constraint::Length(5),
         Constraint::Length(4),
         Constraint::Min(24),
         Constraint::Length(6),
@@ -372,7 +372,7 @@ fn draw_call_picker(
     let widths = [
         Constraint::Length(3),
         Constraint::Length(14),
-        Constraint::Length(16),
+        Constraint::Length(5),
         Constraint::Min(22),
         Constraint::Length(5),
         Constraint::Length(4),
@@ -786,7 +786,7 @@ fn draw_find_set(frame: &mut Frame<'_>, state: &AppState, query: &str, selected:
                 Constraint::Length(3),
                 Constraint::Length(7),
                 Constraint::Length(12),
-                Constraint::Length(18),
+                Constraint::Length(5),
                 Constraint::Min(20),
             ],
         )

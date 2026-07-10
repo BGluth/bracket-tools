@@ -15,6 +15,30 @@ pub fn strip_sponsor(name: &str) -> &str {
     name.rsplit_once(" | ").map_or(name, |(_, tag)| tag)
 }
 
+/// The round label abbreviated for narrow table columns: "Winners Round 1" →
+/// "WR1", "Losers Semi-Final" → "LSF", "Grand Final Reset" → "GFR". Labels
+/// with words outside the known start.gg vocabulary pass through unchanged.
+pub fn abbreviate_round(text: &str) -> String {
+    let mut out = String::new();
+    for word in text.split_whitespace() {
+        if word.chars().all(|c| c.is_ascii_digit()) {
+            out.push_str(word);
+            continue;
+        }
+        out.push_str(match word.to_ascii_lowercase().as_str() {
+            "winners" => "W",
+            "losers" => "L",
+            "grand" => "G",
+            "round" | "reset" => "R",
+            "quarter-final" | "quarter-finals" | "quarterfinal" | "quarterfinals" => "QF",
+            "semi-final" | "semi-finals" | "semifinal" | "semifinals" => "SF",
+            "final" | "finals" => "F",
+            _ => return text.to_owned(),
+        });
+    }
+    out
+}
+
 pub const PREREQ_TYPE_SET: &str = "set";
 pub const PREREQ_TYPE_SEED: &str = "seed";
 
@@ -371,6 +395,27 @@ mod tests {
         assert_eq!(strip_sponsor("Crouton"), "Crouton");
         assert_eq!(strip_sponsor("A | B | Tag"), "Tag");
         assert_eq!(strip_sponsor(""), "");
+    }
+
+    #[test]
+    fn abbreviate_round_covers_the_startgg_vocabulary() {
+        use super::abbreviate_round;
+        assert_eq!(abbreviate_round("Winners Round 1"), "WR1");
+        assert_eq!(abbreviate_round("Losers Round 12"), "LR12");
+        assert_eq!(abbreviate_round("Winners Quarter-Final"), "WQF");
+        assert_eq!(abbreviate_round("Losers Semi-Final"), "LSF");
+        assert_eq!(abbreviate_round("Winners Final"), "WF");
+        assert_eq!(abbreviate_round("Grand Final"), "GF");
+        assert_eq!(abbreviate_round("Grand Final Reset"), "GFR");
+        assert_eq!(abbreviate_round("Round 3"), "R3");
+    }
+
+    #[test]
+    fn abbreviate_round_passes_unknown_labels_through() {
+        use super::abbreviate_round;
+        assert_eq!(abbreviate_round("Round 5 (projected)"), "Round 5 (projected)");
+        assert_eq!(abbreviate_round("Swiss Stage"), "Swiss Stage");
+        assert_eq!(abbreviate_round(""), "");
     }
 
     fn schema_set() -> Set {

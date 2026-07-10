@@ -15,7 +15,7 @@ use crate::{
     },
     duration::DurationModel,
     graph::{BracketGraph, GraphWarning},
-    model::{BracketId, LiveSet, PhaseGroupInfo, SetId, SetKey},
+    model::{abbreviate_round, BracketId, LiveSet, PhaseGroupInfo, SetId, SetKey},
     ranker::{GreedyRanker, RankContext, RankedAction, RankedCandidate, Ranker},
     rollout::RolloutRanker,
     simulator::{simulate, SimBracket, SimOutcome, SimWorld},
@@ -493,8 +493,8 @@ fn queue_entry(candidate: RankedCandidate, graphs: &HashMap<BracketId, BracketGr
         set.occupants().map(|o| o.display_name.as_str()).collect::<Vec<_>>().join(" vs ")
     });
     let round_text = set
-        .and_then(|s| s.full_round_text.clone())
-        .unwrap_or_else(|| format!("Round {}", key.round));
+        .and_then(|s| s.full_round_text.as_deref().map(abbreviate_round))
+        .unwrap_or_else(|| format!("R{}", key.round));
 
     Some(QueueEntry {
         candidate,

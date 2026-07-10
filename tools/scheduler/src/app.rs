@@ -23,7 +23,7 @@ use crate::{
         ConflictInputs, ConflictKey, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones, UnixMillis,
     },
     duration::{diff_snapshots, DurationModel},
-    model::{strip_sponsor, BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
+    model::{abbreviate_round, strip_sponsor, BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
     persist::{BracketSnapshot, OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     ranker::GreedyRanker,
     world::{assigned_sets, recompute, BracketState, QueueEntry, RolloutRankings, RolloutRow, SimSnapshot, World, WorldInputs},
@@ -1454,7 +1454,7 @@ pub fn find_set_rows(state: &AppState, query: &str) -> Vec<FindRow> {
             Some(FindRow {
                 setup: s.id,
                 players: shown.join(" vs "),
-                round_text: live.full_round_text.clone().unwrap_or_else(|| format!("Round {}", set.round)),
+                round_text: live.full_round_text.as_deref().map_or_else(|| format!("R{}", set.round), abbreviate_round),
                 bracket: bracket.clone(),
                 status,
             })
