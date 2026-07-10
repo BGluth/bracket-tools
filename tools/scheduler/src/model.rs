@@ -2,7 +2,7 @@
 //! the schema layer once per poll, so the rest of the core never touches
 //! `Option`-riddled cynic types.
 
-use std::collections::BTreeMap;
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 
 use bracket_tools_startgg_schema::{enums::BracketType, get_event_structure, get_sets_for_event};
 use serde::{Deserialize, Serialize};
@@ -165,6 +165,12 @@ pub struct PhaseGroupInfo {
     /// Unix seconds; the group's own start time or its wave's.
     pub start_at: Option<i64>,
     pub num_rounds: Option<i32>,
+    /// Parent phase: groups sharing a phase run in parallel (pools); phases
+    /// sequence by `phase_order`. Serde-defaulted so pre-phase snapshots load.
+    #[serde(default)]
+    pub phase_id: Option<String>,
+    #[serde(default)]
+    pub phase_order: Option<i32>,
 }
 
 /// Non-fatal conversion findings, returned as data (the pure core never logs).
@@ -182,6 +188,10 @@ pub enum ModelWarning {
     /// A phase group had no usable bracket type or was missing Swiss round
     /// counts; it was mapped to [`GroupKind::Unsupported`].
     UnsupportedGroup { phase_group: String, raw: String },
+    /// The same set key appeared twice in one snapshot (live pagination can
+    /// duplicate a row across a page boundary); the later occurrence
+    /// replaced the earlier one.
+    DuplicateSet { set: SetKey },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,14 +317,28 @@ fn convert_occupant(entrant: get_sets_for_event::Entrant, key: &SetKey, warnings
 /// Converts every set in a page-worth of nodes, splitting into converted sets,
 /// accumulated warnings, and skipped sets.
 pub fn live_sets_from_schema(sets: Vec<get_sets_for_event::Set>) -> (Vec<LiveSet>, Vec<ModelWarning>, Vec<SkippedSet>) {
-    let mut live = Vec::with_capacity(sets.len());
+    let mut live: Vec<LiveSet> = Vec::with_capacity(sets.len());
     let mut warnings = Vec::new();
     let mut skipped = Vec::new();
+    let mut index_by_key: HashMap<SetKey, usize> = HashMap::new();
     for set in sets {
         match live_set_from_schema(set) {
             Ok((set, mut w)) => {
-                live.push(set);
                 warnings.append(&mut w);
+                match index_by_key.entry(set.key.clone()) {
+                    // Live pagination can return one set twice (a row
+                    // straddling a page boundary); duplicate keys corrupt
+                    // every key-addressed association downstream, so the
+                    // last (freshest) observation wins.
+                    Entry::Occupied(slot) => {
+                        warnings.push(ModelWarning::DuplicateSet { set: set.key.clone() });
+                        live[*slot.get()] = set;
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(live.len());
+                        live.push(set);
+                    }
+                }
             }
             Err(s) => skipped.push(s),
         }
@@ -354,6 +378,8 @@ pub fn phase_groups_from_schema(event: &get_event_structure::Event) -> (Vec<Phas
             best_of_by_round,
             start_at,
             num_rounds: pg.num_rounds,
+            phase_id: pg.phase.as_ref().and_then(|p| p.id.as_ref().map(|id| id.inner().to_owned())),
+            phase_order: pg.phase.as_ref().and_then(|p| p.phase_order),
         });
     }
     (infos, warnings)
@@ -395,6 +421,25 @@ mod tests {
         assert_eq!(strip_sponsor("Crouton"), "Crouton");
         assert_eq!(strip_sponsor("A | B | Tag"), "Tag");
         assert_eq!(strip_sponsor(""), "");
+    }
+
+    #[test]
+    fn duplicate_set_keys_dedup_to_the_last_occurrence() {
+        use super::live_sets_from_schema;
+        let mut first = schema_set();
+        first.id = Some(Id::new("1001"));
+        let mut second = schema_set();
+        second.id = Some(Id::new("1001"));
+        second.winner_id = Some(500);
+
+        let (live, warnings, skipped) = live_sets_from_schema(vec![first, second]);
+        assert_eq!(live.len(), 1, "the duplicate row collapses");
+        assert!(live[0].is_completed(), "the later observation wins");
+        assert!(skipped.is_empty());
+        assert!(
+            warnings.iter().any(|w| matches!(w, ModelWarning::DuplicateSet { .. })),
+            "{warnings:?}"
+        );
     }
 
     #[test]

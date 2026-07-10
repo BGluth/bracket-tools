@@ -17,7 +17,7 @@ use crate::{
         SetupBoard, SetupStatus, Tombstones, UnixMillis,
     },
     duration::DurationModel,
-    graph::BracketGraph,
+    graph::{stage_partition, BracketGraph},
     model::{BracketId, EntrantId, GroupKind, LiveSet, PhaseGroupInfo, Prereq, SetId, SetKey, Slot, SlotOccupant},
     ranker::{GreedyRanker, RankContext, RankedAction, Ranker, ScoreComponents},
 };
@@ -544,6 +544,26 @@ impl SimState {
         }
     }
 
+    /// Frees every station serving `key` (a completed set no longer holds one).
+    fn free_stations(&mut self, bracket_id: &BracketId, key: &SetKey) {
+        let freed: Vec<SetupId> = self
+            .board
+            .setups()
+            .iter()
+            .filter(|s| match &s.status {
+                SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set } => bracket == bracket_id && set == key,
+                SetupStatus::OccupiedExternal {
+                    set: Some((linked, linked_key)),
+                } => linked == bracket_id && linked_key == key,
+                _ => false,
+            })
+            .map(|s| s.id)
+            .collect();
+        for setup in freed {
+            self.board.set_status(setup, SetupStatus::Free);
+        }
+    }
+
     /// Starts a set on a setup now (sim treats call→start as instant).
     fn assign(&mut self, bracket_id: &BracketId, key: &SetKey, setup: SetupId) {
         let Some(b) = self.bracket_index(bracket_id) else {
@@ -551,7 +571,7 @@ impl SimState {
         };
         let finish = self.clock + self.estimate_ms(&self.brackets[b], key);
         let clock_secs = self.clock / 1000;
-        if let Some(set) = self.brackets[b].sets.iter_mut().find(|s| &s.key == key) {
+        if let Some(set) = self.brackets[b].sets.iter_mut().find(|s| &s.key == key && !s.is_completed()) {
             set.started_at = Some(clock_secs);
         }
         self.board.set_status(
@@ -613,15 +633,16 @@ impl SimState {
 
     fn apply_completion(&mut self, bracket_id: &BracketId, key: &SetKey) {
         let clock = self.clock;
+        // A Complete event always releases the stations serving this key —
+        // even when the set is gone or already completed (duplicate-key
+        // twins) — so corrupt data can never wedge a station forever.
+        self.free_stations(bracket_id, key);
         let Some(b) = self.bracket_index(bracket_id) else {
             return;
         };
-        let Some(pos) = self.brackets[b].sets.iter().position(|s| &s.key == key) else {
+        let Some(pos) = self.brackets[b].sets.iter().position(|s| &s.key == key && !s.is_completed()) else {
             return;
         };
-        if self.brackets[b].sets[pos].is_completed() {
-            return;
-        }
 
         // Slot-0/higher-seed deterministic winner, skipping absentees.
         let winner_slot = self.brackets[b].sets[pos]
@@ -669,24 +690,6 @@ impl SimState {
         if self.brackets[b].mode == BracketMode::Full {
             let entry = self.finish_by_bracket.entry(bracket_id.clone()).or_insert(clock);
             *entry = (*entry).max(clock);
-        }
-
-        // Free whatever station was running it.
-        let freed: Vec<SetupId> = self
-            .board
-            .setups()
-            .iter()
-            .filter(|s| match &s.status {
-                SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set } => bracket == bracket_id && set == key,
-                SetupStatus::OccupiedExternal {
-                    set: Some((linked, linked_key)),
-                } => linked == bracket_id && linked_key == key,
-                _ => false,
-            })
-            .map(|s| s.id)
-            .collect();
-        for setup in freed {
-            self.board.set_status(setup, SetupStatus::Free);
         }
 
         // Rest windows: completion time per conflict key, plus a wake at
@@ -777,27 +780,36 @@ impl SimState {
         changed
     }
 
-    /// Cross-group progression (pools → DE, swiss → cut): when a group
-    /// finishes, its qualifiers (wins desc, entrant id asc) fill the next
-    /// group's still-empty seed slots.
+    /// Cross-stage progression (pools → finals, swiss → cut): when every
+    /// group of a stage finishes, the stage-wide qualifiers (wins desc,
+    /// entrant id asc across all its groups) fill the next stage's
+    /// still-empty seed slots. Group-list order is untrustworthy (live lists
+    /// interleave phases), so stages, not adjacent groups, are the unit.
     fn fill_group_progressions(&mut self, b: usize) -> bool {
         let mut changed = false;
-        for g in 1..self.brackets[b].groups.len() {
+        let stages = stage_partition(self.brackets[b].groups.iter());
+        for s in 1..stages.len() {
             let bracket = &self.brackets[b];
-            let (prev, cur) = (&bracket.groups[g - 1], &bracket.groups[g]);
-            if !group_finished(&bracket.sets, prev) {
+            let prev: Vec<&PhaseGroupInfo> = stages[s - 1].iter().map(|&g| &bracket.groups[g]).collect();
+            if !prev.iter().all(|group| group_finished(&bracket.sets, group)) {
                 continue;
             }
+            let cur_ids: HashSet<String> = stages[s].iter().map(|&g| bracket.groups[g].id.clone()).collect();
 
             let placed: HashSet<EntrantId> = bracket
                 .sets
                 .iter()
-                .filter(|s| s.key.phase_group == cur.id)
-                .flat_map(|s| s.occupants())
+                .filter(|set| cur_ids.contains(&set.key.phase_group))
+                .flat_map(|set| set.occupants())
                 .map(|o| o.entrant_id.clone())
                 .collect();
 
-            let prev_sets: Vec<&LiveSet> = bracket.sets.iter().filter(|s| s.key.phase_group == prev.id).collect();
+            let prev_ids: HashSet<&str> = prev.iter().map(|group| group.id.as_str()).collect();
+            let prev_sets: Vec<&LiveSet> = bracket
+                .sets
+                .iter()
+                .filter(|set| prev_ids.contains(set.key.phase_group.as_str()))
+                .collect();
             let mut wins: HashMap<EntrantId, u32> = HashMap::new();
             for set in &prev_sets {
                 if let Some(winner) = &set.winner_id {
@@ -814,12 +826,11 @@ impl SimState {
                 wy.cmp(&wx).then_with(|| x.entrant_id.cmp(&y.entrant_id))
             });
 
-            let cur_id = cur.id.clone();
             let mut next_qualifier = qualifiers.into_iter();
             'fill: for set in self.brackets[b]
                 .sets
                 .iter_mut()
-                .filter(|s| s.key.phase_group == cur_id && !s.is_completed())
+                .filter(|set| cur_ids.contains(&set.key.phase_group) && !set.is_completed())
             {
                 for slot in &mut set.slots {
                     let pending = slot.occupant.is_none() && !matches!(&slot.prereq, Some(Prereq::Set { .. }));

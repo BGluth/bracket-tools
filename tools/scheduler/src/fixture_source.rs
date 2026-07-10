@@ -373,7 +373,7 @@ impl FixtureSource {
         }
 
         let structure_path = event_dir.join("structure.json");
-        let response: GraphQlResponse<get_event_structure::GetEventStructure> = read_envelope(&structure_path)?;
+        let response = read_structure_envelope(&structure_path)?;
         let structure = response
             .data
             .and_then(|d| d.event)
@@ -615,6 +615,24 @@ fn read_envelope<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Fixtu
     })
 }
 
+/// The structure query gained a `phase` selection after the first capture
+/// corpora were recorded; backfill a null so pre-phase captures keep replaying.
+pub fn read_structure_envelope(path: &Path) -> Result<GraphQlResponse<get_event_structure::GetEventStructure>, FixtureLoadError> {
+    let mut value: serde_json::Value = read_envelope(path)?;
+    if let Some(groups) = value
+        .pointer_mut("/data/event/phaseGroups")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for group in groups.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+            group.entry("phase").or_insert(serde_json::Value::Null);
+        }
+    }
+    serde_json::from_value(value).map_err(|source| FixtureLoadError::Parse {
+        path: path.to_owned(),
+        source: Box::new(source),
+    })
+}
+
 fn distinct_entrants(sets: &[LiveSet]) -> i32 {
     let entrants: HashSet<_> = sets.iter().flat_map(LiveSet::occupants).map(|o| &o.entrant_id).collect();
     entrants.len() as i32
@@ -739,6 +757,10 @@ fn schema_phase_group(info: &PhaseGroupInfo) -> get_event_structure::PhaseGroup 
         num_rounds,
         start_at: info.start_at.map(Timestamp),
         wave: None,
+        phase: info.phase_id.as_ref().map(|id| get_event_structure::PhaseRef {
+            id: Some(Id::new(id.clone())),
+            phase_order: info.phase_order,
+        }),
         rounds,
     }
 }
@@ -795,6 +817,24 @@ mod tests {
         assert_eq!(groups, vec![bracket.info]);
         let tournament = structure.tournament.unwrap();
         assert_eq!(tournament.slug.as_deref(), Some("tournament/synth"));
+    }
+
+    #[tokio::test]
+    async fn phase_identity_round_trips_through_schema_conversion() {
+        // The rehearsal path re-fetches live structures through this
+        // inversion; losing the phase would collapse pooled events back
+        // into one stage.
+        let bracket = make_de_bracket(1001, 8);
+        let mut info = bracket.info;
+        info.phase_id = Some("78899".to_owned());
+        info.phase_order = Some(2);
+        let mut source = FixtureSource::new();
+        source.add_synth_event(SLUG, from_ref(&info), vec![bracket.sets]);
+
+        let structure = source.fetch_event_structure(SLUG).await.unwrap();
+        let (groups, warnings) = phase_groups_from_schema(&structure);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(groups, vec![info]);
     }
 
     #[tokio::test]

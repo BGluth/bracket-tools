@@ -250,6 +250,8 @@ pub fn make_rr_pool_with(pg: u64, players: &[SynthPlayer]) -> SynthBracket {
             best_of_by_round: Default::default(),
             start_at: None,
             num_rounds: Some(rounds as i32),
+            phase_id: None,
+            phase_order: None,
         },
     }
 }
@@ -282,6 +284,8 @@ pub fn make_swiss_with(pg: u64, players: &[SynthPlayer], num_rounds: i32) -> Syn
             best_of_by_round: Default::default(),
             start_at: None,
             num_rounds: Some(num_rounds),
+            phase_id: None,
+            phase_order: None,
         },
     }
 }
@@ -597,6 +601,8 @@ fn emit(pg: u64, sets: &[ProtoSet], omitted: &[bool], players: Option<&[SynthPla
             best_of_by_round: Default::default(),
             start_at: None,
             num_rounds: None,
+            phase_id: None,
+            phase_order: None,
         },
     }
 }

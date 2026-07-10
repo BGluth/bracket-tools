@@ -2309,11 +2309,19 @@ fn handle_poll(state: &mut AppState, poll: PollResult, now: UnixMillis, effects:
                 state.notice(now, NoticeLevel::Error, text);
             }
             // Warnings (identity-degraded etc.) recur every poll; surface
-            // only new unknown-vocabulary warnings to keep the ring useful.
+            // only unknown vocabulary and data-shape surprises to keep the
+            // ring useful.
             for warning in warnings {
-                if let ModelWarning::UnknownPrereqType { set, raw } = warning {
-                    let text = format!("unknown prereqType {raw:?} on {set:?}");
-                    state.notice(now, NoticeLevel::Warn, text);
+                match warning {
+                    ModelWarning::UnknownPrereqType { set, raw } => {
+                        let text = format!("unknown prereqType {raw:?} on {set:?}");
+                        state.notice(now, NoticeLevel::Warn, text);
+                    }
+                    ModelWarning::DuplicateSet { set } => {
+                        let text = format!("{}: duplicate set {set:?} in snapshot — kept the last", poll.bracket.0);
+                        state.notice(now, NoticeLevel::Warn, text);
+                    }
+                    _ => {}
                 }
             }
         }

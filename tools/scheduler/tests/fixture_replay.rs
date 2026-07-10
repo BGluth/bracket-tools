@@ -14,10 +14,11 @@ use std::{
 use bracket_tools_scheduler::{
     config::{BracketMode, SetupId},
     conflict::{callable_sets, AliasMap, BracketView, ConflictIndex, ConflictInputs, PlayerFlags, SetupBoard, Tombstones},
+    fixture_source::read_structure_envelope,
     graph::BracketGraph,
     model::{live_sets_from_schema, phase_groups_from_schema, GroupKind, LiveSet, PhaseGroupInfo},
 };
-use bracket_tools_startgg_schema::{get_event_structure::GetEventStructure, get_sets_for_event::GetSetsForEvent};
+use bracket_tools_startgg_schema::get_sets_for_event::GetSetsForEvent;
 use cynic::GraphQlResponse;
 
 const FBR_ULTIMATE: &str = "tournament_french-bread-rumble-100_event_ultimate-singles";
@@ -59,8 +60,7 @@ fn load_event(dir: &Path, event: &str) -> (Vec<LiveSet>, Vec<PhaseGroupInfo>) {
         schema_sets.extend(nodes.into_iter().flatten());
     }
 
-    let raw = fs::read_to_string(event_dir.join("structure.json")).expect("structure capture present");
-    let response: GraphQlResponse<GetEventStructure> = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{event} structure: {e}"));
+    let response = read_structure_envelope(&event_dir.join("structure.json")).unwrap_or_else(|e| panic!("{event} structure: {e}"));
     let event_data = response.data.and_then(|d| d.event).expect("structure envelope has an event");
     let (groups, group_warnings) = phase_groups_from_schema(&event_data);
     assert!(group_warnings.is_empty(), "{event}: unexpected group warnings {group_warnings:?}");

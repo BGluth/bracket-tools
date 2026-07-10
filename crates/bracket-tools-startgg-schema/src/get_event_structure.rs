@@ -47,7 +47,17 @@ pub struct PhaseGroup {
     pub num_rounds: Option<i32>,
     pub start_at: Option<Timestamp>,
     pub wave: Option<Wave>,
+    pub phase: Option<PhaseRef>,
     pub rounds: Option<Vec<Option<Round>>>,
+}
+
+/// The group's parent phase: groups sharing a phase run in parallel (pools);
+/// `phase_order` sequences the phases (pools before the final bracket).
+#[derive(cynic::QueryFragment, Debug, Clone)]
+#[cynic(graphql_type = "Phase")]
+pub struct PhaseRef {
+    pub id: Option<Id>,
+    pub phase_order: Option<i32>,
 }
 
 #[derive(cynic::QueryFragment, Debug, Clone)]

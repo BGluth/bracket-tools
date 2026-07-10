@@ -340,10 +340,37 @@ impl BracketGraph {
             group.swiss_future_demand = demand;
         }
 
-        self.remaining_critical_path = stage_runs(&self.groups)
-            .into_iter()
+        let stages = stage_partition(self.groups.iter().map(|g| &g.info));
+        let stage_depths: Vec<u32> = stages
+            .iter()
             .map(|stage| stage.iter().map(|&i| self.groups[i].remaining_depth).max().unwrap_or(0))
-            .sum();
+            .collect();
+        self.remaining_critical_path = stage_depths.iter().sum();
+        self.bake_downstream_tails(&stages, &stage_depths);
+    }
+
+    /// Per-set depth is group-local (prereq edges never cross phase groups),
+    /// so a pool set cannot see the finals bracket it feeds and pooled events
+    /// rank below smaller single-group ones. Credit every incomplete set with
+    /// the critical path of the stages after its own.
+    fn bake_downstream_tails(&mut self, stages: &[Vec<usize>], stage_depths: &[u32]) {
+        let mut tail_by_group = vec![0u32; self.groups.len()];
+        let mut tail = 0;
+        for (stage, depth) in stages.iter().zip(stage_depths).rev() {
+            for &g in stage {
+                tail_by_group[g] = tail;
+            }
+            tail += depth;
+        }
+
+        for idx in 0..self.sets.len() {
+            if self.sets[idx].is_completed() || self.gf_reset_excluded[idx] {
+                continue;
+            }
+            if let Some(&g) = self.group_index.get(&self.sets[idx].key.phase_group) {
+                self.depth[idx] += tail_by_group[g];
+            }
+        }
     }
 }
 
@@ -476,23 +503,50 @@ fn swiss_future_rounds(sets: &[LiveSet], set_indices: &[usize], num_rounds: i32)
     (num_rounds - current_round).max(0) as u32
 }
 
-/// Consecutive same-kind groups form one parallel stage (RR pools run side by
-/// side); different-kind neighbors are sequential phases (pools → DE,
-/// swiss → cut). Sequential same-kind phases are indistinguishable without
-/// phase ids in the structure query — accepted S2 approximation.
-fn stage_runs(groups: &[GroupStats]) -> Vec<Vec<usize>> {
+/// Partitions an event's groups into sequential stages of parallel groups.
+/// Phase identity is the true stage signal: groups sharing a phase run in
+/// parallel (pools), and phases sequence by `phase_order` (pools → finals).
+/// Without it (pre-phase snapshots, synthetic worlds) fall back to the S2
+/// heuristic — consecutive same-kind groups form one parallel stage — which
+/// cannot split sequential same-kind phases (elimination pools → elimination
+/// finals reads as one stage).
+pub fn stage_partition<'a>(infos: impl Iterator<Item = &'a PhaseGroupInfo>) -> Vec<Vec<usize>> {
+    let infos: Vec<&PhaseGroupInfo> = infos.collect();
+    if !infos.is_empty() && infos.iter().all(|g| g.phase_id.is_some()) {
+        return phase_stages(&infos);
+    }
+
     let mut stages: Vec<Vec<usize>> = Vec::new();
     let mut prev_kind: Option<&GroupKind> = None;
-    for (i, group) in groups.iter().enumerate() {
-        let same = prev_kind.is_some_and(|k| std::mem::discriminant(k) == std::mem::discriminant(&group.info.kind));
+    for (i, info) in infos.iter().enumerate() {
+        let same = prev_kind.is_some_and(|k| std::mem::discriminant(k) == std::mem::discriminant(&info.kind));
         if same {
             stages.last_mut().expect("same-kind run implies a prior stage").push(i);
         } else {
             stages.push(vec![i]);
         }
-        prev_kind = Some(&group.info.kind);
+        prev_kind = Some(&info.kind);
     }
     stages
+}
+
+/// One stage per phase, ordered by `phase_order` with first appearance as the
+/// tiebreak (and the ordering when `phase_order` is absent).
+fn phase_stages(infos: &[&PhaseGroupInfo]) -> Vec<Vec<usize>> {
+    let mut stages: Vec<(i32, usize, Vec<usize>)> = Vec::new();
+    let mut stage_of: HashMap<&str, usize> = HashMap::new();
+    for (i, info) in infos.iter().enumerate() {
+        let phase = info.phase_id.as_deref().expect("stage_partition checked every group has a phase");
+        match stage_of.get(phase) {
+            Some(&s) => stages[s].2.push(i),
+            None => {
+                stage_of.insert(phase, stages.len());
+                stages.push((info.phase_order.unwrap_or(i32::MAX), i, vec![i]));
+            }
+        }
+    }
+    stages.sort_by_key(|&(order, first, _)| (order, first));
+    stages.into_iter().map(|(_, _, members)| members).collect()
 }
 
 #[cfg(test)]
@@ -670,6 +724,65 @@ mod tests {
         assert_eq!(graph.group("13").unwrap().remaining_depth, 2, "SE(4): semi + final");
         assert_eq!(graph.remaining_critical_path(), 3 + 2, "pools stage + cut stage");
         assert_eq!(graph.groups()[0].info.kind, GroupKind::RoundRobin);
+    }
+
+    #[test]
+    fn elimination_pools_split_stages_by_phase_and_carry_the_finals_tail() {
+        // FBR 100 ultimate shape: elimination pools (one phase) feeding an
+        // elimination finals bracket (the next phase). Same-kind neighbors,
+        // so only the phase ids can split the stages.
+        let pool_a = make_de_bracket(21, 8);
+        let pool_b = make_de_bracket(22, 8);
+        let finals = make_de_bracket(23, 8);
+        let sets: Vec<_> = pool_a.sets.iter().chain(&pool_b.sets).chain(&finals.sets).cloned().collect();
+        let mut infos = vec![pool_a.info, pool_b.info, finals.info];
+        for info in &mut infos[..2] {
+            info.phase_id = Some("pools".to_owned());
+            info.phase_order = Some(1);
+        }
+        infos[2].phase_id = Some("finals".to_owned());
+        infos[2].phase_order = Some(2);
+
+        let (graph, warnings) = BracketGraph::build(&sets, &infos);
+        assert!(warnings.is_empty());
+        let pool_depth = graph.group("21").unwrap().remaining_depth;
+        let finals_depth = graph.group("23").unwrap().remaining_depth;
+        assert!(pool_depth > 0 && finals_depth > 0);
+        assert_eq!(graph.remaining_critical_path(), pool_depth + finals_depth, "pools stage + finals stage");
+
+        // A pool set's ranking depth sees the finals chain it feeds; finals
+        // sets are the last stage and stay local.
+        assert_eq!(max_group_depth(&graph, "21"), pool_depth + finals_depth);
+        assert_eq!(max_group_depth(&graph, "23"), finals_depth);
+    }
+
+    #[test]
+    fn phaseless_same_kind_groups_keep_the_legacy_single_stage() {
+        let pool_a = make_de_bracket(21, 8);
+        let pool_b = make_de_bracket(22, 8);
+        let finals = make_de_bracket(23, 8);
+        let sets: Vec<_> = pool_a.sets.iter().chain(&pool_b.sets).chain(&finals.sets).cloned().collect();
+        let infos = vec![pool_a.info, pool_b.info, finals.info];
+
+        let (graph, _) = BracketGraph::build(&sets, &infos);
+        let pool_depth = graph.group("21").unwrap().remaining_depth;
+        assert_eq!(
+            graph.remaining_critical_path(),
+            pool_depth,
+            "no phase ids: consecutive elimination groups merge into one stage"
+        );
+        assert_eq!(max_group_depth(&graph, "21"), pool_depth, "single stage means no tail");
+    }
+
+    fn max_group_depth(graph: &BracketGraph, phase_group: &str) -> u32 {
+        graph
+            .sets()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.key.phase_group == phase_group)
+            .map(|(idx, _)| graph.depth(idx))
+            .max()
+            .unwrap_or(0)
     }
 
     #[test]
