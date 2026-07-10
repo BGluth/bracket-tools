@@ -6,6 +6,7 @@
 //! main loop and by tests.
 
 use std::{
+    cell::Cell,
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     mem::discriminant,
@@ -436,6 +437,12 @@ pub struct UiState {
     pub selected_setup: Option<SetupId>,
     /// Cursor into `world.queue` (snooze target / inspection).
     pub queue_ix: usize,
+    /// The queue table's viewport, remembered across draws so the view only
+    /// moves when the cursor crosses an edge and PgUp/PgDn jump one box.
+    pub queue_view: ListView,
+    /// Same, for whichever list modal is open (one at a time; a fresh modal's
+    /// selection clamps any stale offset back into view).
+    pub modal_view: ListView,
     /// Digits typed toward a setup number on a >10-station board; commits on
     /// Enter, on becoming unambiguous, or on the next tick past the grace
     /// window.
@@ -447,6 +454,25 @@ pub struct UiState {
 pub struct PendingSetupEntry {
     pub digits: String,
     pub at: UnixMillis,
+}
+
+/// One scrollable table's render bookkeeping, written during draw (`Cell`
+/// keeps rendering `&AppState`): the scroll offset that makes edge-scrolling
+/// possible, and the visible row count that sizes a PgUp/PgDn jump.
+#[derive(Debug, Clone, Default)]
+pub struct ListView {
+    pub scroll: Cell<usize>,
+    pub rows: Cell<usize>,
+}
+
+impl ListView {
+    /// One page's worth of cursor movement (before the first draw: 10).
+    pub fn page(&self) -> usize {
+        match self.rows.get() {
+            0 => 10,
+            rows => rows,
+        }
+    }
 }
 
 /// Per-bracket poll bookkeeping around the recompute-facing [`BracketState`].
@@ -1010,6 +1036,10 @@ fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mu
         KeyCode::Down => {
             state.ui.queue_ix = (state.ui.queue_ix + 1).min(state.world.queue.len().saturating_sub(1));
         }
+        KeyCode::PageUp => state.ui.queue_ix = state.ui.queue_ix.saturating_sub(state.ui.queue_view.page()),
+        KeyCode::PageDown => {
+            state.ui.queue_ix = (state.ui.queue_ix + state.ui.queue_view.page()).min(state.world.queue.len().saturating_sub(1));
+        }
         _ => {}
     }
 }
@@ -1058,14 +1088,14 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
         }
         Some(Modal::Inspection { selected }) => {
             let count = blocked_entries(state).len();
-            match scroll(key.code, selected, count) {
+            match scroll(state, key.code, selected, count) {
                 Some(next) => state.ui.modal = Some(Modal::Inspection { selected: next }),
                 None => state.ui.modal = None,
             }
         }
         Some(Modal::Notices { selected }) => match key.code {
             KeyCode::Enter => ack_notice(state, selected),
-            code => match scroll(code, selected, state.notices.len()) {
+            code => match scroll(state, code, selected, state.notices.len()) {
                 Some(next) => state.ui.modal = Some(Modal::Notices { selected: next }),
                 None => state.ui.modal = None,
             },
@@ -1073,28 +1103,28 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
         Some(Modal::PendingWrites { selected }) => match key.code {
             KeyCode::Enter => retry_parked(state, selected, now, effects),
             KeyCode::Char('d') => discard_pending(state, selected, now),
-            code => match scroll(code, selected, state.pending_writes.len()) {
+            code => match scroll(state, code, selected, state.pending_writes.len()) {
                 Some(next) => state.ui.modal = Some(Modal::PendingWrites { selected: next }),
                 None => state.ui.modal = None,
             },
         },
         Some(Modal::PlayerFlags { players, selected }) => match key.code {
             KeyCode::Enter => cycle_selected_flag(state, &players, selected, now),
-            code => match scroll(code, selected, players.len()) {
+            code => match scroll(state, code, selected, players.len()) {
                 Some(next) => state.ui.modal = Some(Modal::PlayerFlags { players, selected: next }),
                 None => state.ui.modal = None,
             },
         },
         Some(Modal::Reassign { setup, selected }) => match key.code {
             KeyCode::Enter => apply_reassign(state, setup, selected, now),
-            code => match scroll(code, selected, reassign_options(state).len()) {
+            code => match scroll(state, code, selected, reassign_options(state).len()) {
                 Some(next) => state.ui.modal = Some(Modal::Reassign { setup, selected: next }),
                 None => state.ui.modal = None,
             },
         },
         Some(Modal::Setups { selected }) => match key.code {
             KeyCode::Enter => apply_setups_row(state, selected, now, effects),
-            code => match scroll(code, selected, setups_rows(state).len()) {
+            code => match scroll(state, code, selected, setups_rows(state).len()) {
                 Some(next) => state.ui.modal = Some(Modal::Setups { selected: next }),
                 None => state.ui.modal = None,
             },
@@ -1105,11 +1135,15 @@ fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effect
     }
 }
 
-/// Shared list-modal cursor: Up/Down move (clamped), anything else closes.
-fn scroll(code: KeyCode, selected: usize, count: usize) -> Option<usize> {
+/// Shared list-modal cursor: Up/Down move, PgUp/PgDn jump a box height
+/// (clamped), anything else closes.
+fn scroll(state: &AppState, code: KeyCode, selected: usize, count: usize) -> Option<usize> {
+    let page = state.ui.modal_view.page();
     match code {
         KeyCode::Up => Some(selected.saturating_sub(1)),
         KeyCode::Down => Some((selected + 1).min(count.saturating_sub(1))),
+        KeyCode::PageUp => Some(selected.saturating_sub(page)),
+        KeyCode::PageDown => Some((selected + page).min(count.saturating_sub(1))),
         _ => None,
     }
 }

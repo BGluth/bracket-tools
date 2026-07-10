@@ -17,7 +17,7 @@ use ratatui::{
 
 use crate::{
     app::{
-        blocked_entries, filtered_roster, flag_label, picker_rows, reassign_options, report_roster, setups_rows, AppState, Modal,
+        blocked_entries, filtered_roster, flag_label, picker_rows, reassign_options, report_roster, setups_rows, AppState, ListView, Modal,
         NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, SetupsRow, Side,
     },
     conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
@@ -27,12 +27,18 @@ use crate::{
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
-/// Renders a table whose `selected` row must stay visible: stateful render
-/// scrolls the viewport with the highlight (a stateless one lets the cursor
-/// walk off-screen — long boards made the setups modal's add row unreachable).
-fn render_with_selection(frame: &mut Frame<'_>, area: Rect, table: Table<'_>, selected: usize) {
-    let mut table_state = TableState::default().with_selected(Some(selected));
+/// Renders a table whose `selected` row must stay visible. The scroll offset
+/// persists in the [`ListView`] across draws, so the viewport holds still
+/// and only moves when the cursor crosses an edge (a fresh offset every
+/// frame would pin the selection to the bottom edge instead); the visible
+/// row count recorded alongside sizes a PgUp/PgDn jump.
+fn render_with_selection(frame: &mut Frame<'_>, area: Rect, table: Table<'_>, selected: usize, view: &ListView) {
+    let mut table_state = TableState::default().with_offset(view.scroll.get()).with_selected(Some(selected));
     frame.render_stateful_widget(table, area, &mut table_state);
+    view.scroll.set(table_state.offset());
+    // Two border rows plus the header; a one-row error on the headerless
+    // modals is fine for a page jump.
+    view.rows.set(usize::from(area.height.saturating_sub(3)).max(1));
 }
 
 pub fn draw(frame: &mut Frame<'_>, state: &AppState, now: UnixMillis) {
@@ -164,7 +170,7 @@ fn draw_queue(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMill
     ];
     let title = format!("Call queue ({} ready)", state.world.queue.len());
     let table = Table::new(rows, widths).header(header).block(Block::bordered().title(title));
-    render_with_selection(frame, area, table, state.ui.queue_ix);
+    render_with_selection(frame, area, table, state.ui.queue_ix, &state.ui.queue_view);
 }
 
 fn draw_summaries(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -380,7 +386,7 @@ fn draw_call_picker(
     };
     let title = format!("Call on setup {} [{ranking}] — Enter commits, Esc cancels", setup.0);
     let table = Table::new(table_rows, widths).header(header).block(Block::bordered().title(title));
-    render_with_selection(frame, area, table, selected);
+    render_with_selection(frame, area, table, selected, &state.ui.modal_view);
 }
 
 fn draw_inspection(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
@@ -420,6 +426,7 @@ fn draw_inspection(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
         list_area,
         Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
         selected,
+        &state.ui.modal_view,
     );
 
     let detail: Vec<Line<'_>> = entries
@@ -555,6 +562,7 @@ fn draw_notices(frame: &mut Frame<'_>, state: &AppState, selected: usize, now: U
         area,
         Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
         selected,
+        &state.ui.modal_view,
     );
 }
 
@@ -602,6 +610,7 @@ fn draw_pending_writes(frame: &mut Frame<'_>, state: &AppState, selected: usize)
         writes_area,
         Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
         selected,
+        &state.ui.modal_view,
     );
 
     // The divergence ledger: sets the desk re-queued that the site still
@@ -671,6 +680,7 @@ fn draw_reassign(frame: &mut Frame<'_>, state: &AppState, setup: crate::config::
         area,
         Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)),
         selected,
+        &state.ui.modal_view,
     );
 }
 
@@ -705,6 +715,7 @@ fn draw_setups(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
         area,
         Table::new(rows, [Constraint::Min(20)]).block(Block::bordered().title(title)),
         selected,
+        &state.ui.modal_view,
     );
 }
 
@@ -728,6 +739,7 @@ fn draw_player_flags(frame: &mut Frame<'_>, state: &AppState, players: &[(Confli
         area,
         Table::new(rows, widths).header(header).block(Block::bordered().title(title)),
         selected,
+        &state.ui.modal_view,
     );
 }
 
@@ -848,7 +860,7 @@ fn draw_help(frame: &mut Frame<'_>) {
         "i         inspect blocked sets (why not callable)",
         "n         notices page (Enter acks)",
         "w         pending writes + divergence ledger",
-        "Up/Down   move the queue highlight",
+        "Up/Down   move the queue highlight (PgUp/PgDn jump 10)",
         "u         undo the last local action (single level)",
         "q/Ctrl-C  quit",
     ]
@@ -1186,6 +1198,19 @@ mod tests {
 
         let text = render(&state);
         assert!(text.contains("+ add a default station"), "add row visible:\n{text}");
+
+        // Edge-scrolling: stepping back inside the view must not move the
+        // viewport (a fresh offset each frame would re-pin the cursor to the
+        // bottom edge).
+        let offset = state.ui.modal_view.scroll.get();
+        assert!(offset > 0, "the long list scrolled");
+        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)), NOW);
+        render(&state);
+        assert_eq!(
+            state.ui.modal_view.scroll.get(),
+            offset,
+            "offset holds while the cursor is inside the view"
+        );
     }
 
     #[test]
