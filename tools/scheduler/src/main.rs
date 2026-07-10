@@ -183,6 +183,17 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
         );
     }
     let mapping = GameSetups::load(&mapping_path);
+    // Say which mapping got used and how much of it parsed: a skeleton
+    // template (all entries commented out) or a TOML typo both read as an
+    // empty mapping, and "every event → default pool" should self-diagnose.
+    match mapping.game.len() {
+        0 => println!(
+            "game mapping: {} has no [game.*] entries — every event gets the shared default pool\n\
+             (fill it in and re-run; tools/scheduler/examples/game-setups.toml carries the FBR 100 values)\n",
+            mapping_path.display()
+        ),
+        n => println!("game mapping: {} ({n} game entries)\n", mapping_path.display()),
+    }
 
     let text = generate_config(&slug, &events, &mapping, &default_data_dir());
     if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
