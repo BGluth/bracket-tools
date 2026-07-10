@@ -292,21 +292,31 @@ fn fill_dangling_slots(sets: &mut [LiveSet], next_id: &mut u64) {
         let known: HashSet<&str> = sets.iter().map(|s| s.id.0.as_str()).collect();
         for (s, set) in sets.iter().enumerate() {
             for (i, slot) in set.slots.iter().enumerate() {
-                let unresolvable = matches!(&slot.prereq, Some(Prereq::Set { id, .. }) if !known.contains(id.0.as_str()));
-                if unresolvable && slot.occupant.is_none() {
-                    dangling.push((s, i));
+                let placement = match &slot.prereq {
+                    Some(Prereq::Set { id, placement }) if !known.contains(id.0.as_str()) => *placement,
+                    _ => continue,
+                };
+                if slot.occupant.is_none() {
+                    dangling.push((s, i, placement));
                 }
             }
         }
     }
 
-    for (s, i) in dangling {
+    for (s, i, placement) in dangling {
         let id = *next_id;
         *next_id += 1;
+        // A dangling WINNER edge is a bye's recipient: a real (top-seeded)
+        // player the omitted set carried, so the stand-in plays matches. A
+        // dangling LOSER edge is the loser of a bye — nobody, live: the
+        // server walks such sets over. The DQ flag gives the sim the same
+        // semantics (zero-duration walkover), so phantom losers matches are
+        // never callable.
+        let is_bye = placement == Some(2);
         sets[s].slots[i].occupant = Some(SlotOccupant {
             entrant_id: EntrantId(id.to_string()),
             display_name: format!("drop-in {}", id - DROP_IN_ID_BASE + 1),
-            is_disqualified: false,
+            is_disqualified: is_bye,
             player_ids: vec![PlayerId(id.to_string())],
         });
         if sets[s].has_placeholder && sets[s].all_slots_occupied() {
@@ -506,6 +516,39 @@ mod tests {
             panic!("expected the missing event to error");
         };
         assert!(matches!(err, RehearsalError::LiveFetch { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn dangling_loser_edges_walk_over_instead_of_playing() {
+        let mut bracket = make_de_bracket(1001, 4);
+        // Simulate the server omitting one WR1 set (a bye): its winner edge
+        // (into W2) and loser edge (into L1) both dangle.
+        bracket.sets.retain(|s| s.id.0 != "preview_1001_1_1");
+        let mut source = FixtureSource::new();
+        source.add_synth_event(SLUG, from_ref(&bracket.info), vec![bracket.sets]);
+        let mut config = SchedulerConfig {
+            setups: Some(SetupCounts::Uniform(2)),
+            ..Default::default()
+        };
+        config.brackets.push(bracket_config(SLUG));
+
+        let report = install_rehearsal(&mut source, &config, 60.0, NOW).await.unwrap();
+        assert!(report.blocked.is_empty(), "{report:?}");
+
+        let (live, _, _) = live_sets_from_schema(source.fetch_event_sets(SLUG).await.unwrap());
+        // The winner-side stand-in is a real (bye-seeded) player and plays.
+        let w2 = live.iter().find(|s| s.key.round == 2).unwrap();
+        assert!(
+            w2.occupants().any(|o| o.display_name.starts_with("drop-in") && !o.is_disqualified),
+            "{w2:?}"
+        );
+        // The loser-side stand-in is nobody: flagged so the sim walks the
+        // set over instead of offering a phantom losers match.
+        let l1 = live.iter().find(|s| s.key.round == -1).unwrap();
+        assert!(
+            l1.occupants().any(|o| o.display_name.starts_with("drop-in") && o.is_disqualified),
+            "{l1:?}"
+        );
     }
 
     #[tokio::test]
