@@ -12,9 +12,12 @@
 # completions teach the model): prior = setup_minutes + 2.5 * game_minutes.
 # Left unset, events keep the default prior (8 min per bo3 set).
 #
-# Pre-filled from the FBR 100 setup map (smash-likes share the switch pool
-# and may borrow the pokemon stations; Pokémon Champions is pokemon-only) —
-# adjust for other venues.
+# These are the FBR 100 values (smash-likes share the switch pool and may
+# borrow the pokemon stations; Pokémon Champions is pokemon-only). They are
+# ALSO the scheduler's built-in standards, which apply whenever a game has no
+# entry in your file — so this example only matters as a starting point for
+# overriding them (an entry beats its built-in; `setup_types = []` pins a
+# game to the shared default pool).
 
 [game.smash]
 setup_types = ["switch", "pokemon"]

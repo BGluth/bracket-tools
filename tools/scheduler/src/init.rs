@@ -7,7 +7,7 @@
 //! Station counts deliberately stay OUT of it — the 's' modal owns those at
 //! runtime and persists them to the cross-tournament defaults file.
 
-use std::{collections::BTreeMap, fmt::Write as _, fs, path::Path};
+use std::{collections::BTreeMap, fmt::Write as _, fs, path::Path, sync::LazyLock};
 
 use bracket_tools_startgg::EventInfo;
 use serde::Deserialize;
@@ -17,34 +17,65 @@ use thiserror::Error;
 /// `scheduler.toml`.
 pub const GAME_SETUPS_FILE: &str = "game-setups.toml";
 
-/// Written when no mapping exists yet; parses as an empty mapping until the
-/// operator uncomments entries.
-pub const GAME_SETUPS_TEMPLATE: &str = r#"# game-setups.toml — maps start.gg videogames to the setup types their
+/// The standard entries for the games this scene actually runs. Compiled in:
+/// lookup falls back here when the operator's file has no matching entry, and
+/// the auto-written template starts from these instead of blanks.
+pub const BUILTIN_GAME_SETUPS: &str = r#"[game.smash] # every "Super Smash Bros. ..." title
+setup_types = ["switch", "pokemon"]
+
+[game.rivals]
+setup_types = ["pc"]
+
+[game."m.u.g.e.n"]
+setup_types = ["pc"]
+
+[game."pokémon"]
+setup_types = ["pokemon"]
+"#;
+
+/// Explanatory header of the auto-written mapping file; the body is
+/// [`BUILTIN_GAME_SETUPS`].
+const GAME_SETUPS_HEADER: &str = r#"# game-setups.toml — maps start.gg videogames to the setup types their
 # events run on. `--init-tournament` reads this to seed each generated
 # event's `setup_type`.
 #
 # A table's key matches case-insensitively as a SUBSTRING of the start.gg
-# videogame name, so [game.melee] matches "Super Smash Bros. Melee". Setup
-# type names are your own labels; station counts per type live in
-# setup-defaults.toml and the in-tool 's' modal, not here.
+# videogame name, so [game.melee] matches "Super Smash Bros. Melee" (the
+# longest matching key wins). Setup type names are your own labels; station
+# counts per type live in setup-defaults.toml and the in-tool 's' modal,
+# not here.
 #
-# The optional minutes seed each event's duration prior (used until live
+# The entries below are the built-in standards, which also apply when a game
+# has no entry in this file at all. An entry here overrides its built-in;
+# `setup_types = []` forces a game onto the shared default pool.
+#
+# Optional minutes seed each event's duration prior (used until live
 # completions teach the model): prior = setup_minutes + 2.5 * game_minutes.
 #
 # [game.melee]
 # setup_types = ["crt"]
 # game_minutes = 5
 # setup_minutes = 2
-#
-# [game.ultimate]
-# setup_types = ["switch"]
-# game_minutes = 7
-# setup_minutes = 2
 "#;
+
+/// The full auto-written `game-setups.toml`: header + built-in standards.
+pub fn game_setups_template() -> String {
+    format!("{GAME_SETUPS_HEADER}\n{BUILTIN_GAME_SETUPS}")
+}
 
 /// A bo3 set averages about 2.5 games; the duration model is bo3-normalized,
 /// so seeded priors use the same basis.
 const BO3_AVERAGE_GAMES: f64 = 2.5;
+
+static BUILTIN: LazyLock<GameSetups> = LazyLock::new(|| toml::from_str(BUILTIN_GAME_SETUPS).expect("built-in game mapping parses"));
+
+/// Which mapping answered a game lookup — the generated config and the init
+/// summary say so, so the operator knows where a pool assignment came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchSource {
+    UserFile,
+    Builtin,
+}
 
 #[derive(Debug, Error)]
 pub enum InitError {
@@ -100,6 +131,15 @@ impl GameSetups {
             .filter(|(key, _)| name.contains(&key.to_lowercase()))
             .max_by_key(|(key, _)| key.len())
             .map(|(_, entry)| entry)
+    }
+
+    /// The operator's own entry when one matches, else the built-in standard.
+    /// An operator entry always wins outright — even an empty one, which is
+    /// how a game gets pinned to the shared default pool.
+    pub fn match_game_or_builtin(&self, videogame: &str) -> Option<(&GameEntry, MatchSource)> {
+        self.match_game(videogame)
+            .map(|entry| (entry, MatchSource::UserFile))
+            .or_else(|| BUILTIN.match_game(videogame).map(|entry| (entry, MatchSource::Builtin)))
     }
 }
 
@@ -168,16 +208,20 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
         if let Some(game) = event.videogame.as_deref() {
             let _ = writeln!(out, "videogame = \"{}\"", game.replace('"', "\\\""));
         }
-        match event.videogame.as_deref().and_then(|game| setups.match_game(game)) {
-            Some(entry) => {
+        match event.videogame.as_deref().and_then(|game| setups.match_game_or_builtin(game)) {
+            Some((entry, source)) => {
+                let provenance = match source {
+                    MatchSource::UserFile => "",
+                    MatchSource::Builtin => " # built-in standard (no game-setups.toml entry)",
+                };
                 match entry.setup_types.as_slice() {
                     [] => {}
                     [only] => {
-                        let _ = writeln!(out, "setup_type = \"{only}\"");
+                        let _ = writeln!(out, "setup_type = \"{only}\"{provenance}");
                     }
                     many => {
                         let list = many.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
-                        let _ = writeln!(out, "setup_type = [{list}]");
+                        let _ = writeln!(out, "setup_type = [{list}]{provenance}");
                     }
                 }
                 match entry.prior_secs() {
@@ -196,7 +240,10 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
                 }
             }
             None => {
-                let _ = writeln!(out, "# no game-setups.toml entry matched — this event uses the shared default pool");
+                let _ = writeln!(
+                    out,
+                    "# no game-setups.toml or built-in entry matched — this event uses the shared default pool"
+                );
             }
         }
     }
@@ -209,7 +256,7 @@ mod tests {
 
     use bracket_tools_startgg::EventInfo;
 
-    use super::{generate_config, parse_tournament_slug, GameSetups, InitError};
+    use super::{game_setups_template, generate_config, parse_tournament_slug, GameSetups, InitError, MatchSource};
     use crate::config::{OneOrMany, SchedulerConfig};
 
     fn event(slug: &str, name: &str, game: Option<&str>) -> EventInfo {
@@ -264,6 +311,36 @@ mod tests {
     }
 
     #[test]
+    fn builtin_standards_cover_the_scene_games() {
+        let empty = GameSetups::default();
+        for (game, types) in [
+            ("Super Smash Bros. Ultimate", vec!["switch", "pokemon"]),
+            ("Super Smash Bros. Melee", vec!["switch", "pokemon"]),
+            ("Rivals of Aether II", vec!["pc"]),
+            ("M.U.G.E.N", vec!["pc"]),
+            ("Pokémon Champions", vec!["pokemon"]),
+        ] {
+            let (entry, source) = empty.match_game_or_builtin(game).unwrap_or_else(|| panic!("{game} matches"));
+            assert_eq!(entry.setup_types, types, "{game}");
+            assert_eq!(source, MatchSource::Builtin, "{game}");
+        }
+        assert!(empty.match_game_or_builtin("Tetris Effect").is_none());
+    }
+
+    #[test]
+    fn user_entries_beat_builtins_even_when_empty() {
+        let setups = mapping();
+        let (melee, source) = setups.match_game_or_builtin("Super Smash Bros. Melee").unwrap();
+        assert_eq!(melee.setup_types, vec!["crt"], "user entry wins over the built-in smash standard");
+        assert_eq!(source, MatchSource::UserFile);
+
+        let pinned: GameSetups = toml::from_str("[game.smash]\nsetup_types = []").unwrap();
+        let (entry, source) = pinned.match_game_or_builtin("Super Smash Bros. Melee").unwrap();
+        assert!(entry.setup_types.is_empty(), "an empty user entry pins the default pool");
+        assert_eq!(source, MatchSource::UserFile);
+    }
+
+    #[test]
     fn generated_config_parses_validates_and_carries_the_mapping() {
         let events = vec![
             event(
@@ -277,27 +354,36 @@ mod tests {
                 Some("Super Smash Bros. Ultimate"),
             ),
             event("tournament/fbr/event/rivals", "Rivals", Some("Rivals of Aether II")),
+            event("tournament/fbr/event/tetris", "Tetris", Some("Tetris Effect")),
         ];
         let text = generate_config("tournament/fbr", &events, &mapping(), &PathBuf::from("/tmp/data"));
 
         let config: SchedulerConfig = toml::from_str(&text).expect("generated config parses");
         config.validate().expect("generated config validates");
         assert_eq!(config.tournament_slug.as_deref(), Some("tournament/fbr"));
-        assert_eq!(config.brackets.len(), 3);
+        assert_eq!(config.brackets.len(), 4);
         assert_eq!(config.brackets[0].setup_type, Some(OneOrMany::One("crt".to_owned())));
         assert_eq!(config.brackets[0].duration_prior_secs, 870);
         assert_eq!(
             config.brackets[1].setup_type,
             Some(OneOrMany::Many(vec!["switch".to_owned(), "pokemon".to_owned()]))
         );
-        assert_eq!(config.brackets[2].setup_type, None, "unmatched game keeps the default pool");
+        assert_eq!(
+            config.brackets[2].setup_type,
+            Some(OneOrMany::One("pc".to_owned())),
+            "no user entry — the built-in rivals standard fills in"
+        );
+        assert!(text.contains("built-in standard"), "built-in seeds are labeled as such");
+        assert_eq!(config.brackets[3].setup_type, None, "unmatched game keeps the default pool");
         assert_eq!(config.known_called_state_int, Some(6));
         assert!(config.state_file.as_deref().is_some_and(|p| p.ends_with("fbr-state.json")));
     }
 
     #[test]
-    fn template_parses_as_an_empty_mapping() {
-        let setups: GameSetups = toml::from_str(super::GAME_SETUPS_TEMPLATE).unwrap();
-        assert!(setups.game.is_empty());
+    fn template_carries_exactly_the_builtin_standards() {
+        let template: GameSetups = toml::from_str(&game_setups_template()).unwrap();
+        let builtin: GameSetups = toml::from_str(super::BUILTIN_GAME_SETUPS).unwrap();
+        assert!(!builtin.game.is_empty());
+        assert_eq!(template.game.keys().collect::<Vec<_>>(), builtin.game.keys().collect::<Vec<_>>());
     }
 }

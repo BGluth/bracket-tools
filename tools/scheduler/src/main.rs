@@ -21,7 +21,7 @@ use bracket_tools_scheduler::{
     config::{referenced_types, resolve_roster, write_starter_template, SetupCounts},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
-    init::{generate_config, parse_tournament_slug, GameSetups, InitError, GAME_SETUPS_FILE, GAME_SETUPS_TEMPLATE},
+    init::{game_setups_template, generate_config, parse_tournament_slug, GameSetups, InitError, MatchSource, GAME_SETUPS_FILE},
     model::BracketId,
     persist::{
         load_overlay, load_setup_defaults, load_snapshot, save_overlay, save_setup_defaults, save_snapshot, sibling_with_suffix, Load,
@@ -217,24 +217,24 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
         if let Some(parent) = mapping_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::write(&mapping_path, GAME_SETUPS_TEMPLATE).with_context(|| format!("writing {}", mapping_path.display()))?;
+        fs::write(&mapping_path, game_setups_template()).with_context(|| format!("writing {}", mapping_path.display()))?;
         println!(
-            "wrote a game-setups template to {} — fill in your games' setup types\n\
-             and re-run to get typed pools (this run uses one shared default pool)\n",
+            "wrote the standard game mapping to {} (smash / rivals / mugen / pokémon)\n\
+             — edit it if your venue runs different setups\n",
             mapping_path.display()
         );
     }
     let mapping = GameSetups::load(&mapping_path);
-    // Say which mapping got used and how much of it parsed: a skeleton
-    // template (all entries commented out) or a TOML typo both read as an
-    // empty mapping, and "every event → default pool" should self-diagnose.
+    // Say which mapping got used and how much of it parsed: a TOML typo
+    // reads as an empty mapping, and "every event → built-in standards"
+    // should self-diagnose.
     match mapping.game.len() {
         0 => println!(
-            "game mapping: {} has no [game.*] entries — every event gets the shared default pool\n\
-             (fill it in and re-run; tools/scheduler/examples/game-setups.toml carries the FBR 100 values)\n",
+            "game mapping: {} has no [game.*] entries — events fall back to the\n\
+             built-in standards (smash / rivals / mugen / pokémon), other games get the shared default pool\n",
             mapping_path.display()
         ),
-        n => println!("game mapping: {} ({n} game entries)\n", mapping_path.display()),
+        n => println!("game mapping: {} ({n} game entries + built-in standards)\n", mapping_path.display()),
     }
 
     let text = generate_config(&slug, &events, &mapping, &default_data_dir());
@@ -256,11 +256,12 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
         let types = event
             .videogame
             .as_deref()
-            .and_then(|g| mapping.match_game(g))
-            .map(|entry| entry.setup_types.join(", "));
+            .and_then(|g| mapping.match_game_or_builtin(g))
+            .map(|(entry, source)| (entry.setup_types.join(", "), source));
         match types {
-            Some(types) => println!("  {} — {game} → [{types}]", event.slug),
-            None => println!("  {} — {game} → default pool (no game-setups.toml match)", event.slug),
+            Some((types, MatchSource::UserFile)) => println!("  {} — {game} → [{types}]", event.slug),
+            Some((types, MatchSource::Builtin)) => println!("  {} — {game} → [{types}] (built-in standard)", event.slug),
+            None => println!("  {} — {game} → default pool (no game-setups.toml or built-in match)", event.slug),
         }
     }
     println!(

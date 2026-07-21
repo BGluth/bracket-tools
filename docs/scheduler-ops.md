@@ -15,8 +15,12 @@ authoritative for sets the desk manages.** Everything here protects that.
    ready-to-review config to `~/.config/bracket-tools/tournaments/<slug>.toml`: one
    `[[brackets]]` per event, each event's `setup_type` seeded from the global
    `~/.config/bracket-tools/game-setups.toml` mapping (videogame → your setup-type
-   labels; a template is written on first run; optional per-game minutes seed
-   duration priors). Launch it with `scheduler --tournament <slug>` (a unique prefix
+   labels; optional per-game minutes seed duration priors). Standards for the usual
+   games (smash / rivals / mugen / pokémon) are built into the binary: they pre-fill
+   the mapping file on first run and apply even when a game has no entry, so a fresh
+   machine seeds sensible pools with zero editing (an entry in the file overrides its
+   built-in; `setup_types = []` pins a game to the shared default pool). Launch it
+   with `scheduler --tournament <slug>` (a unique prefix
    works). Re-running init right before doors picks up late bracket changes — it
    overwrites, keeping the old file as `.bak`; re-delete generated events you are
    not calling (e.g. a matchmaking ladder). Station counts are never in the config:
