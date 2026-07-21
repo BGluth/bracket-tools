@@ -9,6 +9,8 @@ use bracket_tools_startgg_schema::{
     get_player_for_player_id::GetPlayerForPlayerId,
     get_sets_for_event::{self, GetSetsForEvent},
     get_tournament_for_id::{self, GetTournamentForId},
+    get_tournament_header::GetTournamentHeader,
+    get_tournaments_for_owner::{self, GetTournamentsForOwner},
     mark_set_called::MarkSetCalled,
     mark_set_in_progress::MarkSetInProgress,
     register_for_tournament::RegisterForTournament,
@@ -283,8 +285,9 @@ fn parse_scalar_id(id: &ScalarId) -> Option<StartGgId> {
 }
 
 /// A tournament event as listed by the admin roster query: the numeric id the
-/// registration mutations take, plus display fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// registration mutations take, plus display fields. Serde: rosters are
+/// cached on disk by callers (past tournaments' rosters are frozen).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminEvent {
     pub id: StartGgId,
     pub slug: String,
@@ -294,7 +297,7 @@ pub struct AdminEvent {
 /// The page-1 header of the admin roster query: tournament identity, start
 /// date (unix seconds), and event list (the slug → id vocabulary for
 /// registration).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminTournament {
     pub id: Option<StartGgId>,
     pub name: Option<String>,
@@ -305,7 +308,7 @@ pub struct AdminTournament {
 /// One tournament participant through the admin lens. `user_id` is the handle
 /// the registration mutations take; a participant without a user account
 /// (e.g. an admin-created shell) carries `None` and cannot be targeted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdminParticipant {
     pub id: Option<StartGgId>,
     pub gamer_tag: String,
@@ -408,6 +411,68 @@ pub fn extract_register_for_tournament(response: RegisterForTournament) -> Resul
     })
 }
 
+/// The lightweight tournament header: identity, start date (unix seconds),
+/// and owner — the seed for series discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TournamentHeader {
+    pub id: Option<StartGgId>,
+    pub slug: Option<String>,
+    pub name: Option<String>,
+    pub start_at: Option<i64>,
+    pub owner_id: Option<StartGgId>,
+}
+
+/// Unwraps a tournament-header response. Errors when the tournament is
+/// missing entirely (bad slug).
+pub fn extract_tournament_header(response: GetTournamentHeader) -> Result<TournamentHeader, GgConversionError> {
+    let tournament = response.tournament.required("GetTournamentHeader", "tournament")?;
+
+    Ok(TournamentHeader {
+        id: tournament.id.as_ref().and_then(parse_scalar_id),
+        slug: tournament.slug,
+        name: tournament.name,
+        start_at: tournament.start_at.map(|ts| ts.0),
+        owner_id: tournament.owner.and_then(|owner| owner.id).as_ref().and_then(parse_scalar_id),
+    })
+}
+
+/// One tournament from a filtered tournament listing (series-scan material).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TournamentSummary {
+    pub id: StartGgId,
+    pub slug: String,
+    pub name: Option<String>,
+    pub start_at: Option<i64>,
+}
+
+/// Extracts one page of a filtered tournament listing plus the connection's
+/// total page count. A missing connection (nothing matched the filter) is an
+/// empty page, not an error. Suitable as the `extract_page` argument to
+/// [`GGProvider::fetch_all_pages`](crate::provider).
+pub fn extract_tournaments_page(response: &GetTournamentsForOwner) -> Result<Page<TournamentSummary>, GgConversionError> {
+    let connection = response.tournaments.as_ref();
+
+    let total_pages = connection
+        .and_then(|c| c.page_info.as_ref())
+        .and_then(|pi| pi.total_pages)
+        .unwrap_or(1);
+    let items = connection
+        .and_then(|c| c.nodes.as_ref())
+        .map(|nodes| nodes.iter().flatten().filter_map(tournament_summary).collect())
+        .unwrap_or_default();
+
+    Ok(Page { items, total_pages })
+}
+
+fn tournament_summary(t: &get_tournaments_for_owner::Tournament) -> Option<TournamentSummary> {
+    Some(TournamentSummary {
+        id: t.id.as_ref().and_then(parse_scalar_id)?,
+        slug: t.slug.clone()?,
+        name: t.name.clone(),
+        start_at: t.start_at.map(|ts| ts.0),
+    })
+}
+
 impl TryFrom<PlayerQueryResult> for HydratedGgPlayer {
     type Error = GgConversionError;
 
@@ -503,16 +568,16 @@ mod tests {
     use bracket_tools_startgg_schema::{
         enums::ActivityState,
         generate_registration_token as grt, get_event_structure as ges, get_games_for_set as gfs, get_participants_for_tournament as gpt,
-        get_player_for_player_id as gp, get_sets_for_event as gse, get_tournament_for_id as gt, mark_set_called as msc,
-        mark_set_in_progress as msip, register_for_tournament as rft,
+        get_player_for_player_id as gp, get_sets_for_event as gse, get_tournament_for_id as gt, get_tournament_header as gth,
+        get_tournaments_for_owner as gto, mark_set_called as msc, mark_set_in_progress as msip, register_for_tournament as rft,
         scalars::{Id, Timestamp},
     };
 
     use super::{
         extract_admin_participants_page, extract_admin_tournament, extract_event_sets_page, extract_event_structure,
         extract_mark_set_called, extract_mark_set_in_progress, extract_register_for_tournament, extract_registration_token,
-        extract_tournament_participants_page, tournament_name, GgConversionError, HydratedGgPlayer, HydratedGgSet, Matchup,
-        PlayerQueryResult, SetMutationResult, SetQueryResult,
+        extract_tournament_header, extract_tournament_participants_page, extract_tournaments_page, tournament_name, GgConversionError,
+        HydratedGgPlayer, HydratedGgSet, Matchup, PlayerQueryResult, SetMutationResult, SetQueryResult,
     };
 
     fn admin_event_node(id: &str) -> gpt::Event {
@@ -598,6 +663,54 @@ mod tests {
         .unwrap();
         assert_eq!(registered.id, Some(900));
         assert_eq!(registered.gamer_tag.as_deref(), Some("Zelda"));
+    }
+
+    #[test]
+    fn tournament_header_extraction() {
+        let response = gth::GetTournamentHeader {
+            tournament: Some(gth::Tournament {
+                id: Some(Id::new("926703")),
+                name: Some("FBR 100".to_string()),
+                slug: Some("tournament/french-bread-rumble-100".to_string()),
+                start_at: Some(Timestamp(1752130800)),
+                owner: Some(gth::User { id: Some(Id::new("777")) }),
+            }),
+        };
+
+        let header = extract_tournament_header(response).unwrap();
+        assert_eq!(header.id, Some(926703));
+        assert_eq!(header.owner_id, Some(777));
+        assert_eq!(header.start_at, Some(1752130800));
+
+        assert!(extract_tournament_header(gth::GetTournamentHeader { tournament: None }).is_err());
+    }
+
+    #[test]
+    fn tournaments_page_extraction() {
+        let node = |id: &str, slug: &str| {
+            Some(gto::Tournament {
+                id: Some(Id::new(id)),
+                name: Some(format!("T {id}")),
+                slug: Some(format!("tournament/{slug}")),
+                start_at: Some(Timestamp(1000)),
+            })
+        };
+        let response = gto::GetTournamentsForOwner {
+            tournaments: Some(gto::TournamentConnection {
+                page_info: Some(gto::PageInfo { total_pages: Some(2) }),
+                nodes: Some(vec![node("1", "fbr-99"), None, node("2", "fbr-100")]),
+            }),
+        };
+
+        let page = extract_tournaments_page(&response).unwrap();
+        assert_eq!(page.total_pages, 2);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[1].slug, "tournament/fbr-100");
+
+        // Nothing matched the filter: empty page, not an error.
+        let empty = extract_tournaments_page(&gto::GetTournamentsForOwner { tournaments: None }).unwrap();
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.total_pages, 1);
     }
 
     fn participant(id: &str) -> Option<gt::Participant> {

@@ -9,6 +9,7 @@ pub mod types;
 
 pub use conversions::{
     AdminEvent, AdminParticipant, AdminProbeResult, AdminTournament, CharacterInfo, EventInfo, RegisteredParticipant, SetMutationResult,
+    TournamentHeader, TournamentSummary,
 };
 pub use gg_data_types::StartGgId;
 pub use lazy::{LazyPlayer, LazySet, LazyTournament};

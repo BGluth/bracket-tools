@@ -5,26 +5,34 @@
 //!   to *change* payment state — marking paid stays in the start.gg admin UI.
 //! - `add`: register a start.gg user into events of a tournament (e.g. a redemption bracket) via the on-behalf-of token flow. Needs a
 //!   tournament-admin token.
-//! - `find`: fuzzy-search a player across the rosters of the tournaments you name (there is no global player search in the public API),
-//!   ranked by match quality, then recency, then attendance.
+//! - `find`: fuzzy-search a player across a saved pool of tournaments (there is no global player search in the public API), ranked by match
+//!   quality, then recency, then attendance. The pool lives in `~/.config/bracket-tools/find-pool.toml`, grows automatically with every
+//!   tournament the tool touches, and `pool scan` adds a whole series (same owner, same slug stem) in one go. Past tournaments' rosters are
+//!   cached on disk so repeated `find` runs stay off the network.
 
 mod fuzzy;
+mod store;
 
 use std::{
+    cmp::Reverse,
     collections::BTreeMap,
     env,
     io::{self, Write},
     path::{Path, PathBuf},
     str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use bracket_tools_cache::null_storage::NullStorage;
-use bracket_tools_startgg::{types::GGRestToken, AdminEvent, AdminParticipant, AdminTournament, GGProvider, StartGgId};
+use bracket_tools_startgg::{types::GGRestToken, AdminEvent, AdminParticipant, AdminTournament, GGProvider, StartGgId, TournamentSummary};
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
 
-use crate::fuzzy::{best_tier, MatchTier};
+use crate::{
+    fuzzy::{best_tier, MatchTier},
+    store::CachedRoster,
+};
 
 type Provider = GGProvider<NullStorage>;
 
@@ -33,6 +41,9 @@ type Provider = GGProvider<NullStorage>;
 const ROSTER_PAGE_SIZE: i32 = 50;
 const TOKEN_FALLBACK_PATHS: [&str; 2] = ["~/work/tokens/admin_gg.token", "~/work/tokens/scraper_gg.token"];
 const FIND_RESULT_CAP: usize = 15;
+/// A tournament this far in the past no longer gains registrations, so its
+/// cached roster is served without a refetch.
+const ROSTER_FROZEN_AFTER_SECS: i64 = 2 * 24 * 3600;
 
 #[derive(Parser)]
 #[command(name = "gg-admin", version, about = "start.gg tournament-admin desk tool (prototype)")]
@@ -77,13 +88,48 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Fuzzy-find a player across the rosters of the given tournaments
+    /// Fuzzy-find a player across the saved pool of tournaments
     Find {
         /// Tag, prefix, or numeric user id to search for
         query: String,
-        /// Tournament to include in the search pool (repeatable)
-        #[arg(long = "tournament", required = true)]
+        /// Extra tournaments beyond the saved pool (repeatable; remembered)
+        #[arg(long = "tournament")]
         tournaments: Vec<String>,
+        /// Ignore cached rosters and refetch everything live
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Manage the saved search pool that `find` uses by default
+    Pool {
+        #[command(subcommand)]
+        action: PoolAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PoolAction {
+    /// Show the saved pool
+    List,
+    /// Add tournaments to the pool
+    Add {
+        #[arg(required = true)]
+        tournaments: Vec<String>,
+    },
+    /// Remove tournaments from the pool
+    Remove {
+        #[arg(required = true)]
+        tournaments: Vec<String>,
+    },
+    /// Discover a whole series (same owner + same slug stem) and add it
+    Scan {
+        /// Seed tournament — any tournament of the series
+        tournament: Option<String>,
+        /// Add all of the owner's tournaments, not just the seed's series
+        #[arg(long)]
+        all: bool,
+        /// Add every tournament your token administers instead (no seed needed)
+        #[arg(long, conflicts_with_all = ["tournament", "all"])]
+        mine: bool,
     },
 }
 
@@ -102,13 +148,28 @@ async fn main() -> Result<()> {
             user_id,
             yes,
         } => run_add(&provider, &tournament, query.as_deref(), &event, user_id, yes).await,
-        Command::Find { query, tournaments } => run_find(&provider, &query, &tournaments).await,
+        Command::Find {
+            query,
+            tournaments,
+            refresh,
+        } => run_find(&provider, &query, &tournaments, refresh).await,
+        Command::Pool { action } => match action {
+            PoolAction::List => run_pool_list(),
+            PoolAction::Add { tournaments } => run_pool_add(&tournaments),
+            PoolAction::Remove { tournaments } => run_pool_remove(&tournaments),
+            PoolAction::Scan { tournament, all, mine } => run_pool_scan(&provider, tournament.as_deref(), all, mine).await,
+        },
     }
 }
 
 async fn run_roster(provider: &Provider, tournament: &str, unpaid: bool, event_filter: Option<&str>) -> Result<()> {
     let slug = normalize_tournament_slug(tournament);
     let (header, participants) = provider.fetch_tournament_admin(&slug, unpaid).await?;
+    remember_in_pool(&bare_slug(tournament));
+    if !unpaid {
+        // Never cache a filtered roster — the cache stands in for the full list.
+        cache_roster(&bare_slug(tournament), &header, &participants);
+    }
 
     print_header(&header, &slug);
 
@@ -155,6 +216,8 @@ async fn run_add(
 ) -> Result<()> {
     let slug = normalize_tournament_slug(tournament);
     let (header, participants) = provider.fetch_tournament_admin(&slug, false).await?;
+    remember_in_pool(&bare_slug(tournament));
+    cache_roster(&bare_slug(tournament), &header, &participants);
 
     let targets = events
         .iter()
@@ -212,6 +275,7 @@ async fn run_add(
 /// Re-fetches the roster so the operator sees the write actually landed.
 async fn verify_registration(provider: &Provider, slug: &str, user_id: StartGgId, expected: &[StartGgId]) -> Result<()> {
     let (header, after) = provider.fetch_tournament_admin(slug, false).await?;
+    cache_roster(slug.trim_start_matches("tournament/"), &header, &after);
 
     match after.iter().find(|p| p.user_id == Some(user_id)) {
         Some(p) if expected.iter().all(|id| p.event_ids.contains(id)) => {
@@ -258,25 +322,46 @@ impl PoolEntry {
     }
 }
 
-async fn run_find(provider: &Provider, query: &str, tournaments: &[String]) -> Result<()> {
-    let mut pool: BTreeMap<String, PoolEntry> = BTreeMap::new();
-
+async fn run_find(provider: &Provider, query: &str, tournaments: &[String], refresh: bool) -> Result<()> {
+    let mut slugs = store::load_pool()?.tournaments;
     for tournament in tournaments {
-        let slug = normalize_tournament_slug(tournament);
-        let (header, participants) = provider.fetch_tournament_admin(&slug, false).await?;
-        let name = header.name.clone().unwrap_or_else(|| slug.clone());
-        println!("pool: {name} — {} participants", participants.len());
+        let bare = bare_slug(tournament);
+        if !slugs.contains(&bare) {
+            slugs.push(bare.clone());
+        }
+        remember_in_pool(&bare);
+    }
+    if slugs.is_empty() {
+        bail!("the search pool is empty: pass --tournament, or seed it with `gg-admin pool add/scan`");
+    }
+
+    let mut entries: BTreeMap<String, PoolEntry> = BTreeMap::new();
+    let mut skipped = Vec::new();
+    for bare in &slugs {
+        let (header, participants, from_cache) = match roster_cached_or_live(provider, bare, refresh).await {
+            Ok(fetched) => fetched,
+            Err(err) => {
+                skipped.push(format!("{bare}: {err}"));
+                continue;
+            }
+        };
+        let name = header.name.clone().unwrap_or_else(|| bare.clone());
+        let source = if from_cache { "cached" } else { "live" };
+        println!("pool: {name} — {} participants ({source})", participants.len());
 
         for p in &participants {
             let key = p
                 .user_id
                 .map_or_else(|| format!("tag:{}", p.gamer_tag.to_lowercase()), |id| format!("user:{id}"));
-            pool.entry(key).or_default().absorb(p, header.start_at, &name);
+            entries.entry(key).or_default().absorb(p, header.start_at, &name);
         }
+    }
+    for line in &skipped {
+        println!("warning: skipped {line}");
     }
 
     let queried_id = query.parse::<u64>().ok();
-    let mut ranked: Vec<(&PoolEntry, MatchTier)> = pool
+    let mut ranked: Vec<(&PoolEntry, MatchTier)> = entries
         .values()
         .filter_map(|entry| {
             let tier = if queried_id.is_some() && queried_id == entry.user_id {
@@ -322,6 +407,155 @@ async fn run_find(provider: &Provider, query: &str, tournaments: &[String]) -> R
     println!("\nadd with: gg-admin add <tournament> --user-id <id> --event <event>");
 
     Ok(())
+}
+
+fn run_pool_list() -> Result<()> {
+    let pool = store::load_pool()?;
+    if pool.tournaments.is_empty() {
+        println!("pool is empty — seed it with `gg-admin pool add <t>` or `gg-admin pool scan <t>`");
+        return Ok(());
+    }
+
+    println!(
+        "search pool ({} tournaments) — {}",
+        pool.tournaments.len(),
+        store::pool_path().display()
+    );
+    for bare in &pool.tournaments {
+        match store::load_cached_roster(bare) {
+            Some(cached) => println!(
+                "  {bare:<44} {}  {:>4} players  {}",
+                format_date(cached.header.start_at),
+                cached.participants.len(),
+                cached.header.name.as_deref().unwrap_or(""),
+            ),
+            None => println!("  {bare:<44} (roster not yet fetched)"),
+        }
+    }
+
+    Ok(())
+}
+
+fn run_pool_add(tournaments: &[String]) -> Result<()> {
+    let mut pool = store::load_pool()?;
+    for tournament in tournaments {
+        let bare = bare_slug(tournament);
+        let note = if pool.add(&bare) { "added" } else { "already present" };
+        println!("  {bare}: {note}");
+    }
+    store::save_pool(&pool)?;
+    println!("pool: {} tournaments", pool.tournaments.len());
+
+    Ok(())
+}
+
+fn run_pool_remove(tournaments: &[String]) -> Result<()> {
+    let mut pool = store::load_pool()?;
+    for tournament in tournaments {
+        let bare = bare_slug(tournament);
+        let note = if pool.remove(&bare) { "removed" } else { "was not in the pool" };
+        println!("  {bare}: {note}");
+    }
+    store::save_pool(&pool)?;
+    println!("pool: {} tournaments", pool.tournaments.len());
+
+    Ok(())
+}
+
+/// Discovers series siblings (same owner, same slug stem — `fbr-99`/`fbr-100`)
+/// or, with `--mine`, every tournament the token administers, and adds the
+/// unique ones to the pool.
+async fn run_pool_scan(provider: &Provider, seed: Option<&str>, all: bool, mine: bool) -> Result<()> {
+    let mut found: Vec<TournamentSummary> = if mine {
+        provider.fetch_my_admin_tournaments().await?
+    } else {
+        let seed = seed.ok_or_else(|| anyhow!("give a seed tournament, or pass --mine"))?;
+        let header = provider.fetch_tournament_header(&normalize_tournament_slug(seed)).await?;
+        let owner = header
+            .owner_id
+            .ok_or_else(|| anyhow!("couldn't determine the tournament's owner"))?;
+        let mut owned = provider.fetch_tournaments_by_owner(owner).await?;
+        if !all {
+            let stem = series_stem(&bare_slug(seed)).to_string();
+            owned.retain(|t| series_stem(&bare_slug(&t.slug)) == stem);
+        }
+        owned
+    };
+
+    if found.is_empty() {
+        println!("no tournaments found (an unlisted/private series may hide from the tournaments query).");
+        return Ok(());
+    }
+    found.sort_by_key(|t| Reverse(t.start_at));
+
+    let mut pool = store::load_pool()?;
+    let mut added = 0;
+    for tournament in &found {
+        let bare = bare_slug(&tournament.slug);
+        if pool.add(&bare) {
+            added += 1;
+            println!(
+                "  + {}  {}",
+                format_date(tournament.start_at),
+                tournament.name.as_deref().unwrap_or(&bare)
+            );
+        }
+    }
+    store::save_pool(&pool)?;
+    println!(
+        "pool: {added} added, {} already present — {} total",
+        found.len() - added,
+        pool.tournaments.len()
+    );
+
+    Ok(())
+}
+
+/// Serves a cached roster when the tournament is safely in the past,
+/// otherwise fetches live (and refreshes the cache). The bool reports
+/// whether the cache answered.
+async fn roster_cached_or_live(provider: &Provider, bare: &str, refresh: bool) -> Result<(AdminTournament, Vec<AdminParticipant>, bool)> {
+    if !refresh {
+        if let Some(cached) = store::load_cached_roster(bare) {
+            if cache_usable(cached.header.start_at, now_secs()) {
+                return Ok((cached.header, cached.participants, true));
+            }
+        }
+    }
+
+    let (header, participants) = provider.fetch_tournament_admin(&format!("tournament/{bare}"), false).await?;
+    cache_roster(bare, &header, &participants);
+
+    Ok((header, participants, false))
+}
+
+fn cache_roster(bare: &str, header: &AdminTournament, participants: &[AdminParticipant]) {
+    store::save_cached_roster(
+        bare,
+        &CachedRoster {
+            header: header.clone(),
+            participants: participants.to_vec(),
+            fetched_at: now_secs(),
+        },
+    );
+}
+
+/// A roster is frozen once its tournament is comfortably in the past; recent
+/// or upcoming tournaments still gain registrations, so they refetch live.
+fn cache_usable(start_at: Option<i64>, now: i64) -> bool {
+    start_at.is_some_and(|start| now - start > ROSTER_FROZEN_AFTER_SECS)
+}
+
+/// Best-effort pool bookkeeping — must never break the command that ran.
+fn remember_in_pool(bare: &str) {
+    let Ok(mut pool) = store::load_pool() else { return };
+    if pool.add(bare) && store::save_pool(&pool).is_ok() {
+        println!("pool: remembered {bare} (see `gg-admin pool list`)");
+    }
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 fn print_header(header: &AdminTournament, slug: &str) {
@@ -468,6 +702,20 @@ fn normalize_tournament_slug(input: &str) -> String {
     format!("tournament/{trimmed}")
 }
 
+/// The bare slug (`french-bread-rumble-100`) from any accepted tournament form.
+fn bare_slug(input: &str) -> String {
+    normalize_tournament_slug(input).trim_start_matches("tournament/").to_string()
+}
+
+/// The series stem of a bare slug: `french-bread-rumble-100` →
+/// `french-bread-rumble`. A slug without a trailing number is its own stem.
+fn series_stem(bare: &str) -> &str {
+    match bare.rfind('-') {
+        Some(ix) if !bare[ix + 1..].is_empty() && bare[ix + 1..].chars().all(|c| c.is_ascii_digit()) => &bare[..ix],
+        _ => bare,
+    }
+}
+
 fn format_date(unix_secs: Option<i64>) -> String {
     unix_secs
         .and_then(|secs| DateTime::from_timestamp(secs, 0))
@@ -517,7 +765,10 @@ fn expand_home(path: &str) -> PathBuf {
 mod tests {
     use bracket_tools_startgg::{AdminEvent, AdminParticipant};
 
-    use super::{display_tag, event_short, normalize_tournament_slug, resolve_event, resolve_participant};
+    use super::{
+        bare_slug, cache_usable, display_tag, event_short, normalize_tournament_slug, resolve_event, resolve_participant, series_stem,
+        ROSTER_FROZEN_AFTER_SECS,
+    };
 
     fn event(id: u64, short: &str, name: &str) -> AdminEvent {
         AdminEvent {
@@ -587,6 +838,33 @@ mod tests {
         assert_eq!(resolve_participant(&twins, "ken").unwrap().user_id, Some(601));
         // `ke` is a prefix of both — ambiguous.
         assert!(resolve_participant(&twins, "ke").is_err());
+    }
+
+    #[test]
+    fn series_stems() {
+        assert_eq!(series_stem("french-bread-rumble-100"), "french-bread-rumble");
+        assert_eq!(series_stem("fbr-9"), "fbr");
+        assert_eq!(series_stem("weekly"), "weekly");
+        assert_eq!(series_stem("smash-64-arena"), "smash-64-arena");
+        assert_eq!(series_stem("trailing-dash-"), "trailing-dash-");
+    }
+
+    #[test]
+    fn bare_slugs() {
+        assert_eq!(bare_slug("https://www.start.gg/tournament/fbr-100/details"), "fbr-100");
+        assert_eq!(bare_slug("tournament/fbr-100"), "fbr-100");
+        assert_eq!(bare_slug("fbr-100"), "fbr-100");
+    }
+
+    #[test]
+    fn cache_freshness_policy() {
+        let now = 1_000_000_000;
+        // Comfortably past: cached roster is frozen.
+        assert!(cache_usable(Some(now - ROSTER_FROZEN_AFTER_SECS - 1), now));
+        // Recent, today, or upcoming: always refetch.
+        assert!(!cache_usable(Some(now - 3600), now));
+        assert!(!cache_usable(Some(now + 3600), now));
+        assert!(!cache_usable(None, now));
     }
 
     #[test]

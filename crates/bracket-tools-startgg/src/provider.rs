@@ -21,6 +21,8 @@ use bracket_tools_startgg_schema::{
     get_player_for_player_id::{GetPlayerForPlayerId, GetPlayerForPlayerIdVariables},
     get_sets_for_event::{self, GetSetsForEvent, GetSetsForEventVariables},
     get_tournament_for_id::{GetTournamentForId, GetTournamentForIdVariables},
+    get_tournament_header::{GetTournamentHeader, GetTournamentHeaderVariables},
+    get_tournaments_for_owner::{GetTournamentsForOwner, GetTournamentsForOwnerVariables},
     mark_set_called::{MarkSetCalled, MarkSetCalledVariables},
     mark_set_in_progress::{MarkSetInProgress, MarkSetInProgressVariables},
     register_for_tournament::{RegisterForTournament, RegisterForTournamentVariables},
@@ -42,9 +44,10 @@ use crate::{
     conversions::{
         extract_admin_participants_page, extract_admin_probe, extract_admin_tournament, extract_event_characters, extract_event_sets_page,
         extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress, extract_register_for_tournament,
-        extract_registration_token, extract_report_bracket_set, extract_tournament_events, extract_tournament_participants_page,
-        tournament_name, AdminParticipant, AdminProbeResult, AdminTournament, CharacterInfo, EventInfo, GgConversionError, Page,
-        PlayerQueryResult, RegisteredParticipant, SetMutationResult, SetQueryResult,
+        extract_registration_token, extract_report_bracket_set, extract_tournament_events, extract_tournament_header,
+        extract_tournament_participants_page, extract_tournaments_page, tournament_name, AdminParticipant, AdminProbeResult,
+        AdminTournament, CharacterInfo, EventInfo, GgConversionError, Page, PlayerQueryResult, RegisteredParticipant, SetMutationResult,
+        SetQueryResult, TournamentHeader, TournamentSummary,
     },
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
     limit_journal::{LimitJournal, JOURNAL_CAPACITY_MARGIN},
@@ -469,6 +472,51 @@ impl<S: Storage> GGProvider<S> {
             .await?;
 
         Ok((extract_admin_tournament(&first_page)?, participants))
+    }
+
+    /// Fetches the lightweight tournament header (identity, start date,
+    /// owner) — the seed for series discovery. Bypasses the cache entirely.
+    pub async fn fetch_tournament_header(&self, slug: &str) -> Result<TournamentHeader, GGProviderError> {
+        let data = self
+            .run_query(GetTournamentHeader::build(GetTournamentHeaderVariables { slug }))
+            .await?;
+
+        Ok(extract_tournament_header(data)?)
+    }
+
+    /// Lists every tournament owned by `owner_id` (all pages) — series
+    /// discovery material. Bypasses the cache entirely.
+    pub async fn fetch_tournaments_by_owner(&self, owner_id: StartGgId) -> Result<Vec<TournamentSummary>, GGProviderError> {
+        self.fetch_tournaments_filtered(Some(owner_id), false).await
+    }
+
+    /// Lists every tournament the token's user administers (start.gg's
+    /// `isCurrentUserAdmin` filter; all pages). Bypasses the cache entirely.
+    pub async fn fetch_my_admin_tournaments(&self) -> Result<Vec<TournamentSummary>, GGProviderError> {
+        self.fetch_tournaments_filtered(None, true).await
+    }
+
+    async fn fetch_tournaments_filtered(
+        &self,
+        owner_id: Option<StartGgId>,
+        admin_only: bool,
+    ) -> Result<Vec<TournamentSummary>, GGProviderError> {
+        let owner = owner_id.map(gg_id);
+        let (tournaments, _first_page) = self
+            .fetch_all_pages(
+                |page| {
+                    GetTournamentsForOwner::build(GetTournamentsForOwnerVariables {
+                        owner_id: owner.clone(),
+                        admin_only: admin_only.then_some(true),
+                        page,
+                        per_page: self.page_size,
+                    })
+                },
+                extract_tournaments_page,
+            )
+            .await?;
+
+        Ok(tournaments)
     }
 
     /// Mints a registration token on behalf of `user_id` for the given events

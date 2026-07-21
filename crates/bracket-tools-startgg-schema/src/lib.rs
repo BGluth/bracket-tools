@@ -15,6 +15,8 @@ pub mod get_player_for_player_id;
 pub mod get_sets_for_event;
 pub mod get_sets_of_player_after_datetime;
 pub mod get_tournament_for_id;
+pub mod get_tournament_header;
+pub mod get_tournaments_for_owner;
 pub mod get_tourney_id;
 pub mod get_user_for_user_slug;
 pub mod mark_set_called;

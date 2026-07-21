@@ -14,4 +14,8 @@ bracket-tools-startgg = { path = "../../crates/bracket-tools-startgg" }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+directories = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
