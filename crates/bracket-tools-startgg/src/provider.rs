@@ -12,15 +12,18 @@ use bracket_tools_cache::{
 };
 use bracket_tools_startgg_schema::{
     admin_probe::{AdminProbe, AdminProbeVariables},
+    generate_registration_token::{GenerateRegistrationToken, GenerateRegistrationTokenVariables, TournamentRegistrationInput},
     get_event_characters::{GetEventCharacters, GetEventCharactersVariables},
     get_event_structure::{self, GetEventStructure, GetEventStructureVariables},
     get_events_for_tournament::{GetEventsForTournament, GetEventsForTournamentVariables},
     get_games_for_set::{GetGamesOfSet, GetGamesOfSetVariables},
+    get_participants_for_tournament::{GetParticipantsForTournament, GetParticipantsForTournamentVariables},
     get_player_for_player_id::{GetPlayerForPlayerId, GetPlayerForPlayerIdVariables},
     get_sets_for_event::{self, GetSetsForEvent, GetSetsForEventVariables},
     get_tournament_for_id::{GetTournamentForId, GetTournamentForIdVariables},
     mark_set_called::{MarkSetCalled, MarkSetCalledVariables},
     mark_set_in_progress::{MarkSetInProgress, MarkSetInProgressVariables},
+    register_for_tournament::{RegisterForTournament, RegisterForTournamentVariables},
     report_bracket_set::{BracketSetGameDataInput, BracketSetGameSelectionInput, ReportBracketSet, ReportBracketSetVariables},
 };
 use cynic::{
@@ -37,10 +40,11 @@ use thiserror::Error;
 
 use crate::{
     conversions::{
-        extract_admin_probe, extract_event_characters, extract_event_sets_page, extract_event_structure, extract_mark_set_called,
-        extract_mark_set_in_progress, extract_report_bracket_set, extract_tournament_events, extract_tournament_participants_page,
-        tournament_name, AdminProbeResult, CharacterInfo, EventInfo, GgConversionError, Page, PlayerQueryResult, SetMutationResult,
-        SetQueryResult,
+        extract_admin_participants_page, extract_admin_probe, extract_admin_tournament, extract_event_characters, extract_event_sets_page,
+        extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress, extract_register_for_tournament,
+        extract_registration_token, extract_report_bracket_set, extract_tournament_events, extract_tournament_participants_page,
+        tournament_name, AdminParticipant, AdminProbeResult, AdminTournament, CharacterInfo, EventInfo, GgConversionError, Page,
+        PlayerQueryResult, RegisteredParticipant, SetMutationResult, SetQueryResult,
     },
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
     limit_journal::{LimitJournal, JOURNAL_CAPACITY_MARGIN},
@@ -435,6 +439,77 @@ impl<S: Storage> GGProvider<S> {
         Ok(extract_tournament_events(data))
     }
 
+    /// Fetches a tournament's full participant roster (all pages) with the
+    /// admin-relevant fields, plus the tournament header (identity, start
+    /// date, event list). Takes a tournament slug in either form
+    /// (`tournament/foo` or bare `foo`).
+    ///
+    /// `unpaid_only` applies start.gg's server-side unpaid filter — the public
+    /// API's only view of payment state (there is no mutation to mark a
+    /// participant paid, and no paid field on `Participant`). Bypasses the
+    /// cache entirely: admin views must never serve stale rosters.
+    pub async fn fetch_tournament_admin(
+        &self,
+        slug: &str,
+        unpaid_only: bool,
+    ) -> Result<(AdminTournament, Vec<AdminParticipant>), GGProviderError> {
+        let unpaid = unpaid_only.then_some(true);
+        let (participants, first_page) = self
+            .fetch_all_pages(
+                |page| {
+                    GetParticipantsForTournament::build(GetParticipantsForTournamentVariables {
+                        slug,
+                        page,
+                        per_page: self.page_size,
+                        unpaid,
+                    })
+                },
+                extract_admin_participants_page,
+            )
+            .await?;
+
+        Ok((extract_admin_tournament(&first_page)?, participants))
+    }
+
+    /// Mints a registration token on behalf of `user_id` for the given events
+    /// (the admin half of the add-attendee flow; requires a tournament-admin
+    /// token). The tournament is implied by the event ids.
+    pub async fn generate_registration_token(&self, user_id: StartGgId, event_ids: &[StartGgId]) -> Result<String, GGProviderError> {
+        let gg_user = gg_id(user_id);
+        let operation = GenerateRegistrationToken::build(GenerateRegistrationTokenVariables {
+            user_id: &gg_user,
+            registration: registration_input(event_ids),
+        });
+        let data = self.run_query(operation).await?;
+
+        Ok(extract_registration_token(data)?)
+    }
+
+    /// Redeems a registration token minted by
+    /// [`generate_registration_token`](Self::generate_registration_token),
+    /// completing the on-behalf-of registration for the same events.
+    pub async fn register_for_tournament(
+        &self,
+        event_ids: &[StartGgId],
+        registration_token: &str,
+    ) -> Result<RegisteredParticipant, GGProviderError> {
+        let operation = RegisterForTournament::build(RegisterForTournamentVariables {
+            registration: registration_input(event_ids),
+            registration_token,
+        });
+        let data = self.run_query(operation).await?;
+
+        Ok(extract_register_for_tournament(data)?)
+    }
+
+    /// The full admin add-attendee flow: mint a registration token on behalf
+    /// of `user_id` for `event_ids`, then redeem it.
+    pub async fn admin_register_user(&self, user_id: StartGgId, event_ids: &[StartGgId]) -> Result<RegisteredParticipant, GGProviderError> {
+        let token = self.generate_registration_token(user_id, event_ids).await?;
+
+        self.register_for_tournament(event_ids, &token).await
+    }
+
     /// Fetches an event's videogame character roster (the vocabulary for
     /// reporting character selections). Bypasses the cache entirely; an event
     /// without character data yields an empty roster.
@@ -523,6 +598,12 @@ pub struct GameReport {
 pub struct GameSelection {
     pub entrant_id: String,
     pub character_id: Option<i32>,
+}
+
+fn registration_input(event_ids: &[StartGgId]) -> TournamentRegistrationInput {
+    TournamentRegistrationInput {
+        event_ids: Some(event_ids.iter().map(|id| Some(gg_id(*id))).collect()),
+    }
 }
 
 fn game_data_input(ix: usize, game: &GameReport) -> BracketSetGameDataInput {
@@ -691,9 +772,9 @@ mod tests {
         is_stale, CacheEntity, CacheFreshness, EntityTtls, GGProvider, GGProviderError, DEFAULT_BURST, DEFAULT_CONNECT_TIMEOUT,
         DEFAULT_PAGE_SIZE, DEFAULT_REQUESTS_PER_MINUTE, DEFAULT_REQUEST_TIMEOUT,
     };
-    use crate::limit_journal::LimitJournal;
     use crate::{
         gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, Matchup, SlotData, StartGgId},
+        limit_journal::LimitJournal,
         types::GGRestToken,
     };
 

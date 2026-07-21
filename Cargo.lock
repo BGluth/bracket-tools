@@ -223,6 +223,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bracket-tools-admin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bracket-tools-cache",
+ "bracket-tools-startgg",
+ "chrono",
+ "clap",
+ "tokio",
+]
+
+[[package]]
 name = "bracket-tools-cache"
 version = "0.1.0"
 dependencies = [

@@ -7,6 +7,7 @@ members = [
     "crates/bracket-tools-startgg",
     "tools/reporter/reporter-cli",
     "tools/reporter/reporter-state",
+    "tools/admin",
     "tools/daemon",
     "tools/scheduler",
 ]

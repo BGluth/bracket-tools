@@ -1,16 +1,19 @@
 use bracket_tools_startgg_schema::{
     admin_probe::{self, AdminProbe},
+    generate_registration_token::GenerateRegistrationToken,
     get_event_characters::GetEventCharacters,
     get_event_structure::{self, GetEventStructure},
     get_events_for_tournament::GetEventsForTournament,
     get_games_for_set::{self, GetGamesOfSet},
+    get_participants_for_tournament::{self, GetParticipantsForTournament},
     get_player_for_player_id::GetPlayerForPlayerId,
     get_sets_for_event::{self, GetSetsForEvent},
     get_tournament_for_id::{self, GetTournamentForId},
     mark_set_called::MarkSetCalled,
     mark_set_in_progress::MarkSetInProgress,
+    register_for_tournament::RegisterForTournament,
     report_bracket_set::ReportBracketSet,
-    scalars::Timestamp,
+    scalars::{Id as ScalarId, Timestamp},
 };
 use thiserror::Error;
 
@@ -275,6 +278,136 @@ pub fn extract_admin_probe(response: AdminProbe) -> AdminProbeResult {
     }
 }
 
+fn parse_scalar_id(id: &ScalarId) -> Option<StartGgId> {
+    id.inner().parse::<u64>().ok()
+}
+
+/// A tournament event as listed by the admin roster query: the numeric id the
+/// registration mutations take, plus display fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminEvent {
+    pub id: StartGgId,
+    pub slug: String,
+    pub name: Option<String>,
+}
+
+/// The page-1 header of the admin roster query: tournament identity, start
+/// date (unix seconds), and event list (the slug → id vocabulary for
+/// registration).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminTournament {
+    pub id: Option<StartGgId>,
+    pub name: Option<String>,
+    pub start_at: Option<i64>,
+    pub events: Vec<AdminEvent>,
+}
+
+/// One tournament participant through the admin lens. `user_id` is the handle
+/// the registration mutations take; a participant without a user account
+/// (e.g. an admin-created shell) carries `None` and cannot be targeted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminParticipant {
+    pub id: Option<StartGgId>,
+    pub gamer_tag: String,
+    pub prefix: Option<String>,
+    pub checked_in: bool,
+    pub verified: bool,
+    pub user_id: Option<StartGgId>,
+    pub user_slug: Option<String>,
+    pub event_ids: Vec<StartGgId>,
+}
+
+/// Extracts the tournament header from (any page of) an admin roster
+/// response. Errors when the tournament is missing entirely (bad slug).
+pub fn extract_admin_tournament(response: &GetParticipantsForTournament) -> Result<AdminTournament, GgConversionError> {
+    let tournament = admin_tournament_ref(response)?;
+
+    Ok(AdminTournament {
+        id: tournament.id.as_ref().and_then(parse_scalar_id),
+        name: tournament.name.clone(),
+        start_at: tournament.start_at.map(|ts| ts.0),
+        events: admin_events(tournament.events.as_ref()),
+    })
+}
+
+/// Extracts one page of admin participants plus the connection's total page
+/// count. Suitable as the `extract_page` argument to
+/// [`GGProvider::fetch_all_pages`](crate::provider).
+pub fn extract_admin_participants_page(response: &GetParticipantsForTournament) -> Result<Page<AdminParticipant>, GgConversionError> {
+    let participants = admin_tournament_ref(response)?.participants.as_ref();
+
+    let total_pages = participants
+        .and_then(|pc| pc.page_info.as_ref())
+        .and_then(|pi| pi.total_pages)
+        .unwrap_or(1);
+    let items = participants
+        .and_then(|pc| pc.nodes.as_ref())
+        .map(|nodes| nodes.iter().flatten().filter_map(admin_participant).collect())
+        .unwrap_or_default();
+
+    Ok(Page { items, total_pages })
+}
+
+fn admin_tournament_ref(
+    response: &GetParticipantsForTournament,
+) -> Result<&get_participants_for_tournament::Tournament, GgConversionError> {
+    response.tournament.as_ref().required("GetParticipantsForTournament", "tournament")
+}
+
+fn admin_events(events: Option<&Vec<Option<get_participants_for_tournament::Event>>>) -> Vec<AdminEvent> {
+    events
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            Some(AdminEvent {
+                id: e.id.as_ref().and_then(parse_scalar_id)?,
+                slug: e.slug.clone()?,
+                name: e.name.clone(),
+            })
+        })
+        .collect()
+}
+
+fn admin_participant(p: &get_participants_for_tournament::Participant) -> Option<AdminParticipant> {
+    Some(AdminParticipant {
+        id: p.id.as_ref().and_then(parse_scalar_id),
+        gamer_tag: p.gamer_tag.clone()?,
+        prefix: p.prefix.clone().filter(|prefix| !prefix.is_empty()),
+        checked_in: p.checked_in.unwrap_or(false),
+        verified: p.verified.unwrap_or(false),
+        user_id: p.user.as_ref().and_then(|u| u.id.as_ref()).and_then(parse_scalar_id),
+        user_slug: p.user.as_ref().and_then(|u| u.slug.clone()),
+        event_ids: admin_events(p.events.as_ref()).into_iter().map(|e| e.id).collect(),
+    })
+}
+
+/// Unwraps a `generateRegistrationToken` mutation response.
+pub fn extract_registration_token(response: GenerateRegistrationToken) -> Result<String, GgConversionError> {
+    response
+        .generate_registration_token
+        .required("GenerateRegistrationToken", "generateRegistrationToken")
+}
+
+/// The participant returned by `registerForTournament`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredParticipant {
+    pub id: Option<StartGgId>,
+    pub gamer_tag: Option<String>,
+}
+
+/// Unwraps a `registerForTournament` mutation response.
+pub fn extract_register_for_tournament(response: RegisterForTournament) -> Result<RegisteredParticipant, GgConversionError> {
+    let participant = response
+        .register_for_tournament
+        .required("RegisterForTournament", "registerForTournament")?;
+
+    Ok(RegisteredParticipant {
+        id: participant.id.as_ref().and_then(parse_scalar_id),
+        gamer_tag: participant.gamer_tag,
+    })
+}
+
 impl TryFrom<PlayerQueryResult> for HydratedGgPlayer {
     type Error = GgConversionError;
 
@@ -369,16 +502,103 @@ fn slot_score(standing: &get_games_for_set::Standing) -> Option<f64> {
 mod tests {
     use bracket_tools_startgg_schema::{
         enums::ActivityState,
-        get_event_structure as ges, get_games_for_set as gfs, get_player_for_player_id as gp, get_sets_for_event as gse,
-        get_tournament_for_id as gt, mark_set_called as msc, mark_set_in_progress as msip,
+        generate_registration_token as grt, get_event_structure as ges, get_games_for_set as gfs, get_participants_for_tournament as gpt,
+        get_player_for_player_id as gp, get_sets_for_event as gse, get_tournament_for_id as gt, mark_set_called as msc,
+        mark_set_in_progress as msip, register_for_tournament as rft,
         scalars::{Id, Timestamp},
     };
 
     use super::{
-        extract_event_sets_page, extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress,
+        extract_admin_participants_page, extract_admin_tournament, extract_event_sets_page, extract_event_structure,
+        extract_mark_set_called, extract_mark_set_in_progress, extract_register_for_tournament, extract_registration_token,
         extract_tournament_participants_page, tournament_name, GgConversionError, HydratedGgPlayer, HydratedGgSet, Matchup,
         PlayerQueryResult, SetMutationResult, SetQueryResult,
     };
+
+    fn admin_event_node(id: &str) -> gpt::Event {
+        gpt::Event {
+            id: Some(Id::new(id)),
+            slug: Some(format!("tournament/t/event/e{id}")),
+            name: Some(format!("Event {id}")),
+        }
+    }
+
+    fn admin_participant_node(tag: &str, user_id: Option<&str>, event_ids: &[&str]) -> Option<gpt::Participant> {
+        Some(gpt::Participant {
+            id: Some(Id::new("900")),
+            gamer_tag: Some(tag.to_string()),
+            prefix: Some(String::new()),
+            checked_in: Some(false),
+            verified: Some(true),
+            user: user_id.map(|id| gpt::User {
+                id: Some(Id::new(id)),
+                slug: Some(format!("user/{id}")),
+            }),
+            events: Some(event_ids.iter().map(|id| Some(admin_event_node(id))).collect()),
+        })
+    }
+
+    #[test]
+    fn admin_roster_extraction() {
+        let response = gpt::GetParticipantsForTournament {
+            tournament: Some(gpt::Tournament {
+                id: Some(Id::new("926703")),
+                name: Some("FBR 100".to_string()),
+                start_at: Some(Timestamp(1752130800)),
+                events: Some(vec![Some(admin_event_node("11")), Some(admin_event_node("12"))]),
+                participants: Some(gpt::ParticipantConnection {
+                    page_info: Some(gpt::PageInfo { total_pages: Some(2) }),
+                    nodes: Some(vec![
+                        admin_participant_node("Zelda", Some("501"), &["11"]),
+                        admin_participant_node("NoAccount", None, &[]),
+                        None,
+                    ]),
+                }),
+            }),
+        };
+
+        let header = extract_admin_tournament(&response).unwrap();
+        assert_eq!(header.id, Some(926703));
+        assert_eq!(header.start_at, Some(1752130800));
+        assert_eq!(header.events.len(), 2);
+
+        let page = extract_admin_participants_page(&response).unwrap();
+        assert_eq!(page.total_pages, 2);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].user_id, Some(501));
+        assert_eq!(page.items[0].event_ids, vec![11]);
+        assert!(page.items[0].prefix.is_none(), "empty prefix normalizes to None");
+        assert_eq!(page.items[1].user_id, None);
+    }
+
+    #[test]
+    fn admin_roster_missing_tournament_errors() {
+        let response = gpt::GetParticipantsForTournament { tournament: None };
+
+        assert!(matches!(
+            extract_admin_participants_page(&response),
+            Err(GgConversionError::MissingField { field: "tournament", .. })
+        ));
+    }
+
+    #[test]
+    fn registration_mutation_extraction() {
+        let token = extract_registration_token(grt::GenerateRegistrationToken {
+            generate_registration_token: Some("tok-123".to_string()),
+        })
+        .unwrap();
+        assert_eq!(token, "tok-123");
+
+        let registered = extract_register_for_tournament(rft::RegisterForTournament {
+            register_for_tournament: Some(rft::Participant {
+                id: Some(Id::new("900")),
+                gamer_tag: Some("Zelda".to_string()),
+            }),
+        })
+        .unwrap();
+        assert_eq!(registered.id, Some(900));
+        assert_eq!(registered.gamer_tag.as_deref(), Some("Zelda"));
+    }
 
     fn participant(id: &str) -> Option<gt::Participant> {
         Some(gt::Participant {
