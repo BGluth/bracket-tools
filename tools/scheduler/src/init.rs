@@ -180,9 +180,10 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
     let _ = writeln!(out, "tournament_slug = \"{tournament_slug}\"\n");
     let _ = writeln!(
         out,
-        "# Chaotic-event option: calls mark sets started immediately (no\n\
-         # called/waiting phase, no no-show alerts).\n\
-         # call_action = \"in_progress\"\n"
+        "# Calls mark sets started immediately (default; a call means \"both\n\
+         # players are here\"). Uncomment for a summon-first desk: calls wait\n\
+         # for arrival, `p` marks started, no-show alerts armed.\n\
+         # call_action = \"called\"\n"
     );
     let _ = write!(
         out,

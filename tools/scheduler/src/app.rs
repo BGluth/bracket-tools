@@ -2716,6 +2716,9 @@ mod tests {
             brackets: brackets.iter().map(|slug| BracketConfig::new(*slug)).collect(),
             known_called_state_int: Some(6),
             known_in_progress_state_int: Some(2),
+            // These tests exercise the summon-first flow (Called statuses,
+            // no-show timers); the in_progress default has its own test.
+            call_action: CallAction::Called,
             ..SchedulerConfig::default()
         }
     }

@@ -28,10 +28,11 @@ pub const STARTER_TEMPLATE: &str = r#"# scheduler — starter config (auto-creat
 # sessions never mutate start.gg regardless of token permissions.
 advisor_only = true
 
-# What committing a call marks the set as: "called" (default; players are
-# summoned, `p` marks started on arrival) or "in_progress" (chaotic events:
-# the caller seats players directly — one less keypress, no no-show alerts).
-# call_action = "in_progress"
+# What committing a call marks the set as: "in_progress" (default; the
+# caller seats players directly — a call means "both players are here") or
+# "called" (players are summoned, `p` marks started on arrival, no-show
+# alerts armed).
+# call_action = "called"
 
 # How many stations the desk starts with. A single number means one shared
 # pool; stations can be added/retired live in the TUI ('s'), and the counts
@@ -511,9 +512,11 @@ impl BracketConfig {
 #[serde(rename_all = "snake_case")]
 pub enum CallAction {
     /// Players are summoned; `p` marks the set started when they arrive.
-    #[default]
+    /// Arms the no-show timer.
     Called,
-    /// Straight to started (chaotic events: callers seat players directly).
+    /// Straight to started: the caller seats players directly (the desk's
+    /// usual practice — a call means "both players are here").
+    #[default]
     InProgress,
 }
 
@@ -730,6 +733,7 @@ slug = "tournament/t/event/melee"
         assert!(!config.advisor_only);
         assert_eq!(config.known_called_state_int, Some(6), "live vocabulary is the default");
         assert_eq!(config.known_in_progress_state_int, Some(2));
+        assert_eq!(config.call_action, CallAction::InProgress, "calls seat players by default");
     }
 
     #[test]

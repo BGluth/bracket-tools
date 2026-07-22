@@ -1047,7 +1047,7 @@ mod tests {
     use super::draw;
     use crate::{
         app::{update, AppState, BracketBootstrap, Msg},
-        config::{BracketConfig, BracketMode, SchedulerConfig, SetupCounts, DEFAULT_SETUP_TYPE},
+        config::{BracketConfig, BracketMode, CallAction, SchedulerConfig, SetupCounts, DEFAULT_SETUP_TYPE},
         model::BracketId,
         synth::{make_se_bracket, materialize_ids},
     };
@@ -1061,6 +1061,9 @@ mod tests {
         let config = SchedulerConfig {
             setups: Some(SetupCounts::Uniform(2)),
             brackets: vec![BracketConfig::new(slug)],
+            // The render assertions cover the summon-first flow's Called
+            // status strip entry.
+            call_action: CallAction::Called,
             ..SchedulerConfig::default()
         };
         let boots = vec![BracketBootstrap {
