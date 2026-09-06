@@ -1,6 +1,0 @@
-query get_player_for_player_id($p_id: ID!) {
-  player(id: $p_id) {
-    prefix
-    gamerTag
-  }
-}

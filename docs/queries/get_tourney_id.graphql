@@ -1,6 +1,0 @@
-query getEventId($slug: String) {
-  event(slug: $slug) {
-    id
-    name
-  }
-}
