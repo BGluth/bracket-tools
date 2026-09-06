@@ -1,11 +1,11 @@
 use std::{
     fmt::Display,
     sync::{Mutex, MutexGuard},
-    time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
 use sled::{Config, Db};
+use web_time::SystemTime;
 
 use crate::storage::{Storage, StorageError};
 

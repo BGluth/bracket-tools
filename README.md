@@ -20,6 +20,12 @@ Rust mono-repo for esports tournament tooling, primarily targeting [start.gg](ht
 | `reporter-state` | `tools/reporter/reporter-state` | Reporter state management |
 | `bracket-tools-daemon` | `tools/daemon` | Background scraper daemon |
 
+## Development
+
+The SDK and the scheduler core also build for the browser (`wasm32-unknown-unknown`).
+After `rustup target add wasm32-unknown-unknown`, `scripts/wasm-check.sh` verifies that
+they still do; run it alongside `cargo test --workspace` before landing changes to those crates.
+
 ## License
 
 Licensed under either of

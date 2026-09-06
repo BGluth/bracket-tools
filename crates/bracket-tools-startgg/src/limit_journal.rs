@@ -13,14 +13,11 @@
 //! read-modify-write without a file lock — a lost timestamp under-counts the
 //! window slightly, which the capacity margin absorbs.
 
-use std::{
-    fs,
-    path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::PathBuf, time::Duration};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 /// Kept below the configured per-minute rate so clock skew between processes
 /// (and the lockless read-modify-write) can't nudge the count past the
@@ -130,10 +127,9 @@ fn to_millis(t: SystemTime) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        time::{Duration, SystemTime},
-    };
+    use std::{path::PathBuf, time::Duration};
+
+    use web_time::SystemTime;
 
     use super::LimitJournal;
 

@@ -748,7 +748,11 @@ mod tests {
         let pool_depth = graph.group("21").unwrap().remaining_depth;
         let finals_depth = graph.group("23").unwrap().remaining_depth;
         assert!(pool_depth > 0 && finals_depth > 0);
-        assert_eq!(graph.remaining_critical_path(), pool_depth + finals_depth, "pools stage + finals stage");
+        assert_eq!(
+            graph.remaining_critical_path(),
+            pool_depth + finals_depth,
+            "pools stage + finals stage"
+        );
 
         // A pool set's ranking depth sees the finals chain it feeds; finals
         // sets are the last stage and stay local.

@@ -3,6 +3,26 @@ use std::{error::Error, future::Future};
 use bracket_tools_cache::null_storage::NullStorage;
 use bracket_tools_startgg::{AdminProbeResult, CharacterInfo, GGProvider, GGProviderError, GameReport, SetMutationResult, StartGgId};
 use bracket_tools_startgg_schema::{get_event_structure, get_sets_for_event};
+use cfg_if::cfg_if;
+
+cfg_if! {
+    if #[cfg(target_arch = "wasm32")] {
+        /// Unbounded on wasm32, where browser futures are `!Send`; `Send` natively.
+        pub trait MaybeSend {}
+        impl<T> MaybeSend for T {}
+        /// Unbounded on wasm32; `Sync` natively.
+        pub trait MaybeSync {}
+        impl<T> MaybeSync for T {}
+    } else {
+        /// `Send` natively, where generic task spawning must see it through the
+        /// opaque RPITIT; unbounded on wasm32, where browser futures are `!Send`.
+        pub trait MaybeSend: Send {}
+        impl<T: Send> MaybeSend for T {}
+        /// `Sync` natively; unbounded on wasm32 (see [`MaybeSend`]).
+        pub trait MaybeSync: Sync {}
+        impl<T: Sync> MaybeSync for T {}
+    }
+}
 
 /// A source of live bracket data the scheduler polls and writes through.
 ///
@@ -10,33 +30,31 @@ use bracket_tools_startgg_schema::{get_event_structure, get_sets_for_event};
 /// stand in for start.gg in tests and `--simulate` runs.
 ///
 /// Declared in the desugared `impl Future` form (like `Storage`); impls can
-/// use plain `async fn`. The `+ Send` bounds exist for the *generic* task
-/// wiring (`tokio::spawn` inside `run<S: SetSource>`): monomorphic spawns
-/// proved Send without them (the S1 spike), but generic code can't see
-/// through an opaque RPITIT, so the trait states it. Both implementations'
-/// futures are naturally Send.
+/// use plain `async fn`. The [`MaybeSend`] bounds let generic task wiring
+/// (`tokio::spawn` inside `run<S: SetSource>`) see through the opaque RPITIT
+/// natively while the same trait compiles for the browser.
 pub trait SetSource {
-    type Error: Error + Send + Sync + 'static;
+    type Error: Error + MaybeSend + MaybeSync + 'static;
 
     /// Fetches every set in an event, including not-yet-filled future sets.
-    fn fetch_event_sets(&self, event_slug: &str) -> impl Future<Output = Result<Vec<get_sets_for_event::Set>, Self::Error>> + Send;
+    fn fetch_event_sets(&self, event_slug: &str) -> impl Future<Output = Result<Vec<get_sets_for_event::Set>, Self::Error>> + MaybeSend;
 
     /// Fetches an event's structural skeleton (phases, groups, waves, rounds).
-    fn fetch_event_structure(&self, event_slug: &str) -> impl Future<Output = Result<get_event_structure::Event, Self::Error>> + Send;
+    fn fetch_event_structure(&self, event_slug: &str) -> impl Future<Output = Result<get_event_structure::Event, Self::Error>> + MaybeSend;
 
     /// Marks a set as called (players summoned to their station).
-    fn mark_called(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + Send;
+    fn mark_called(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + MaybeSend;
 
     /// Marks a set as in progress.
-    fn mark_in_progress(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + Send;
+    fn mark_in_progress(&self, set_id: StartGgId) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + MaybeSend;
 
     /// Probes whether the token administers the tournament (preflight's
     /// writes-armed decision).
-    fn probe_admin(&self, tournament_id: StartGgId) -> impl Future<Output = Result<AdminProbeResult, Self::Error>> + Send;
+    fn probe_admin(&self, tournament_id: StartGgId) -> impl Future<Output = Result<AdminProbeResult, Self::Error>> + MaybeSend;
 
     /// Fetches an event's videogame character roster (empty when the event
     /// has no character data).
-    fn fetch_event_characters(&self, event_slug: &str) -> impl Future<Output = Result<Vec<CharacterInfo>, Self::Error>> + Send;
+    fn fetch_event_characters(&self, event_slug: &str) -> impl Future<Output = Result<Vec<CharacterInfo>, Self::Error>> + MaybeSend;
 
     /// Reports a set's result: winner, optional per-game data, DQ flag.
     fn report_set(
@@ -45,7 +63,7 @@ pub trait SetSource {
         winner_entrant_id: Option<String>,
         is_dq: bool,
         games: Vec<GameReport>,
-    ) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<SetMutationResult, Self::Error>> + MaybeSend;
 }
 
 /// A [`SetSource`] backed by the live start.gg API through an uncached

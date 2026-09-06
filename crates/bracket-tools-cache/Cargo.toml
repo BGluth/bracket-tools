@@ -7,8 +7,12 @@ license.workspace = true
 [dependencies]
 bincode = { workspace = true }
 serde = { workspace = true }
-sled = { workspace = true }
+sled = { workspace = true, optional = true }
 thiserror = { workspace = true }
+web-time = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+[features]
+default = ["sled"]
+sled = ["dep:sled"]

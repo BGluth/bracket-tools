@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 bracket-tools-core = { path = "../bracket-tools-core" }
-bracket-tools-cache = { path = "../bracket-tools-cache" }
+bracket-tools-cache = { path = "../bracket-tools-cache", default-features = false }
 bracket-tools-startgg-schema = { path = "../bracket-tools-startgg-schema" }
 cynic = { workspace = true, features = ["http-reqwest"] }
 governor = { workspace = true }
@@ -17,3 +17,14 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 parking_lot = { workspace = true }
+web-time = { workspace = true }
+
+[features]
+default = ["sled"]
+sled = ["bracket-tools-cache/sled"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

@@ -247,6 +247,7 @@ dependencies = [
  "sled",
  "thiserror 2.0.18",
  "tokio",
+ "web-time",
 ]
 
 [[package]]
@@ -281,6 +282,7 @@ dependencies = [
  "bracket-tools-cache",
  "bracket-tools-startgg",
  "bracket-tools-startgg-schema",
+ "cfg-if",
  "chrono",
  "clap",
  "crossterm 0.29.0",
@@ -308,6 +310,7 @@ dependencies = [
  "bracket-tools-core",
  "bracket-tools-startgg-schema",
  "cynic",
+ "getrandom 0.2.14",
  "governor",
  "parking_lot",
  "reqwest",
@@ -315,6 +318,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "web-time",
 ]
 
 [[package]]
@@ -1144,8 +1148,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94b22e06ecb0110981051723910cbf0b5f5e09a2062dd7663334ee79a9d1286c"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3533,6 +3539,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77afa9a11836342370f4817622a2f0f418b134426d91a82dfb48f532d2ec13ef"
 dependencies = [
  "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 

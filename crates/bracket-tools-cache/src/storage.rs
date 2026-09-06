@@ -1,6 +1,7 @@
-use std::{future::Future, time::SystemTime};
+use std::future::Future;
 
 use thiserror::Error;
+use web_time::SystemTime;
 
 #[derive(Debug, Error)]
 pub enum StorageError {

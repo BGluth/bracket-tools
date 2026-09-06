@@ -1454,7 +1454,10 @@ pub fn find_set_rows(state: &AppState, query: &str) -> Vec<FindRow> {
             Some(FindRow {
                 setup: s.id,
                 players: shown.join(" vs "),
-                round_text: live.full_round_text.as_deref().map_or_else(|| format!("R{}", set.round), abbreviate_round),
+                round_text: live
+                    .full_round_text
+                    .as_deref()
+                    .map_or_else(|| format!("R{}", set.round), abbreviate_round),
                 bracket: bracket.clone(),
                 status,
             })

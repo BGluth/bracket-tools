@@ -1,10 +1,4 @@
-use std::{
-    future::Future,
-    num::NonZeroU32,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{future::Future, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration};
 
 use bracket_tools_cache::{
     null_storage::NullStorage,
@@ -39,6 +33,7 @@ use reqwest::{
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
+use web_time::SystemTime;
 
 use crate::{
     conversions::{
@@ -777,11 +772,10 @@ impl<S: Storage> GGProviderBuilder<S> {
             HeaderValue::from_str(&self.token.as_bearer_value()).expect("bearer token should be valid ASCII"),
         );
 
-        let client = Client::builder()
-            .default_headers(headers)
-            .connect_timeout(self.connect_timeout)
-            .timeout(self.request_timeout)
-            .build()?;
+        let client = Client::builder().default_headers(headers);
+        #[cfg(not(target_arch = "wasm32"))]
+        let client = client.connect_timeout(self.connect_timeout).timeout(self.request_timeout);
+        let client = client.build()?;
 
         let rpm = NonZeroU32::new(self.requests_per_minute).unwrap_or(NonZeroU32::new(DEFAULT_REQUESTS_PER_MINUTE).unwrap());
         let burst = NonZeroU32::new(self.burst.min(rpm.get())).unwrap_or(NonZeroU32::new(1).unwrap());
@@ -808,13 +802,11 @@ impl<S: Storage> GGProviderBuilder<S> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        str::FromStr,
-        time::{Duration, SystemTime},
-    };
+    use std::{str::FromStr, time::Duration};
 
     use bracket_tools_cache::{null_storage::NullStorage, sled_storage::SledStorage, storage::Storage};
     use serde::Serialize;
+    use web_time::SystemTime;
 
     use super::{
         is_stale, CacheEntity, CacheFreshness, EntityTtls, GGProvider, GGProviderError, DEFAULT_BURST, DEFAULT_CONNECT_TIMEOUT,
