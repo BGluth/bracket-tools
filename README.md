@@ -26,6 +26,9 @@ The SDK and the scheduler core also build for the browser (`wasm32-unknown-unkno
 After `rustup target add wasm32-unknown-unknown`, `scripts/wasm-check.sh` verifies that
 they still do; run it alongside `cargo test --workspace` before landing changes to those crates.
 
+The browser/desktop shell lives in `tools/app` and runs with the Dioxus CLI: `dx serve` there (add
+`--platform desktop` for the native window).
+
 ## License
 
 Licensed under either of

@@ -50,6 +50,8 @@ pub const WORLD_REFRESH_MS: i64 = 10_000;
 pub enum Msg {
     /// A terminal key, resolved through the keymap.
     Key(Key),
+    /// A shell's intent, applied like a key's.
+    Action(UiAction),
     Poll(PollResult),
     Write(WriteResult),
     /// A background rollout evaluation landed.
@@ -965,7 +967,7 @@ impl AppState {
         self.brackets.iter().position(|b| &b.state.id == id)
     }
 
-    fn find_set(&self, bracket: &BracketId, key: &SetKey) -> Option<&LiveSet> {
+    pub fn find_set(&self, bracket: &BracketId, key: &SetKey) -> Option<&LiveSet> {
         let ix = self.bracket_ix(bracket)?;
         self.brackets[ix].state.sets.iter().find(|s| &s.key == key)
     }
@@ -986,10 +988,11 @@ pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateE
                 KeyOutcome::Reject(text) => state.notice(now_millis, NoticeLevel::Warn, text),
                 KeyOutcome::Ignore => {}
             }
-            state.overlay_dirty = true;
-            if state.dirty {
-                effects.want_sim(SimUrgency::Routine);
-            }
+            after_input(state, &mut effects);
+        }
+        Msg::Action(action) => {
+            apply_action(state, action, now_millis, &mut effects);
+            after_input(state, &mut effects);
         }
         Msg::Poll(poll) => {
             handle_poll(state, poll, now_millis, &mut effects);
@@ -1030,6 +1033,15 @@ pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateE
         state.last_recompute = now_millis;
     }
     effects
+}
+
+/// Any input may have touched the persisted overlay; scheduling changes ask
+/// for a routine rollout, pure navigation does not.
+fn after_input(state: &mut AppState, effects: &mut UpdateEffects) {
+    state.overlay_dirty = true;
+    if state.dirty {
+        effects.want_sim(SimUrgency::Routine);
+    }
 }
 
 /// The one-refresh-per-modal-session policy: an open picker takes at most one
@@ -1124,6 +1136,21 @@ fn apply_action(state: &mut AppState, action: UiAction, now: UnixMillis, effects
         UiAction::Report(action) => {
             if let Some(draft) = take_report_draft(state) {
                 report_action(state, draft, action, now, effects);
+            }
+        }
+        UiAction::CallSet { setup, bracket, key } => call_set(state, setup, &bracket, &key, now, effects),
+        UiAction::QuickCallSet { bracket, key } => match queue_entry(state, &bracket, &key) {
+            Some(entry) => quick_call_entry(state, entry, now, effects),
+            None => left_the_queue(state, now),
+        },
+        UiAction::SnoozeSet { bracket, key } => match queue_entry(state, &bracket, &key) {
+            Some(entry) => snooze_entry(state, entry, now),
+            None => left_the_queue(state, now),
+        },
+        UiAction::OpenFlagsFor { bracket, key } => open_flags_for(state, &bracket, &key),
+        UiAction::AckNoticeAt(at) => {
+            if let Some(notice) = state.notices.iter_mut().rev().find(|n| n.at == at) {
+                notice.acked = true;
             }
         }
     }
@@ -1275,6 +1302,33 @@ fn commit_call(state: &mut AppState, setup: SetupId, selected: usize, now: UnixM
     commit_entry(state, setup, entry, now, effects);
 }
 
+/// The picker's identity-keyed call: the set must still be offered for the
+/// setup, so a ranking that moved underneath a shell can't call the wrong one.
+fn call_set(state: &mut AppState, setup: SetupId, bracket: &BracketId, key: &SetKey, now: UnixMillis, effects: &mut UpdateEffects) {
+    let (rows, _) = picker_rows(state, setup);
+    let entry = rows.into_iter().find_map(|row| match row {
+        RolloutRow::Call(entry) if entry.bracket == *bracket && entry.key == *key => Some(*entry),
+        _ => None,
+    });
+    close_modal(state);
+    match entry {
+        Some(entry) => commit_entry(state, setup, entry, now, effects),
+        None => state.notice(
+            now,
+            NoticeLevel::Warn,
+            format!("that set is no longer offered for setup {}", setup.0),
+        ),
+    }
+}
+
+fn queue_entry(state: &AppState, bracket: &BracketId, key: &SetKey) -> Option<QueueEntry> {
+    state.world.queue.iter().find(|e| e.bracket == *bracket && e.key == *key).cloned()
+}
+
+fn left_the_queue(state: &mut AppState, now: UnixMillis) {
+    state.notice(now, NoticeLevel::Warn, "that set is no longer in the queue");
+}
+
 /// Calls a queue entry on its lowest-numbered free candidate setup — the TO
 /// often doesn't care which station.
 fn quick_call(state: &mut AppState, queue_ix: usize, now: UnixMillis, effects: &mut UpdateEffects) {
@@ -1282,6 +1336,10 @@ fn quick_call(state: &mut AppState, queue_ix: usize, now: UnixMillis, effects: &
         state.notice(now, NoticeLevel::Warn, "nothing in the queue to call");
         return;
     };
+    quick_call_entry(state, entry, now, effects);
+}
+
+fn quick_call_entry(state: &mut AppState, entry: QueueEntry, now: UnixMillis, effects: &mut UpdateEffects) {
     let Some(setup) = entry.candidate_setups.first().copied() else {
         state.notice(now, NoticeLevel::Warn, format!("no free setup can take {}", entry.players));
         return;
@@ -1473,6 +1531,10 @@ fn snooze(state: &mut AppState, queue_ix: usize, now: UnixMillis) {
     let Some(entry) = state.world.queue.get(queue_ix).cloned() else {
         return;
     };
+    snooze_entry(state, entry, now);
+}
+
+fn snooze_entry(state: &mut AppState, entry: QueueEntry, now: UnixMillis) {
     push_undo(state, format!("snooze {}", entry.players));
     state
         .snoozes
@@ -1621,11 +1683,15 @@ fn discard_pending(state: &mut AppState, selected: usize, now: UnixMillis) {
 
 /// Tri-state flags for a queue entry's players.
 fn open_flags(state: &mut AppState, queue_ix: usize, now: UnixMillis) {
-    let Some(entry) = state.world.queue.get(queue_ix) else {
+    let Some((bracket, key)) = state.world.queue.get(queue_ix).map(|e| (e.bracket.clone(), e.key.clone())) else {
         state.notice(now, NoticeLevel::Warn, "highlight a queue entry first (Up/Down), then d");
         return;
     };
-    let Some(set) = state.find_set(&entry.bracket, &entry.key) else {
+    open_flags_for(state, &bracket, &key);
+}
+
+fn open_flags_for(state: &mut AppState, bracket: &BracketId, key: &SetKey) {
+    let Some(set) = state.find_set(bracket, key) else {
         return;
     };
     let players: Vec<(ConflictKey, String)> = set
@@ -2591,6 +2657,7 @@ mod tests {
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
         set_source::SetSource,
         synth::{complete, make_de_bracket_with, make_se_bracket, materialize_ids, SynthBracket, SynthPlayer},
+        ui_action::UiAction,
     };
 
     const NOW: i64 = 1_751_000_000_000;
@@ -2640,6 +2707,32 @@ mod tests {
         let config = test_config(&[1, 2], &["ultimate"]);
         let boots = bootstrap(vec![("ultimate", &se4())]);
         AppState::new(config, writes_armed, boots, NOW)
+    }
+
+    #[test]
+    fn identity_keyed_intents_call_and_refuse_by_set() {
+        let mut state = se4_app(true);
+        let entry = state.world.queue[0].clone();
+        let intent = UiAction::QuickCallSet {
+            bracket: entry.bracket.clone(),
+            key: entry.key.clone(),
+        };
+        update(&mut state, Msg::Action(intent.clone()), NOW);
+        assert!(state
+            .board
+            .setups()
+            .iter()
+            .any(|s| matches!(&s.status, SetupStatus::Called { set, .. } if *set == entry.key)));
+        // On a station now, so the same intent is refused instead of double-called.
+        update(&mut state, Msg::Action(intent), NOW);
+        assert!(state.notices.iter().any(|n| n.text.contains("no longer in the queue")));
+        let stale = UiAction::CallSet {
+            setup: SetupId(2),
+            bracket: entry.bracket,
+            key: entry.key,
+        };
+        update(&mut state, Msg::Action(stale), NOW);
+        assert!(state.notices.iter().any(|n| n.text.contains("no longer offered for setup 2")));
     }
 
     #[test]

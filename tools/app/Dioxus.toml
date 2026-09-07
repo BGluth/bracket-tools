@@ -1,0 +1,11 @@
+[application]
+
+[web.app]
+title = "bracket-tools"
+
+[web.resource]
+style = []
+script = []
+
+[web.resource.dev]
+script = []

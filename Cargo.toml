@@ -11,6 +11,7 @@ members = [
     "tools/daemon",
     "tools/scheduler/core",
     "tools/scheduler/tui",
+    "tools/app",
 ]
 resolver = "2"
 
@@ -52,6 +53,8 @@ web-time = { version = "1.1", features = ["serde"] }
 cfg-if = "1"
 # Browser-side sleep for the scheduler's timer shim.
 gloo-timers = { version = "0.4", features = ["futures"] }
+# The browser + desktop shell (tools/app).
+dioxus = "0.7"
 
 [profile.release]
 opt-level = 3

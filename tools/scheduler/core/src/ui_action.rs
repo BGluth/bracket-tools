@@ -1,7 +1,11 @@
 //! Semantic UI intents: what the desk wants done, independent of how it was
 //! asked. The keymap produces them from keys; `app::update` applies them.
 
-use crate::config::SetupId;
+use crate::{
+    config::SetupId,
+    conflict::UnixMillis,
+    model::{BracketId, SetKey},
+};
 
 /// Cursor movement over whichever list has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,8 +39,9 @@ impl Side {
     }
 }
 
-/// One intent with its explicit target. Indices address the rows the
-/// corresponding view lists (queue order, notices newest-first, ...).
+/// One intent with its explicit target. Index-addressed variants are for
+/// the keymap, where the row was resolved in the same turn; a shell round-trip
+/// uses the identity-keyed ones, which survive a re-ranked queue or picker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
     Quit,
@@ -91,6 +96,27 @@ pub enum UiAction {
         target: u32,
     },
     Report(ReportAction),
+    /// Call one of the picker's sets onto `setup`.
+    CallSet {
+        setup: SetupId,
+        bracket: BracketId,
+        key: SetKey,
+    },
+    /// Call a queued set onto its first free candidate setup.
+    QuickCallSet {
+        bracket: BracketId,
+        key: SetKey,
+    },
+    SnoozeSet {
+        bracket: BracketId,
+        key: SetKey,
+    },
+    OpenFlagsFor {
+        bracket: BracketId,
+        key: SetKey,
+    },
+    /// Ack the notice posted at this instant.
+    AckNoticeAt(UnixMillis),
 }
 
 /// Intents inside the report modal.

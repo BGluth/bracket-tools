@@ -13,6 +13,7 @@ Rust mono-repo for esports tournament tooling targeting the start.gg platform, b
 | bracket-tools-startgg | crates/bracket-tools-startgg | Main SDK: caching, rate-limited start.gg client |
 | bracket-tools-scheduler-core | tools/scheduler/core | Scheduler core: bracket model, scheduling, Elm loop, poll/write loops (also builds for wasm32) |
 | bracket-tools-scheduler | tools/scheduler/tui | `scheduler` TUI for the TO desk over the core (runs live at events) |
+| bracket-tools-app | tools/app | Dioxus browser + desktop shell over the scheduler core (`dx serve` in that dir; demo world, no token yet) |
 | bracket-tools-admin | tools/admin | `gg-admin` CLI: registration admin (roster / add / find / pool) |
 | reporter-cli, reporter-state | tools/reporter/* | ratatui set-reporting TUI + its store layer (early) |
 | bracket-tools-daemon | tools/daemon | Background scraper daemon (skeleton) |
