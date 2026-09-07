@@ -562,6 +562,7 @@ name = "bracket-tools-scheduler-web"
 version = "0.1.0"
 dependencies = [
  "bracket-tools-scheduler-core",
+ "bracket-tools-startgg",
  "dioxus",
  "tokio",
 ]

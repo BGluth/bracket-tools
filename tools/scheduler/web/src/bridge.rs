@@ -5,11 +5,11 @@
 use std::{collections::HashSet, rc::Rc, time::Duration};
 
 use bracket_tools_scheduler_core::{
-    app::{update, AppState, BracketBootstrap, Msg},
+    app::{update, AppState, BracketBootstrap, Msg, PollFailure},
     config::SchedulerConfig,
-    fixture_source::{classify_fixture_error, FixtureSource},
     model::BracketId,
     poller::{run_poller, PollerConfig},
+    set_source::SetSource,
     timers::{now_millis, sleep},
     ui_action::UiAction,
     writer::{run_writer, WriterConfig},
@@ -33,33 +33,37 @@ impl Session {
 
 /// Starts the background tasks over `source` and hands back the session.
 /// Must run inside a component or one of its tasks.
-pub fn start(source: Rc<FixtureSource>, config: SchedulerConfig, bootstraps: Vec<BracketBootstrap>) -> Session {
+pub fn start<S, F>(source: Rc<S>, config: SchedulerConfig, writes_armed: bool, bootstraps: Vec<BracketBootstrap>, classify: F) -> Session
+where
+    S: SetSource + 'static,
+    F: Fn(&S::Error) -> PollFailure + Clone + 'static,
+{
     let needs_structure: HashSet<BracketId> = bootstraps.iter().filter(|b| b.groups.is_empty()).map(|b| b.id.clone()).collect();
     let events: Vec<BracketId> = bootstraps.iter().map(|b| b.id.clone()).collect();
-    let mut state = Signal::new(AppState::new(config.clone(), true, bootstraps, now_millis()));
+    let mut state = Signal::new(AppState::new(config.clone(), writes_armed, bootstraps, now_millis()));
     let (tx, mut rx) = unbounded_channel::<Msg>();
     let (force_tx, force_rx) = unbounded_channel::<BracketId>();
     let (write_tx, write_rx) = unbounded_channel();
 
     let poller_config = PollerConfig::from_scheduler(&config);
     let poll_source = source.clone();
+    let poll_classify = classify.clone();
     let poll_tx = tx.clone();
     spawn(async move {
         run_poller(
             &*poll_source,
             events,
             poller_config,
-            classify_fixture_error,
+            poll_classify,
             poll_tx,
             force_rx,
             needs_structure,
         )
         .await;
     });
-    let write_source = source.clone();
     let writer_tx = tx.clone();
     spawn(async move {
-        run_writer(&*write_source, WriterConfig::default(), classify_fixture_error, writer_tx, write_rx).await;
+        run_writer(&*source, WriterConfig::default(), classify, writer_tx, write_rx).await;
     });
     let tick_tx = tx.clone();
     spawn(async move {

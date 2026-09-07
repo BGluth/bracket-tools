@@ -51,5 +51,12 @@ async fn boot_demo() -> Result<Session, String> {
         rate_limit_waits: 0,
     };
     let report = preflight(&source, &config, PREFLIGHT_TIMEOUT, true, classify_fixture_error, &env).await;
-    Ok(start(Rc::new(source), config, report.into_bootstraps()))
+    let writes_armed = report.writes_armed;
+    Ok(start(
+        Rc::new(source),
+        config,
+        writes_armed,
+        report.into_bootstraps(),
+        classify_fixture_error,
+    ))
 }

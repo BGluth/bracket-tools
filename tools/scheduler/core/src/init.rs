@@ -13,6 +13,8 @@ use bracket_tools_startgg::EventInfo;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::config::{BracketConfig, OneOrMany, SchedulerConfig};
+
 /// The operator's global game mapping, in the XDG config dir next to
 /// `scheduler.toml`.
 pub const GAME_SETUPS_FILE: &str = "game-setups.toml";
@@ -215,12 +217,12 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
                     MatchSource::UserFile => "",
                     MatchSource::Builtin => " # built-in standard (no game-setups.toml entry)",
                 };
-                match entry.setup_types.as_slice() {
-                    [] => {}
-                    [only] => {
+                match seeded_setup_type(entry) {
+                    None => {}
+                    Some(OneOrMany::One(only)) => {
                         let _ = writeln!(out, "setup_type = \"{only}\"{provenance}");
                     }
-                    many => {
+                    Some(OneOrMany::Many(many)) => {
                         let list = many.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
                         let _ = writeln!(out, "setup_type = [{list}]{provenance}");
                     }
@@ -251,13 +253,46 @@ pub fn generate_config(tournament_slug: &str, events: &[EventInfo], setups: &Gam
     out
 }
 
+/// The `setup_type` an entry seeds; `None` is the shared default pool.
+fn seeded_setup_type(entry: &GameEntry) -> Option<OneOrMany> {
+    match entry.setup_types.as_slice() {
+        [] => None,
+        [only] => Some(OneOrMany::One(only.clone())),
+        many => Some(OneOrMany::Many(many.to_vec())),
+    }
+}
+
+/// One event's bracket as [`generate_config`] would render it, as a value.
+pub fn bracket_config(event: &EventInfo, setups: &GameSetups) -> BracketConfig {
+    let mut bracket = BracketConfig::new(event.slug.clone());
+    bracket.videogame = event.videogame.clone();
+    if let Some((entry, _)) = event.videogame.as_deref().and_then(|game| setups.match_game_or_builtin(game)) {
+        bracket.setup_type = seeded_setup_type(entry);
+        if let Some(prior) = entry.prior_secs() {
+            bracket.duration_prior_secs = prior;
+        }
+    }
+    bracket
+}
+
+/// The generated config as a value for shells without a config file: the
+/// identity pin plus one bracket per event. No state paths, no station
+/// counts (the caller sets `setups`).
+pub fn build_config(tournament_slug: &str, events: &[EventInfo], setups: &GameSetups) -> SchedulerConfig {
+    SchedulerConfig {
+        tournament_slug: Some(tournament_slug.to_owned()),
+        brackets: events.iter().map(|event| bracket_config(event, setups)).collect(),
+        ..SchedulerConfig::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
     use bracket_tools_startgg::EventInfo;
 
-    use super::{game_setups_template, generate_config, parse_tournament_slug, GameSetups, InitError, MatchSource};
+    use super::{build_config, game_setups_template, generate_config, parse_tournament_slug, GameSetups, InitError, MatchSource};
     use crate::config::{OneOrMany, SchedulerConfig};
 
     fn event(slug: &str, name: &str, game: Option<&str>) -> EventInfo {
@@ -341,9 +376,9 @@ mod tests {
         assert_eq!(source, MatchSource::UserFile);
     }
 
-    #[test]
-    fn generated_config_parses_validates_and_carries_the_mapping() {
-        let events = vec![
+    /// Two mapped games, one built-in standard, one unmatched game.
+    fn fbr_events() -> Vec<EventInfo> {
+        vec![
             event(
                 "tournament/fbr/event/melee-singles",
                 "Melee Singles",
@@ -356,7 +391,12 @@ mod tests {
             ),
             event("tournament/fbr/event/rivals", "Rivals", Some("Rivals of Aether II")),
             event("tournament/fbr/event/tetris", "Tetris", Some("Tetris Effect")),
-        ];
+        ]
+    }
+
+    #[test]
+    fn generated_config_parses_validates_and_carries_the_mapping() {
+        let events = fbr_events();
         let text = generate_config("tournament/fbr", &events, &mapping(), &PathBuf::from("/tmp/data"));
 
         let config: SchedulerConfig = toml::from_str(&text).expect("generated config parses");
@@ -378,6 +418,28 @@ mod tests {
         assert_eq!(config.brackets[3].setup_type, None, "unmatched game keeps the default pool");
         assert_eq!(config.known_called_state_int, Some(6));
         assert!(config.state_file.as_deref().is_some_and(|p| p.ends_with("fbr-state.json")));
+    }
+
+    #[test]
+    fn built_config_matches_the_generated_file() {
+        let events = fbr_events();
+        let text = generate_config("tournament/fbr", &events, &mapping(), &PathBuf::from("/tmp/data"));
+        let parsed: SchedulerConfig = toml::from_str(&text).unwrap();
+        let built = build_config("tournament/fbr", &events, &mapping());
+        built.validate().expect("built config validates");
+
+        assert_eq!(built.tournament_slug, parsed.tournament_slug);
+        assert_eq!(built.brackets.len(), parsed.brackets.len());
+        for (built, parsed) in built.brackets.iter().zip(&parsed.brackets) {
+            assert_eq!(built.slug, parsed.slug);
+            assert_eq!(built.videogame, parsed.videogame);
+            assert_eq!(built.setup_type, parsed.setup_type);
+            assert_eq!(built.duration_prior_secs, parsed.duration_prior_secs);
+        }
+        assert!(
+            built.state_file.is_none() && built.setups.is_none(),
+            "no paths or counts without a file"
+        );
     }
 
     #[test]

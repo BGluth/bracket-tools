@@ -1,21 +1,349 @@
-//! The live desk over a start.gg token. The live flow (tournament pick,
-//! preflight, board) is not built yet; this renders the token gate.
+//! The live desk over a start.gg token: look a tournament up, pick its
+//! events and stations, preflight, then run the same desk the demo runs.
 
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    mem,
+    rc::Rc,
+    str::FromStr,
+    time::Duration,
+};
+
+use bracket_tools_scheduler_core::{
+    config::{referenced_types, SchedulerConfig, SetupCounts, FALLBACK_SETUPS_PER_TYPE},
+    init::{bracket_config, build_config, parse_tournament_slug, GameSetups, InitError},
+    poller::classify_provider_error,
+    preflight::{preflight, PreflightEnv, PreflightReport},
+    set_source::StartggSource,
+    timers::timeout,
+};
+use bracket_tools_startgg::{types::GGRestToken, EventInfo, GGProvider};
 use dioxus::prelude::*;
 
-use crate::DESK_CSS;
+use crate::{
+    bridge::{start, Session},
+    views::Desk,
+    DESK_CSS,
+};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Where the operator is between "no tournament yet" and a running desk.
+enum Stage {
+    Lookup,
+    LookingUp,
+    Picking(Tournament),
+    Checking,
+    Checked(Box<Prepared>),
+    Running { session: Session, label: String },
+    Failed(String),
+}
+
+/// A tournament the token could list, with the source that will poll it.
+struct Tournament {
+    /// The pinned `tournament/<slug>` form.
+    slug: String,
+    source: Rc<StartggSource>,
+    events: Vec<EventInfo>,
+}
+
+/// Preflight's output, waiting for the operator to open the desk.
+struct Prepared {
+    tournament: Tournament,
+    config: SchedulerConfig,
+    report: PreflightReport,
+}
 
 /// The scheduler run live against start.gg. `token` is the site's start.gg
 /// token; `None` asks for one.
 #[component]
 pub fn SchedulerTool(token: ReadSignal<Option<String>>) -> Element {
-    let text = if token.read().is_some() {
-        "Live mode is not built yet. The demo runs without a token."
-    } else {
-        "The live desk needs a start.gg token. Add one in Settings."
+    let mut stage = use_signal(|| Stage::Lookup);
+    let tournament_input = use_signal(String::new);
+    let mut selected = use_signal(BTreeSet::<String>::new);
+    let mut counts = use_signal(BTreeMap::<String, String>::new);
+    let arm_writes = use_signal(|| false);
+    let mut notice = use_signal(|| None::<String>);
+
+    let Some(raw_token) = token.read().clone() else {
+        return rsx! {
+            document::Link { rel: "stylesheet", href: DESK_CSS }
+            div { class: "empty", "The live desk needs a start.gg token. Add one in Settings." }
+        };
+    };
+
+    let on_look_up = move |_: MouseEvent| {
+        let raw_token = raw_token.clone();
+        let input = tournament_input();
+        stage.set(Stage::LookingUp);
+        spawn(async move {
+            match look_up(raw_token, input).await {
+                Ok(tournament) => {
+                    selected.set(tournament.events.iter().map(|event| event.slug.clone()).collect());
+                    counts.set(BTreeMap::new());
+                    notice.set(None);
+                    stage.set(Stage::Picking(tournament));
+                }
+                Err(error) => stage.set(Stage::Failed(error)),
+            }
+        });
+    };
+    let on_check = move |_: MouseEvent| {
+        let previous = mem::replace(&mut *stage.write(), Stage::Checking);
+        let Stage::Picking(tournament) = previous else {
+            stage.set(previous);
+            return;
+        };
+        match live_config(&tournament, &selected.read(), &counts.read()) {
+            Ok(config) => {
+                notice.set(None);
+                let arm = arm_writes();
+                spawn(async move {
+                    let env = PreflightEnv::silent();
+                    let report = preflight(&*tournament.source, &config, REQUEST_TIMEOUT, arm, classify_provider_error, &env).await;
+                    stage.set(Stage::Checked(Box::new(Prepared {
+                        tournament,
+                        config,
+                        report,
+                    })));
+                });
+            }
+            Err(error) => {
+                notice.set(Some(error));
+                stage.set(Stage::Picking(tournament));
+            }
+        }
+    };
+    let on_open = move |_: MouseEvent| {
+        let previous = mem::replace(&mut *stage.write(), Stage::Checking);
+        let Stage::Checked(prepared) = previous else {
+            stage.set(previous);
+            return;
+        };
+        let Prepared {
+            tournament,
+            mut config,
+            report,
+        } = *prepared;
+        if report.escalate_soft_busy {
+            config.escalate_unpinned_state_deviation = true;
+        }
+        let writes_armed = report.writes_armed;
+        let label = bare_slug(&tournament.slug).to_owned();
+        let session = start(
+            tournament.source,
+            config,
+            writes_armed,
+            report.into_bootstraps(),
+            classify_provider_error,
+        );
+        stage.set(Stage::Running { session, label });
+    };
+    let on_back_to_picker = move |_: MouseEvent| {
+        let previous = mem::replace(&mut *stage.write(), Stage::Lookup);
+        match previous {
+            Stage::Checked(prepared) => stage.set(Stage::Picking(prepared.tournament)),
+            other => stage.set(other),
+        }
+    };
+    let on_back_to_lookup = move |_: MouseEvent| stage.set(Stage::Lookup);
+
+    let view = match &*stage.read() {
+        Stage::Lookup => lookup_view(tournament_input, on_look_up),
+        Stage::LookingUp => status_view(format!("looking up {}…", tournament_input.read().trim())),
+        Stage::Picking(tournament) => picker_view(tournament, selected, counts, arm_writes, notice, on_check, on_back_to_lookup),
+        Stage::Checking => status_view("preflighting the chosen events…".to_owned()),
+        Stage::Checked(prepared) => report_view(prepared, on_open, on_back_to_picker),
+        Stage::Running { session, label } => rsx! { Desk { session: session.clone(), mode: label.clone() } },
+        Stage::Failed(error) => failed_view(error, on_back_to_lookup),
     };
     rsx! {
         document::Link { rel: "stylesheet", href: DESK_CSS }
-        div { class: "empty", {text} }
+        {view}
+    }
+}
+
+async fn look_up(raw_token: String, input: String) -> Result<Tournament, String> {
+    let token = GGRestToken::from_str(raw_token.trim()).map_err(|e| e.to_string())?;
+    let slug = parse_tournament_slug(&input).map_err(|e| e.to_string())?;
+    let provider = GGProvider::builder(token).build().map_err(|e| e.to_string())?;
+    let events = timeout(REQUEST_TIMEOUT, provider.fetch_tournament_events(&slug))
+        .await
+        .map_err(|_| format!("start.gg did not answer within {}s", REQUEST_TIMEOUT.as_secs()))?
+        .map_err(|e| e.to_string())?;
+    if events.is_empty() {
+        return Err(InitError::NoEvents { slug }.to_string());
+    }
+    Ok(Tournament {
+        slug,
+        source: Rc::new(StartggSource::new(provider)),
+        events,
+    })
+}
+
+/// The in-memory config for the chosen events: the seeded brackets plus the
+/// operator's station counts (blank = the fallback count).
+fn live_config(tournament: &Tournament, selected: &BTreeSet<String>, counts: &BTreeMap<String, String>) -> Result<SchedulerConfig, String> {
+    let chosen = chosen_events(tournament, selected);
+    let mut config = build_config(&tournament.slug, &chosen, &GameSetups::default());
+    let mut table = BTreeMap::new();
+    for setup_type in referenced_types(&config) {
+        let count = match counts.get(&setup_type).map(|raw| raw.trim()).filter(|raw| !raw.is_empty()) {
+            None => FALLBACK_SETUPS_PER_TYPE,
+            Some(raw) => raw.parse().map_err(|_| format!("{setup_type}: {raw:?} is not a station count"))?,
+        };
+        table.insert(setup_type, count);
+    }
+    config.setups = Some(SetupCounts::ByType(table));
+    config.validate().map_err(|e| e.to_string())?;
+    Ok(config)
+}
+
+fn chosen_events(tournament: &Tournament, selected: &BTreeSet<String>) -> Vec<EventInfo> {
+    tournament
+        .events
+        .iter()
+        .filter(|event| selected.contains(&event.slug))
+        .cloned()
+        .collect()
+}
+
+fn bare_slug(slug: &str) -> &str {
+    slug.strip_prefix("tournament/").unwrap_or(slug)
+}
+
+fn seeded_types_text(event: &EventInfo) -> String {
+    bracket_config(event, &GameSetups::default()).setup_types().join(" ")
+}
+
+fn lookup_view(mut input: Signal<String>, on_look_up: impl FnMut(MouseEvent) + 'static) -> Element {
+    let empty = input.read().trim().is_empty();
+    rsx! {
+        section { class: "live",
+            h2 { "Live desk" }
+            div { class: "controls",
+                input {
+                    r#type: "text",
+                    placeholder: "start.gg tournament URL or slug",
+                    value: "{input}",
+                    oninput: move |event| input.set(event.value()),
+                }
+                button { disabled: empty, onclick: on_look_up, "look up" }
+            }
+            p { class: "dim", "The token stays in this browser; start.gg is called directly from it." }
+        }
+    }
+}
+
+fn picker_view(
+    tournament: &Tournament,
+    mut selected: Signal<BTreeSet<String>>,
+    mut counts: Signal<BTreeMap<String, String>>,
+    mut arm_writes: Signal<bool>,
+    notice: Signal<Option<String>>,
+    on_check: impl FnMut(MouseEvent) + 'static,
+    on_back: impl FnMut(MouseEvent) + 'static,
+) -> Element {
+    let chosen = chosen_events(tournament, &selected.read());
+    let types = referenced_types(&build_config(&tournament.slug, &chosen, &GameSetups::default()));
+    let name = bare_slug(&tournament.slug);
+    let total = tournament.events.len();
+    let rows = tournament.events.iter().map(|event| {
+        let slug = event.slug.clone();
+        let on = selected.read().contains(&slug);
+        rsx! {
+            label { class: "event",
+                input {
+                    r#type: "checkbox",
+                    checked: on,
+                    onchange: move |event| {
+                        let on = event.checked();
+                        selected.with_mut(|chosen| {
+                            if on {
+                                chosen.insert(slug.clone());
+                            } else {
+                                chosen.remove(&slug);
+                            }
+                        });
+                    },
+                }
+                span { class: "name", {event.name.clone().unwrap_or_else(|| event.slug.clone())} }
+                span { class: "game", {event.videogame.clone().unwrap_or_default()} }
+                span { class: "types", {seeded_types_text(event)} }
+            }
+        }
+    });
+    let count_fields = types.iter().map(|setup_type| {
+        let key = setup_type.clone();
+        let value = counts
+            .read()
+            .get(setup_type)
+            .cloned()
+            .unwrap_or_else(|| FALLBACK_SETUPS_PER_TYPE.to_string());
+        rsx! {
+            label {
+                {setup_type.clone()}
+                input {
+                    r#type: "text",
+                    value,
+                    oninput: move |event| {
+                        counts.with_mut(|table| {
+                            table.insert(key.clone(), event.value());
+                        });
+                    },
+                }
+            }
+        }
+    });
+    rsx! {
+        section { class: "live",
+            h2 { "{name}: {total} events" }
+            div { class: "events", {rows} }
+            h2 { "Stations per setup type" }
+            div { class: "counts", {count_fields} }
+            label { class: "controls",
+                input { r#type: "checkbox", checked: arm_writes(), onchange: move |event| arm_writes.set(event.checked()) }
+                "arm writes: calls and reports reach start.gg (needs an admin token; preflight decides)"
+            }
+            if let Some(text) = notice.read().as_ref() {
+                p { class: "failed", {text.clone()} }
+            }
+            div { class: "controls",
+                button { disabled: chosen.is_empty(), onclick: on_check, "preflight" }
+                button { class: "quiet", onclick: on_back, "back" }
+            }
+        }
+    }
+}
+
+fn report_view(prepared: &Prepared, on_open: impl FnMut(MouseEvent) + 'static, on_back: impl FnMut(MouseEvent) + 'static) -> Element {
+    let blocked = prepared.report.fatal.is_some();
+    rsx! {
+        section { class: "live",
+            h2 { "Preflight" }
+            pre { class: "report", {prepared.report.render()} }
+            div { class: "controls",
+                button { disabled: blocked, onclick: on_open, "open desk" }
+                button { class: "quiet", onclick: on_back, "back" }
+                if blocked {
+                    span { class: "dim", "preflight failed; adjust the picks and try again" }
+                }
+            }
+        }
+    }
+}
+
+fn status_view(text: String) -> Element {
+    rsx! { div { class: "loading", {text} } }
+}
+
+fn failed_view(error: &str, on_back: impl FnMut(MouseEvent) + 'static) -> Element {
+    rsx! {
+        section { class: "live",
+            div { class: "failed", {error.to_owned()} }
+            div { class: "controls",
+                button { class: "quiet", onclick: on_back, "back" }
+            }
+        }
     }
 }

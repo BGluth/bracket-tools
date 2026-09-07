@@ -16,10 +16,14 @@ use crate::bridge::Session;
 
 #[component]
 pub fn Desk(session: Session, mode: String) -> Element {
+    let writes_armed = session.state.read().writes_armed;
     rsx! {
         main { class: "desk",
             div { class: "toolbar",
                 span { class: "mode", {mode} }
+                span { class: if writes_armed { "writes armed" } else { "writes" },
+                    if writes_armed { "writes armed" } else { "advisor-only" }
+                }
                 button { class: "quiet", onclick: dispatcher(&session, UiAction::Undo), "undo" }
             }
             Stations { session: session.clone() }
