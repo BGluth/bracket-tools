@@ -2,13 +2,13 @@
 //! warnings/skips, never panics, all the way through convert → graph →
 //! conflict → recompute → render.
 
-use bracket_tools_scheduler::{
+use bracket_tools_scheduler::ui;
+use bracket_tools_scheduler_core::{
     app::{update, AppState, BracketBootstrap, Msg, PollOutcome, PollResult},
     config::{BracketConfig, BracketMode, SchedulerConfig, SetupCounts},
     keymap::Key,
     model::{live_sets_from_schema, BracketId, LiveSet, Prereq, SetId, Slot},
     synth::{make_de_bracket, SynthBracket},
-    ui,
 };
 use bracket_tools_startgg_schema::{
     get_sets_for_event::{Entrant, Participant, PhaseGroup, Player, Set, SetSlot},

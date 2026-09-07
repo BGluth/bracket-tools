@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bracket_tools_scheduler::{
+use bracket_tools_scheduler_core::{
     config::{BracketMode, SetupId},
     conflict::{callable_sets, AliasMap, BracketView, ConflictIndex, ConflictInputs, PlayerFlags, SetupBoard, Tombstones},
     fixture_source::read_structure_envelope,
@@ -71,7 +71,7 @@ fn load_event(dir: &Path, event: &str) -> (Vec<LiveSet>, Vec<PhaseGroupInfo>) {
 }
 
 fn zero_callables(sets: &[LiveSet], groups: &[PhaseGroupInfo]) -> bool {
-    let bracket = bracket_tools_scheduler::model::BracketId("replay".to_owned());
+    let bracket = bracket_tools_scheduler_core::model::BracketId("replay".to_owned());
     let pool = [SetupId(1)];
     let board = SetupBoard::new(&pool);
     let (aliases, flags, tombstones) = (AliasMap::default(), PlayerFlags::default(), Tombstones::default());

@@ -194,7 +194,7 @@ pub async fn install_rehearsal(
 /// Fetches every configured event from the fixtures and folds the config
 /// into a simulatable world (numeric ids, open-now brackets, config board
 /// and priors). Shared with the `--autoplay` replay generator.
-pub(crate) async fn load_world(
+pub async fn load_world(
     source: &FixtureSource,
     config: &SchedulerConfig,
     now_millis: UnixMillis,

@@ -1,0 +1,27 @@
+[package]
+name = "bracket-tools-scheduler-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bracket-tools-cache = { path = "../../../crates/bracket-tools-cache", default-features = false }
+bracket-tools-startgg = { path = "../../../crates/bracket-tools-startgg", default-features = false }
+bracket-tools-startgg-schema = { path = "../../../crates/bracket-tools-startgg-schema" }
+cfg-if = { workspace = true }
+cynic = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync"] }
+toml = { workspace = true }
+web-time = { workspace = true }
+
+[dev-dependencies]
+# Virtual-time tests (start_paused) for the poller loop.
+tokio = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { workspace = true }

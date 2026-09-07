@@ -1,4 +1,6 @@
-use cfg_if::cfg_if;
+//! The scheduler's shell-independent core: the bracket model, scheduling,
+//! the Elm loop, and the poll and write loops. Builds for wasm32 as well as
+//! natively (`scripts/wasm-check.sh`).
 
 pub mod app;
 pub mod config;
@@ -24,18 +26,6 @@ pub mod timers;
 pub mod ui_action;
 pub mod world;
 pub mod writer;
-
-// Terminal and filesystem shells. The modules above are the wasm32-clean
-// core (guarded by scripts/wasm-check.sh).
-cfg_if! {
-    if #[cfg(not(target_arch = "wasm32"))] {
-        pub mod cli;
-        pub mod persist;
-        pub mod replay;
-        pub mod terminal;
-        pub mod ui;
-    }
-}
 
 pub use config::{BracketConfig, BracketMode, ConfigError, SchedulerConfig, SetupId};
 pub use conflict::{

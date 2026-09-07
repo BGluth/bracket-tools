@@ -19,14 +19,7 @@ use std::{
     time::Duration,
 };
 
-use crossterm::{
-    cursor::Hide,
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{enable_raw_mode, EnterAlternateScreen},
-};
-
-use crate::{
+use bracket_tools_scheduler_core::{
     config::{SchedulerConfig, SetupId},
     conflict::UnixMillis,
     fixture_source::FixtureSource,
@@ -35,8 +28,15 @@ use crate::{
     ranker::ScoreComponents,
     rehearsal::{load_world, RehearsalError},
     simulator::{simulate_autoplay, ReplayEvent, SetContext, SimOutcome},
-    terminal::restore_terminal,
 };
+use crossterm::{
+    cursor::Hide,
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{enable_raw_mode, EnterAlternateScreen},
+};
+
+use crate::terminal::restore_terminal;
 
 /// Every frame's first line starts with this (the playback split marker).
 const FRAME_MARK: &str = "▶";
@@ -195,7 +195,7 @@ pub fn render_replay(replay: &Replay) -> String {
 /// Board + progress state carried across frames (rebuilt from the events).
 struct Tracker {
     /// setup -> (bracket, players) currently on it.
-    assignments: HashMap<SetupId, (BracketId, crate::model::SetKey, String)>,
+    assignments: HashMap<SetupId, (BracketId, bracket_tools_scheduler_core::model::SetKey, String)>,
     /// bracket -> (done, remaining) so far.
     progress: HashMap<BracketId, (usize, usize)>,
     order: Vec<BracketId>,
@@ -623,8 +623,9 @@ fn truncate(name: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use bracket_tools_scheduler_core::{fixture_source::FixtureSource, simulator::ReplayEvent};
+
     use super::{colorize_line, generate_replay, render_replay, split_frames};
-    use crate::{fixture_source::FixtureSource, simulator::ReplayEvent};
 
     const NOW: i64 = 1_751_000_000_000;
 

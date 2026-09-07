@@ -280,17 +280,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bracket-tools-cache",
+ "bracket-tools-scheduler-core",
  "bracket-tools-startgg",
  "bracket-tools-startgg-schema",
- "cfg-if",
  "chrono",
  "clap",
  "crossterm 0.29.0",
  "cynic",
  "directories",
  "fs2",
- "futures",
- "gloo-timers",
  "ratatui 0.30.2",
  "reqwest",
  "serde",
@@ -300,6 +298,25 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "bracket-tools-scheduler-core"
+version = "0.1.0"
+dependencies = [
+ "bracket-tools-cache",
+ "bracket-tools-startgg",
+ "bracket-tools-startgg-schema",
+ "cfg-if",
+ "cynic",
+ "futures",
+ "gloo-timers",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
  "web-time",
 ]
 

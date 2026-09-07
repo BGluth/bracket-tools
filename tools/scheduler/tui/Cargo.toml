@@ -1,0 +1,34 @@
+[package]
+name = "bracket-tools-scheduler"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scheduler"
+path = "src/main.rs"
+
+[dependencies]
+bracket-tools-scheduler-core = { path = "../core" }
+bracket-tools-cache = { path = "../../../crates/bracket-tools-cache", default-features = false }
+bracket-tools-startgg = { path = "../../../crates/bracket-tools-startgg", default-features = false }
+bracket-tools-startgg-schema = { path = "../../../crates/bracket-tools-startgg-schema" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+cynic = { workspace = true }
+directories = { workspace = true }
+fs2 = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync"] }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# TUI stack (current stable, from workspace deps). Async terminal input is handled
+# by a dedicated blocking thread that forwards to the Elm-loop channel, so
+# crossterm's `event-stream` feature is intentionally not needed.
+crossterm = { workspace = true }
+ratatui = { workspace = true }

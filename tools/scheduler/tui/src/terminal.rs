@@ -10,6 +10,7 @@ use std::{
     panic,
 };
 
+use bracket_tools_scheduler_core::keymap::Key;
 use crossterm::{
     cursor::Show,
     event::{KeyCode, KeyEvent, KeyModifiers},
@@ -17,8 +18,6 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-
-use crate::keymap::Key;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -84,10 +83,10 @@ pub fn key_from_event(event: KeyEvent) -> Key {
 
 #[cfg(test)]
 mod tests {
+    use bracket_tools_scheduler_core::keymap::Key;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{key_from_event, restore_terminal};
-    use crate::keymap::Key;
 
     #[test]
     fn key_from_event_models_ctrl_c_and_maps_the_rest() {

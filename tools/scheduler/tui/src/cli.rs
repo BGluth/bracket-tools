@@ -8,6 +8,10 @@ use std::{
     str::FromStr,
 };
 
+use bracket_tools_scheduler_core::{
+    config::{SchedulerConfig, SetupCounts},
+    set_source::StartggSource,
+};
 use bracket_tools_startgg::{
     types::{GGRestToken, GGRestTokenParseError},
     GGProvider,
@@ -15,11 +19,6 @@ use bracket_tools_startgg::{
 use clap::{ArgGroup, Parser};
 use directories::ProjectDirs;
 use thiserror::Error;
-
-use crate::{
-    config::{SchedulerConfig, SetupCounts},
-    set_source::StartggSource,
-};
 
 pub const STARTGG_TOKEN_ENV: &str = "STARTGG_TOKEN";
 pub const DEFAULT_TOKEN_PATH: &str = "~/work/tokens/scraper_gg.token";
@@ -276,10 +275,10 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    use bracket_tools_scheduler_core::config::SetupCounts;
     use clap::Parser;
 
     use super::{expand_home, resolve_token_from, Cli, TokenError};
-    use crate::config::SetupCounts;
 
     #[test]
     fn cli_parses_all_flags() {

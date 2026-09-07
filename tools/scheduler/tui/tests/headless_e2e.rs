@@ -8,7 +8,8 @@
 
 use std::{env, path::PathBuf, time::Duration};
 
-use bracket_tools_scheduler::{
+use bracket_tools_scheduler::ui;
+use bracket_tools_scheduler_core::{
     app::{update, AppState, Msg, PollFailure},
     config::{BracketConfig, SchedulerConfig, SetupCounts},
     fixture_source::{classify_fixture_error, FixtureSource},
@@ -16,7 +17,6 @@ use bracket_tools_scheduler::{
     model::BracketId,
     poller::{poll_cycle, PollerConfig},
     preflight::{preflight, PreflightEnv},
-    ui,
 };
 use ratatui::{backend::TestBackend, Terminal};
 

@@ -4,7 +4,8 @@
 
 use std::{env, path::PathBuf, time::Duration};
 
-use bracket_tools_scheduler::{
+use bracket_tools_scheduler::ui;
+use bracket_tools_scheduler_core::{
     app::{update, AppState, Msg, PollFailure},
     fixture_source::{classify_fixture_error, FixtureSource},
     model::{live_sets_from_schema, BracketId},
@@ -12,7 +13,7 @@ use bracket_tools_scheduler::{
     preflight::{preflight, PreflightEnv},
     rehearsal::install_rehearsal,
     set_source::SetSource,
-    ui, SchedulerConfig,
+    SchedulerConfig,
 };
 use ratatui::{backend::TestBackend, Terminal};
 

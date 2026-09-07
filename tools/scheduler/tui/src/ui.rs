@@ -6,16 +6,7 @@
 //! ingredients — the ordering must be explainable, not asserted) · per-
 //! bracket summary · status line. Modals: call-picker and `?` help.
 
-use chrono::{DateTime, Local};
-use ratatui::{
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap},
-    Frame,
-};
-
-use crate::{
+use bracket_tools_scheduler_core::{
     app::{
         blocked_entries, filtered_roster, find_set_rows, flag_label, picker_rows, reassign_options, report_roster, setups_rows, AppState,
         ListView, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, SetupsRow,
@@ -24,6 +15,14 @@ use crate::{
     model::{strip_sponsor, BracketId, SetKey},
     ui_action::Side,
     world::RolloutRow,
+};
+use chrono::{DateTime, Local};
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Clear, Paragraph, Row, Table, TableState, Wrap},
+    Frame,
 };
 
 const SELECTED: Style = Style::new().add_modifier(Modifier::REVERSED);
@@ -315,7 +314,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, now: UnixMil
 fn draw_call_picker(
     frame: &mut Frame<'_>,
     state: &AppState,
-    setup: crate::config::SetupId,
+    setup: bracket_tools_scheduler_core::config::SetupId,
     selected: usize,
     refreshed: bool,
     now: UnixMillis,
@@ -660,7 +659,7 @@ fn divergence_ledger(state: &AppState) -> Vec<(BracketId, SetKey)> {
     pairs
 }
 
-fn draw_reassign(frame: &mut Frame<'_>, state: &AppState, setup: crate::config::SetupId, selected: usize) {
+fn draw_reassign(frame: &mut Frame<'_>, state: &AppState, setup: bracket_tools_scheduler_core::config::SetupId, selected: usize) {
     let area = centered_rect(frame.area(), 50, 40);
     frame.render_widget(Clear, area);
 
@@ -960,7 +959,7 @@ fn show_players(state: &AppState, joined: &str) -> String {
     joined.split(" vs ").map(strip_sponsor).collect::<Vec<_>>().join(" vs ")
 }
 
-fn players_for(state: &AppState, bracket: &BracketId, key: &crate::model::SetKey) -> String {
+fn players_for(state: &AppState, bracket: &BracketId, key: &bracket_tools_scheduler_core::model::SetKey) -> String {
     state
         .brackets
         .iter()
@@ -1042,16 +1041,16 @@ fn fmt_clock(millis: UnixMillis) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{backend::TestBackend, Terminal};
-
-    use super::draw;
-    use crate::{
+    use bracket_tools_scheduler_core::{
         app::{update, AppState, BracketBootstrap, Msg},
         config::{BracketConfig, BracketMode, CallAction, SchedulerConfig, SetupCounts, DEFAULT_SETUP_TYPE},
         keymap::Key,
         model::BracketId,
         synth::{make_se_bracket, materialize_ids},
     };
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use super::draw;
 
     const NOW: i64 = 1_751_000_000_000;
 
@@ -1171,12 +1170,12 @@ mod tests {
             .per_setup
             .iter()
             .map(|(setup, entries)| {
-                let mut rows: Vec<crate::world::RolloutRow> = entries
+                let mut rows: Vec<bracket_tools_scheduler_core::world::RolloutRow> = entries
                     .iter()
                     .cloned()
-                    .map(|e| crate::world::RolloutRow::Call(Box::new(e)))
+                    .map(|e| bracket_tools_scheduler_core::world::RolloutRow::Call(Box::new(e)))
                     .collect();
-                rows.push(crate::world::RolloutRow::Hold {
+                rows.push(bracket_tools_scheduler_core::world::RolloutRow::Hold {
                     waiting_for: None,
                     projected_finish: Some(NOW + 3_600_000),
                 });
@@ -1185,7 +1184,7 @@ mod tests {
             .collect();
         update(
             &mut state,
-            Msg::SimResult(crate::world::RolloutRankings {
+            Msg::SimResult(bracket_tools_scheduler_core::world::RolloutRankings {
                 per_setup,
                 computed_at: NOW,
             }),
@@ -1216,7 +1215,7 @@ mod tests {
     #[test]
     fn notices_page_renders_with_unread_count() {
         let mut state = test_state(false);
-        state.notice(NOW, crate::app::NoticeLevel::Warn, "wifi looked shaky");
+        state.notice(NOW, bracket_tools_scheduler_core::app::NoticeLevel::Warn, "wifi looked shaky");
         update(&mut state, Msg::Key(Key::Char('n')), NOW);
 
         let text = render(&state);
@@ -1274,7 +1273,9 @@ mod tests {
         // modal must scroll it into view once the cursor reaches it.
         let mut state = test_state(false);
         for id in 3..=30 {
-            state.board.add_setup(crate::config::SetupId(id), "default".to_owned());
+            state
+                .board
+                .add_setup(bracket_tools_scheduler_core::config::SetupId(id), "default".to_owned());
         }
         update(&mut state, Msg::Key(Key::Char('s')), NOW);
         for _ in 0..30 {

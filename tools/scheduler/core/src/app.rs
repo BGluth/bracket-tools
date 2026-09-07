@@ -424,7 +424,7 @@ pub enum ReassignOption {
 
 /// The reassign modal's option list: every full bracket, then the two
 /// blanket choices.
-pub(crate) fn reassign_options(state: &AppState) -> Vec<ReassignOption> {
+pub fn reassign_options(state: &AppState) -> Vec<ReassignOption> {
     let mut options: Vec<ReassignOption> = state
         .brackets
         .iter()
@@ -449,7 +449,7 @@ pub enum SetupsRow {
 /// The setups modal's rows: stations grouped by type (board order), each
 /// group closed by its add row. Config-referenced types with no station yet
 /// still get an add row, so a zero-count type can be seeded.
-pub(crate) fn setups_rows(state: &AppState) -> Vec<SetupsRow> {
+pub fn setups_rows(state: &AppState) -> Vec<SetupsRow> {
     let mut types: Vec<String> = Vec::new();
     for setup in state.board.setups() {
         if !types.contains(&setup.setup_type) {
@@ -1210,7 +1210,7 @@ fn close_modal(state: &mut AppState) {
 /// The rows the call-picker shows and commits against: the rollout ranking
 /// when one is available for the setup, else the greedy world ranking.
 /// Returns `(rows, from_rollout)`.
-pub(crate) fn picker_rows(state: &AppState, setup: SetupId) -> (Vec<RolloutRow>, bool) {
+pub fn picker_rows(state: &AppState, setup: SetupId) -> (Vec<RolloutRow>, bool) {
     if let Some(rows) = state.rollout.as_ref().and_then(|r| r.per_setup.get(&setup)) {
         if !rows.is_empty() {
             return (rows.clone(), true);
@@ -1957,7 +1957,7 @@ fn character_cursor(state: &AppState, draft: &ReportDraft, side: Side) -> usize 
 }
 
 /// The roster the report modal picks characters from.
-pub(crate) fn report_roster<'a>(state: &'a AppState, bracket: &BracketId) -> &'a [CharacterInfo] {
+pub fn report_roster<'a>(state: &'a AppState, bracket: &BracketId) -> &'a [CharacterInfo] {
     state
         .brackets
         .iter()
@@ -1967,7 +1967,7 @@ pub(crate) fn report_roster<'a>(state: &'a AppState, bracket: &BracketId) -> &'a
 }
 
 /// Case-insensitive roster filter, prefix matches first.
-pub(crate) fn filtered_roster<'a>(roster: &'a [CharacterInfo], filter: &str) -> Vec<&'a CharacterInfo> {
+pub fn filtered_roster<'a>(roster: &'a [CharacterInfo], filter: &str) -> Vec<&'a CharacterInfo> {
     let needle = filter.to_lowercase();
     let (mut prefix, mut rest): (Vec<&CharacterInfo>, Vec<&CharacterInfo>) = roster
         .iter()

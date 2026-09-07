@@ -16,25 +16,27 @@ use std::{
 
 use anyhow::{bail, Context};
 use bracket_tools_scheduler::{
-    app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
     cli::{build_live_source, default_config_dir, default_data_dir, rate_journal_path, resolve_token, tournaments_dir, Cli},
+    persist::{
+        load_overlay, load_setup_defaults, load_snapshot, save_overlay, save_setup_defaults, save_snapshot, sibling_with_suffix, Load,
+        Lockfile,
+    },
+    replay::{generate_replay, play_replay, render_replay},
+    terminal::{install_panic_hook, key_from_event, TerminalGuard},
+    ui,
+};
+use bracket_tools_scheduler_core::{
+    app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
     config::{referenced_types, resolve_roster, write_starter_template, SetupCounts},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
     init::{game_setups_template, generate_config, parse_tournament_slug, GameSetups, InitError, MatchSource, GAME_SETUPS_FILE},
     model::BracketId,
-    persist::{
-        load_overlay, load_setup_defaults, load_snapshot, save_overlay, save_setup_defaults, save_snapshot, sibling_with_suffix, Load,
-        Lockfile,
-    },
     poller::{classify_provider_error, run_poller, PollerConfig},
     preflight::{preflight, PreflightEnv},
     rehearsal::{install_rehearsal, seed_fixture_from_live},
-    replay::{generate_replay, play_replay, render_replay},
     set_source::SetSource,
-    terminal::{install_panic_hook, key_from_event, TerminalGuard},
     timers::now_millis,
-    ui,
     world::{rollout_rankings, snapshot_within_sim_ceiling, SimSnapshot, ROLLOUT_TOP_K},
     writer::{run_writer, WriterConfig},
     SchedulerConfig,
@@ -914,7 +916,7 @@ fn spawn_input_thread(tx: UnboundedSender<Msg>) {
 
 #[cfg(test)]
 mod world_tag_tests {
-    use bracket_tools_scheduler::config::BracketConfig;
+    use bracket_tools_scheduler_core::config::BracketConfig;
     use clap::Parser;
 
     use super::{normalize_tournament_input, world_tag, Cli, SchedulerConfig};
@@ -957,10 +959,10 @@ mod world_tag_tests {
 mod tests {
     use std::{collections::BTreeMap, env, fs, path::PathBuf, process};
 
-    use bracket_tools_scheduler::{
+    use bracket_tools_scheduler::persist::save_setup_defaults;
+    use bracket_tools_scheduler_core::{
         config::{BracketConfig, OneOrMany, SchedulerConfig, SetupCounts},
         fixture_source::FixtureSource,
-        persist::save_setup_defaults,
     };
     use clap::Parser;
 

@@ -3,7 +3,7 @@
 //! resumes the board, flags, tombstones, durations, pending writes, and unread
 //! notices instead of a blank screen.
 //!
-//! The on-disk shape is an [`OverlayDoc`](crate::state_doc::OverlayDoc) DTO: it reuses the internal overlay
+//! The on-disk shape is an [`OverlayDoc`](bracket_tools_scheduler_core::state_doc::OverlayDoc) DTO: it reuses the internal overlay
 //! types where they serialize cleanly and flattens the tuple/enum-keyed maps
 //! (which JSON can't express as object keys) to vectors of pairs. A corrupt or
 //! version-mismatched file is renamed `.bak` and treated as a fresh start —
@@ -17,11 +17,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bracket_tools_scheduler_core::state_doc::{OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION};
 use fs2::FileExt;
 use serde::{de::DeserializeOwned, Serialize};
 use thiserror::Error;
-
-use crate::state_doc::{OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION};
 
 #[derive(Debug, Error)]
 pub enum PersistError {
@@ -235,13 +234,14 @@ fn read_pid(path: &Path) -> Option<String> {
 mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
-    use super::{load_overlay, load_setup_defaults, save_overlay, save_setup_defaults, Load, Lockfile};
-    use crate::{
+    use bracket_tools_scheduler_core::{
         config::SetupId,
         conflict::SetupBoard,
         duration::DurationModel,
         state_doc::{OverlayDoc, OVERLAY_VERSION},
     };
+
+    use super::{load_overlay, load_setup_defaults, save_overlay, save_setup_defaults, Load, Lockfile};
 
     fn scratch(name: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
@@ -320,12 +320,13 @@ mod tests {
 
     #[test]
     fn snapshot_round_trips_with_live_sets() {
-        use super::{load_snapshot, save_snapshot};
-        use crate::{
+        use bracket_tools_scheduler_core::{
             model::BracketId,
             state_doc::{BracketSnapshot, SnapshotDoc, SNAPSHOT_VERSION},
             synth::make_se_bracket,
         };
+
+        use super::{load_snapshot, save_snapshot};
 
         let bracket = make_se_bracket(1001, 4);
         let path = scratch("snapshot.json");
