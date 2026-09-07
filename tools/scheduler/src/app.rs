@@ -24,8 +24,8 @@ use crate::{
     duration::{diff_snapshots, DurationModel},
     keymap::{parse_setup_digits, resolve_key, Key, KeyOutcome},
     model::{abbreviate_round, strip_sponsor, BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
-    persist::{BracketSnapshot, OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     ranker::GreedyRanker,
+    state_doc::{BracketSnapshot, OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     ui_action::{Move, ReportAction, Side, UiAction},
     world::{assigned_sets, recompute, BracketState, QueueEntry, RolloutRankings, RolloutRow, SimSnapshot, World, WorldInputs},
 };
@@ -1564,7 +1564,7 @@ fn enqueue_write(
 
 /// The inspection view's row set: every blocked (bracket, set) pair in a
 /// deterministic order. Rendering and cursor bounds share this.
-pub(crate) fn blocked_entries(state: &AppState) -> Vec<(BracketId, SetKey)> {
+pub fn blocked_entries(state: &AppState) -> Vec<(BracketId, SetKey)> {
     let mut keys: Vec<(BracketId, SetKey)> = state.world.blocked.keys().cloned().collect();
     keys.sort();
     keys
@@ -2087,7 +2087,7 @@ fn cycle_flag(flags: &mut PlayerFlags, key: &ConflictKey) -> &'static str {
 }
 
 /// The flag a key currently carries, for display.
-pub(crate) fn flag_label(flags: &PlayerFlags, key: &ConflictKey) -> &'static str {
+pub fn flag_label(flags: &PlayerFlags, key: &ConflictKey) -> &'static str {
     if flags.resting.contains(key) {
         "resting"
     } else if flags.departed.contains(key) {

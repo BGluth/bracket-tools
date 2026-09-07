@@ -49,6 +49,8 @@ directories = "6"
 # std::time::SystemTime that also works on wasm32 (browser/desktop app targets).
 web-time = { version = "1.1", features = ["serde"] }
 cfg-if = "1"
+# Browser-side sleep for the scheduler's timer shim.
+gloo-timers = { version = "0.4", features = ["futures"] }
 
 [profile.release]
 opt-level = 3

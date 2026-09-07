@@ -6,51 +6,63 @@
 //! tournament wears the real cast instead of the fixture placeholder.
 //! Best-effort throughout: any I/O or parse failure is just a cache miss.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 
 use bracket_tools_startgg::CharacterInfo;
-use serde::{Deserialize, Serialize};
+use cfg_if::cfg_if;
 
-const ROSTER_DIR: &str = "rosters";
+cfg_if! {
+    if #[cfg(target_arch = "wasm32")] {
+        // No filesystem in the browser: every lookup is a miss.
+        pub fn load(_data_dir: &Path, _slug: &str) -> Option<Vec<CharacterInfo>> {
+            None
+        }
 
-#[derive(Serialize, Deserialize)]
-struct RosterDoc {
-    characters: Vec<CharacterInfo>,
-}
+        pub fn save(_data_dir: &Path, _slug: &str, _characters: &[CharacterInfo]) {}
+    } else {
+        use std::{fs, path::PathBuf};
 
-pub fn load(data_dir: &Path, slug: &str) -> Option<Vec<CharacterInfo>> {
-    let text = fs::read_to_string(roster_path(data_dir, slug)).ok()?;
-    let doc: RosterDoc = toml::from_str(&text).ok()?;
-    (!doc.characters.is_empty()).then_some(doc.characters)
-}
+        use serde::{Deserialize, Serialize};
 
-pub fn save(data_dir: &Path, slug: &str, characters: &[CharacterInfo]) {
-    if characters.is_empty() {
-        return;
+        const ROSTER_DIR: &str = "rosters";
+
+        #[derive(Serialize, Deserialize)]
+        struct RosterDoc {
+            characters: Vec<CharacterInfo>,
+        }
+
+        pub fn load(data_dir: &Path, slug: &str) -> Option<Vec<CharacterInfo>> {
+            let text = fs::read_to_string(roster_path(data_dir, slug)).ok()?;
+            let doc: RosterDoc = toml::from_str(&text).ok()?;
+            (!doc.characters.is_empty()).then_some(doc.characters)
+        }
+
+        pub fn save(data_dir: &Path, slug: &str, characters: &[CharacterInfo]) {
+            if characters.is_empty() {
+                return;
+            }
+            let doc = RosterDoc {
+                characters: characters.to_vec(),
+            };
+            let Ok(text) = toml::to_string(&doc) else { return };
+            let path = roster_path(data_dir, slug);
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let tmp = path.with_extension("toml.tmp");
+            if fs::write(&tmp, text).is_ok() {
+                let _ = fs::rename(&tmp, &path);
+            }
+        }
+
+        fn roster_path(data_dir: &Path, key: &str) -> PathBuf {
+            let stem: String = key
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                .collect();
+            data_dir.join(ROSTER_DIR).join(format!("{stem}.toml"))
+        }
     }
-    let doc = RosterDoc {
-        characters: characters.to_vec(),
-    };
-    let Ok(text) = toml::to_string(&doc) else { return };
-    let path = roster_path(data_dir, slug);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let tmp = path.with_extension("toml.tmp");
-    if fs::write(&tmp, text).is_ok() {
-        let _ = fs::rename(&tmp, &path);
-    }
-}
-
-fn roster_path(data_dir: &Path, key: &str) -> PathBuf {
-    let stem: String = key
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-        .collect();
-    data_dir.join(ROSTER_DIR).join(format!("{stem}.toml"))
 }
 
 #[cfg(test)]

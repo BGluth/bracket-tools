@@ -8,14 +8,17 @@
 //! scripted snapshots — the scripted timeline is the source of truth for
 //! what the "server" reports next.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     future::pending,
-    path::{Path, PathBuf},
+    path::PathBuf,
     slice::from_ref,
     sync::Mutex,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use bracket_tools_startgg::{AdminProbeResult, CharacterInfo, GameReport, SetMutationResult, StartGgId};
@@ -24,8 +27,10 @@ use bracket_tools_startgg_schema::{
     get_event_structure, get_sets_for_event,
     scalars::{Id, Timestamp},
 };
+#[cfg(not(target_arch = "wasm32"))]
 use cynic::GraphQlResponse;
 use thiserror::Error;
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     config::{BracketConfig, SchedulerConfig, SetupCounts},
@@ -163,6 +168,7 @@ impl FixtureSource {
     /// Loads every `tournament_*` event directory of an S1-smoke-style
     /// capture dir: `sets_page_N.json` pages (one combined initial snapshot)
     /// plus `structure.json`, all raw `GraphQlResponse` envelopes.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_captures(dir: &Path) -> Result<Self, FixtureLoadError> {
         let mut source = Self::new();
         let entries = fs::read_dir(dir).map_err(|source| FixtureLoadError::Io {
@@ -355,6 +361,7 @@ impl FixtureSource {
         *self.admin_probe.get_mut().unwrap() = Some(result);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_capture_event(&mut self, event_dir: &Path, name: &str) -> Result<(), FixtureLoadError> {
         let mut sets = Vec::new();
         for page in 1.. {
@@ -604,6 +611,7 @@ fn largest_tournament(slugs: &[String]) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_envelope<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, FixtureLoadError> {
     let raw = fs::read_to_string(path).map_err(|source| FixtureLoadError::Io {
         path: path.to_owned(),
@@ -617,6 +625,7 @@ fn read_envelope<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Fixtu
 
 /// The structure query gained a `phase` selection after the first capture
 /// corpora were recorded; backfill a null so pre-phase captures keep replaying.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn read_structure_envelope(path: &Path) -> Result<GraphQlResponse<get_event_structure::GetEventStructure>, FixtureLoadError> {
     let mut value: serde_json::Value = read_envelope(path)?;
     if let Some(groups) = value

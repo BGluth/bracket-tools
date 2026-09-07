@@ -23,7 +23,6 @@ use std::{
 };
 
 use bracket_tools_startgg::{CharacterInfo, StartGgId};
-use tokio::time::{sleep, timeout};
 
 use crate::{
     app::{BracketBootstrap, PollFailure},
@@ -31,6 +30,7 @@ use crate::{
     model::{live_sets_from_schema, phase_groups_from_schema, LiveSet, PhaseGroupInfo, PlayerId},
     roster_cache,
     set_source::SetSource,
+    timers::{sleep, timeout},
 };
 
 /// How long one rate-limit pause lasts: start.gg's window is a minute and

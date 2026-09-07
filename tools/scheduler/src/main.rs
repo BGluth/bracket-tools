@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{bail, Context};
@@ -33,6 +33,7 @@ use bracket_tools_scheduler::{
     replay::{generate_replay, play_replay, render_replay},
     set_source::SetSource,
     terminal::{install_panic_hook, key_from_event, TerminalGuard},
+    timers::now_millis,
     ui,
     world::{rollout_rankings, snapshot_within_sim_ceiling, SimSnapshot, ROLLOUT_TOP_K},
     writer::{run_writer, WriterConfig},
@@ -909,10 +910,6 @@ fn spawn_input_thread(tx: UnboundedSender<Msg>) {
             Err(_) => return,
         }
     });
-}
-
-fn now_millis() -> UnixMillis {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]

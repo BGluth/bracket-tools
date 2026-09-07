@@ -14,6 +14,7 @@ bracket-tools-startgg = { path = "../../crates/bracket-tools-startgg", default-f
 bracket-tools-startgg-schema = { path = "../../crates/bracket-tools-startgg-schema" }
 anyhow = { workspace = true }
 cfg-if = { workspace = true }
+web-time = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 cynic = { workspace = true }
@@ -40,3 +41,6 @@ ratatui = { workspace = true }
 fs2 = { workspace = true }
 directories = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { workspace = true }

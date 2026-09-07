@@ -10,24 +10,19 @@
 //! for a grace cycle) lives app-side in `apply_snapshot`, where the previous
 //! snapshot already exists to diff against.
 
-use std::{
-    collections::HashSet,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashSet, time::Duration};
 
 use bracket_tools_startgg::GGProviderError;
 use cynic::http::CynicReqwestError;
 use futures::{stream, StreamExt};
-use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
-    time::{sleep_until, timeout, Instant},
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use web_time::Instant;
 
 use crate::{
     app::{Msg, PollFailure, PollOutcome, PollResult, StructureUpdate},
-    conflict::UnixMillis,
     model::{live_sets_from_schema, phase_groups_from_schema, BracketId},
     set_source::SetSource,
+    timers::{now_millis, sleep, timeout},
 };
 
 pub const POLL_CONCURRENCY: usize = 3;
@@ -138,7 +133,7 @@ pub async fn run_poller<S, F>(
         let deadline = Instant::now() + config.interval;
         loop {
             tokio::select! {
-                _ = sleep_until(deadline) => break,
+                _ = sleep(deadline.saturating_duration_since(Instant::now())) => break,
                 forced = force_rx.recv() => {
                     let Some(first) = forced else { return };
                     // Coalesce every queued request into one targeted pass.
@@ -162,10 +157,21 @@ pub async fn run_poller<S, F>(
     }
 }
 
+/// The browser's fetch client reports no connect phase.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_connect_error(error: &reqwest::Error) -> bool {
+    error.is_connect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn is_connect_error(_error: &reqwest::Error) -> bool {
+    false
+}
+
 /// Three-bucket classification for the live provider's errors.
 pub fn classify_provider_error(error: &GGProviderError) -> PollFailure {
     match error {
-        GGProviderError::Http(CynicReqwestError::ReqwestError(e)) if e.is_connect() || e.is_timeout() => PollFailure::Offline,
+        GGProviderError::Http(CynicReqwestError::ReqwestError(e)) if is_connect_error(e) || e.is_timeout() => PollFailure::Offline,
         GGProviderError::Http(CynicReqwestError::ReqwestError(_)) => PollFailure::Transient,
         GGProviderError::RateLimited { .. } => PollFailure::RateLimited,
         GGProviderError::Http(CynicReqwestError::ErrorResponse(status, body)) => {
@@ -183,10 +189,6 @@ pub fn classify_provider_error(error: &GGProviderError) -> PollFailure {
         }
         GGProviderError::Storage(_) | GGProviderError::CacheDeserialization(_) => PollFailure::Transient,
     }
-}
-
-fn now_millis() -> UnixMillis {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]

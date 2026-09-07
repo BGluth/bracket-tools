@@ -20,7 +20,6 @@ use std::{
 
 use bracket_tools_startgg_schema::get_sets_for_event;
 use thiserror::Error;
-use tokio::time::timeout;
 
 use crate::{
     config::{pool_for_types, resolve_roster, SchedulerConfig},
@@ -31,6 +30,7 @@ use crate::{
     roster_cache,
     set_source::SetSource,
     simulator::{simulate_recorded, ScriptFrame, SimBracket, SimWorld},
+    timers::timeout,
 };
 
 /// Materialized rehearsal ids start here: far above live set ids, still

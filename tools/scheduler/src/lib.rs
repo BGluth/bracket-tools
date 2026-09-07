@@ -1,38 +1,39 @@
 use cfg_if::cfg_if;
 
+pub mod app;
 pub mod config;
 pub mod conflict;
 pub mod duration;
+pub mod fixture_source;
 pub mod graph;
 pub mod init;
+pub mod keymap;
 pub mod model;
+pub mod poller;
+pub mod preflight;
 pub mod ranker;
+pub mod rehearsal;
 pub mod rollout;
+pub mod roster_cache;
 pub mod set_source;
 pub mod simulator;
+pub mod state_doc;
 #[doc(hidden)]
 pub mod synth;
+pub mod timers;
 pub mod ui_action;
 pub mod world;
+pub mod writer;
 
-// Terminal, filesystem and tokio-runtime shells, plus the Elm core and its
-// keymap, which reach the persistence documents. The modules above are the
-// wasm32-clean core (guarded by scripts/wasm-check.sh).
+// Terminal and filesystem shells. The modules above are the wasm32-clean
+// core (guarded by scripts/wasm-check.sh).
 cfg_if! {
     if #[cfg(not(target_arch = "wasm32"))] {
-        pub mod app;
         pub mod cli;
-        pub mod fixture_source;
-        pub mod keymap;
         pub mod persist;
-        pub mod poller;
-        pub mod preflight;
-        pub mod rehearsal;
         pub mod replay;
-        pub mod roster_cache;
         pub mod terminal;
         pub mod ui;
-        pub mod writer;
     }
 }
 

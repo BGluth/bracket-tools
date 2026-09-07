@@ -22,18 +22,16 @@
 //! shared governor lives inside GGProvider today, so both paths contend
 //! equally; acceptable for FBR volumes.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bracket_tools_startgg::SetMutationResult;
-use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
-    time::{sleep, timeout},
-};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::{
     app::{Msg, OffsetSample, PollFailure, WriteIntent, WriteKind, WriteOutcome, WriteResult},
     conflict::UnixMillis,
     set_source::SetSource,
+    timers::{now_millis, sleep, timeout},
 };
 
 #[derive(Debug, Clone)]
@@ -155,10 +153,6 @@ fn offset_sample(payload: &SetMutationResult, sent_at: UnixMillis, received_at: 
         offset_secs: started.0 - (sent_at + received_at) / 2 / 1000,
         at: received_at,
     })
-}
-
-fn now_millis() -> UnixMillis {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 #[cfg(test)]
