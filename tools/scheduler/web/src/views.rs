@@ -2,17 +2,16 @@
 //! picker, all rendered from the session's `AppState`.
 
 use bracket_tools_scheduler_core::{
-    app::{picker_rows, AppState, Modal, NoticeLevel},
+    app::{AppState, NoticeLevel},
     config::SetupId,
     conflict::{SetupStatus, UnixMillis},
     model::{BracketId, SetKey},
     timers::now_millis,
     ui_action::UiAction,
-    world::RolloutRow,
 };
 use dioxus::prelude::*;
 
-use crate::bridge::Session;
+use crate::{bridge::Session, modals::Modals};
 
 /// The desk; `toolbar` adds shell-specific controls next to undo.
 #[component]
@@ -31,8 +30,12 @@ pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] t
                 if persist_failed {
                     span { class: "writes armed", "saves failing" }
                 }
-                {toolbar}
-                button { class: "quiet", onclick: dispatcher(&session, UiAction::Undo), "undo" }
+                div { class: "tools",
+                    {toolbar}
+                    button { class: "quiet", onclick: dispatcher(&session, UiAction::OpenSetups), "stations" }
+                    button { class: "quiet", onclick: dispatcher(&session, UiAction::OpenFindSet), "find set" }
+                    button { class: "quiet", onclick: dispatcher(&session, UiAction::Undo), "undo" }
+                }
             }
             Stations { session: session.clone() }
             section { class: "columns",
@@ -42,7 +45,7 @@ pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] t
                     Notices { session: session.clone() }
                 }
             }
-            Picker { session: session.clone() }
+            Modals { session: session.clone() }
         }
     }
 }
@@ -50,6 +53,16 @@ pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] t
 #[component]
 fn Stations(session: Session) -> Element {
     let state = session.state.read();
+    let report = |setup: SetupId| {
+        rsx! {
+            button {
+                disabled: !state.writes_armed,
+                title: if state.writes_armed { None } else { Some("reporting needs writes armed") },
+                onclick: dispatcher(&session, UiAction::OpenReport(setup)),
+                "report"
+            }
+        }
+    };
     rsx! {
         section { class: "stations",
             for setup in state.board.setups().iter().cloned() {
@@ -63,11 +76,13 @@ fn Stations(session: Session) -> Element {
                             },
                             SetupStatus::Called { .. } => rsx! {
                                 button { onclick: dispatcher(&session, UiAction::Progress(setup.id)), "started" }
+                                {report(setup.id)}
                                 button { class: "quiet", onclick: dispatcher(&session, UiAction::Free(setup.id)), "free" }
                                 button { class: "quiet", onclick: dispatcher(&session, UiAction::Requeue(setup.id)), "re-queue" }
                             },
                             SetupStatus::InProgress { .. } => rsx! {
-                                button { onclick: dispatcher(&session, UiAction::Free(setup.id)), "free" }
+                                {report(setup.id)}
+                                button { class: "quiet", onclick: dispatcher(&session, UiAction::Free(setup.id)), "free" }
                                 button { class: "quiet", onclick: dispatcher(&session, UiAction::Requeue(setup.id)), "re-queue" }
                             },
                             SetupStatus::OccupiedExternal { .. } => rsx! { span { "in use elsewhere" } },
@@ -144,41 +159,8 @@ fn Notices(session: Session) -> Element {
     }
 }
 
-#[component]
-fn Picker(session: Session) -> Element {
-    let state = session.state.read();
-    let Some(Modal::CallPicker { setup, .. }) = state.ui.modal.clone() else {
-        return rsx! {};
-    };
-    let (rows, from_rollout) = picker_rows(&state, setup);
-    rsx! {
-        div { class: "modal",
-            div { class: "dialog",
-                h2 {
-                    "Setup {setup.0}"
-                    span { class: "hint", if from_rollout { "rollout ranking" } else { "greedy ranking" } }
-                }
-                ul {
-                    for row in rows {
-                        match row {
-                            RolloutRow::Call(entry) => rsx! {
-                                li {
-                                    span { class: "label", "{entry.players} — {entry.round_text} ({entry.bracket.0})" }
-                                    button { onclick: dispatcher(&session, call_set(setup, &entry.bracket, &entry.key)), "call" }
-                                }
-                            },
-                            RolloutRow::Hold { .. } => rsx! { li { class: "hold", "hold this setup open" } },
-                        }
-                    }
-                }
-                button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
-            }
-        }
-    }
-}
-
 /// A click handler that sends one intent.
-fn dispatcher(session: &Session, action: UiAction) -> impl FnMut(Event<MouseData>) {
+pub(crate) fn dispatcher(session: &Session, action: UiAction) -> impl FnMut(Event<MouseData>) {
     let session = session.clone();
     move |_| session.dispatch(action.clone())
 }
@@ -192,14 +174,6 @@ fn quick_call(bracket: &BracketId, key: &SetKey) -> UiAction {
 
 fn snooze(bracket: &BracketId, key: &SetKey) -> UiAction {
     UiAction::SnoozeSet {
-        bracket: bracket.clone(),
-        key: key.clone(),
-    }
-}
-
-fn call_set(setup: SetupId, bracket: &BracketId, key: &SetKey) -> UiAction {
-    UiAction::CallSet {
-        setup,
         bracket: bracket.clone(),
         key: key.clone(),
     }

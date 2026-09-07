@@ -117,6 +117,15 @@ pub enum UiAction {
     },
     /// Ack the notice posted at this instant.
     AckNoticeAt(UnixMillis),
+    /// Retire this station (free ones only).
+    RetireSetup(SetupId),
+    /// Add a station of this type.
+    AddSetup(String),
+    /// Add or retire free stations until this type has `target` of them.
+    SetSetupCount {
+        setup_type: String,
+        target: u32,
+    },
 }
 
 /// Intents inside the report modal.
@@ -125,6 +134,9 @@ pub enum ReportAction {
     RecordGame(Side),
     UndoGame,
     MoveGameCursor(Move),
+    /// Aim the character picker at this game (draft-local, so an index is
+    /// stable).
+    TargetGame(usize),
     OpenCharacterPicker,
     StartDq,
     FinishGames,

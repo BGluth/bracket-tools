@@ -1,7 +1,7 @@
 .desk { padding: 12px 16px; display: grid; gap: 12px; }
 .desk .toolbar { display: flex; align-items: center; gap: 12px; }
 .desk .toolbar .mode { color: var(--dim); }
-.desk .toolbar button { margin-left: auto; }
+.desk .toolbar .tools { margin-left: auto; display: flex; gap: 6px; }
 .desk h2 { margin: 0 0 6px; font-size: 14px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
 .desk table { width: 100%; border-collapse: collapse; background: var(--panel); }
 .desk th, .desk td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
@@ -31,6 +31,18 @@
 .dialog li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
 .dialog li .label { flex: 1; }
 .dialog li.hold { color: var(--dim); }
+.dialog li.targeted { background: var(--line); border-radius: 4px; padding-left: 6px; padding-right: 6px; }
+.dialog ul.games li { cursor: pointer; }
+.dialog ul.roster { max-height: 40vh; overflow: auto; }
+.dialog .score { margin: 4px 0 10px; font-size: 18px; }
+.dialog .row { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+.dialog .confirm { font-weight: 600; }
+.dialog .warn { color: var(--called); }
+.dialog input[type=text], .dialog input[type=number] { padding: 6px 8px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; font: inherit; }
+.dialog input[type=text] { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+.dialog input[type=number] { width: 5em; text-align: right; }
+.dialog table { margin-bottom: 8px; }
+.dialog button:disabled { opacity: .45; cursor: default; }
 .loading, .failed, .empty { padding: 40px; text-align: center; color: var(--dim); }
 .desk .toolbar .writes { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: var(--line); color: var(--dim); }
 .desk .toolbar .writes.armed { background: var(--busy); color: var(--text); }

@@ -1210,6 +1210,18 @@ fn apply_action(state: &mut AppState, action: UiAction, now: UnixMillis, effects
                 notice.acked = true;
             }
         }
+        UiAction::RetireSetup(id) => {
+            retire_setup(state, id, now, effects);
+            clamp_setups_cursor(state);
+        }
+        UiAction::AddSetup(setup_type) => {
+            add_setup_station(state, setup_type, now, effects);
+            clamp_setups_cursor(state);
+        }
+        UiAction::SetSetupCount { setup_type, target } => {
+            set_setup_count(state, setup_type, target, now, effects);
+            clamp_setups_cursor(state);
+        }
     }
 }
 
@@ -1812,20 +1824,33 @@ fn apply_setups_row(state: &mut AppState, selected: usize, now: UnixMillis, effe
         Some(SetupsRow::Add(setup_type)) => add_setup_station(state, setup_type.clone(), now, effects),
         None => return,
     }
-    let len = setups_rows(state).len();
-    state.ui.modal = Some(Modal::Setups {
-        selected: selected.min(len.saturating_sub(1)),
-    });
+    clamp_setups_cursor(state);
 }
 
-/// Typed-count form of the stations modal: adds or retires (free stations,
-/// highest placard first) until the highlighted row's type has `target`
-/// stations. Occupied stations never retire — the shortfall warns instead.
+/// The stations modal stays open across edits; its cursor clamps to the
+/// rebuilt row list.
+fn clamp_setups_cursor(state: &mut AppState) {
+    let last = setups_rows(state).len().saturating_sub(1);
+    if let Some(Modal::Setups { selected }) = &mut state.ui.modal {
+        *selected = (*selected).min(last);
+    }
+}
+
+/// Typed-count form of the stations modal, applied to the highlighted row's
+/// type.
 fn apply_setups_count(state: &mut AppState, selected: usize, target: u32, now: UnixMillis, effects: &mut UpdateEffects) {
     let setup_type = match setups_rows(state).get(selected) {
         Some(SetupsRow::Retire(_, ty) | SetupsRow::Add(ty)) => ty.clone(),
         None => return,
     };
+    set_setup_count(state, setup_type, target, now, effects);
+    clamp_setups_cursor(state);
+}
+
+/// Adds or retires (free stations, highest placard first) until `setup_type`
+/// has `target` stations. Occupied stations never retire — the shortfall
+/// warns instead.
+fn set_setup_count(state: &mut AppState, setup_type: String, target: u32, now: UnixMillis, effects: &mut UpdateEffects) {
     let count = state.board.setups().iter().filter(|s| s.setup_type == setup_type).count() as u32;
     if count == target {
         state.notice(now, NoticeLevel::Info, format!("{setup_type}: already {target} stations"));
@@ -1871,10 +1896,6 @@ fn apply_setups_count(state: &mut AppState, selected: usize, target: u32, now: U
         let text = format!("{kept_occupied} occupied {setup_type} station(s) kept — free them (f/r) and re-enter the count");
         state.notice(now, NoticeLevel::Warn, text);
     }
-    let len = setups_rows(state).len();
-    state.ui.modal = Some(Modal::Setups {
-        selected: selected.min(len.saturating_sub(1)),
-    });
 }
 
 fn retire_setup(state: &mut AppState, id: SetupId, now: UnixMillis, effects: &mut UpdateEffects) {
@@ -1981,6 +2002,9 @@ fn report_action(state: &mut AppState, mut draft: ReportDraft, action: ReportAct
         }
         (ReportStage::Games, ReportAction::MoveGameCursor(direction)) => {
             draft.game_cursor = step_cursor(draft.game_cursor, draft.games.len(), direction, 1);
+        }
+        (ReportStage::Games, ReportAction::TargetGame(game)) => {
+            draft.game_cursor = game.min(draft.games.len().saturating_sub(1));
         }
         (ReportStage::Games, ReportAction::OpenCharacterPicker) => {
             if report_roster(state, &draft.bracket).is_empty() {
@@ -2714,7 +2738,7 @@ mod tests {
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
         set_source::SetSource,
         synth::{complete, make_de_bracket_with, make_se_bracket, materialize_ids, SynthBracket, SynthPlayer},
-        ui_action::UiAction,
+        ui_action::{ReportAction, UiAction},
     };
 
     const NOW: i64 = 1_751_000_000_000;
@@ -3727,6 +3751,42 @@ mod tests {
     }
 
     #[test]
+    fn identity_keyed_setups_intents_edit_the_roster() {
+        let mut state = se4_app(true);
+        call_top_candidate(&mut state, '1');
+        update(&mut state, key(Key::Char('s')), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        assert!(matches!(state.ui.modal, Some(Modal::Setups { selected: 2 })));
+        let ids = |state: &AppState| state.board.setups().iter().map(|s| s.id.0).collect::<Vec<_>>();
+
+        let default = DEFAULT_SETUP_TYPE.to_owned();
+        update(&mut state, Msg::Action(UiAction::AddSetup(default.clone())), NOW);
+        assert_eq!(ids(&state), vec![1, 2, 3]);
+
+        // The occupied setup 1 refuses; the free ones go, and the open
+        // modal's cursor clamps to the rebuilt rows.
+        update(&mut state, Msg::Action(UiAction::RetireSetup(SetupId(1))), NOW);
+        assert_eq!(ids(&state), vec![1, 2, 3]);
+        assert!(state.notices.iter().any(|n| n.text.contains("occupied")));
+        update(&mut state, Msg::Action(UiAction::RetireSetup(SetupId(3))), NOW);
+        update(&mut state, Msg::Action(UiAction::RetireSetup(SetupId(2))), NOW);
+        assert_eq!(ids(&state), vec![1]);
+        assert!(
+            matches!(state.ui.modal, Some(Modal::Setups { selected: 1 })),
+            "{:?}",
+            state.ui.modal
+        );
+
+        let count = UiAction::SetSetupCount {
+            setup_type: default,
+            target: 4,
+        };
+        update(&mut state, Msg::Action(count), NOW);
+        assert_eq!(ids(&state), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
     fn setups_modal_seeds_a_zero_station_type() {
         let melee = se4();
         let config = SchedulerConfig {
@@ -4207,6 +4267,20 @@ mod tests {
         assert!(report.games.is_empty(), "DQ reports carry no game data");
         assert!(report.summary.contains("DQ"), "{}", report.summary);
         assert!(report.summary.contains(&left_name), "{}", report.summary);
+    }
+
+    #[test]
+    fn report_target_game_aims_the_character_picker() {
+        let mut state = reporting_app();
+        for winner in ['1', '2', '1'] {
+            update(&mut state, key(Key::Char(winner)), NOW);
+        }
+        assert_eq!(draft(&state).game_cursor, 2);
+        let target = |game| Msg::Action(UiAction::Report(ReportAction::TargetGame(game)));
+        update(&mut state, target(0), NOW);
+        assert_eq!(draft(&state).game_cursor, 0);
+        update(&mut state, target(9), NOW);
+        assert_eq!(draft(&state).game_cursor, 2, "clamps to the last game");
     }
 
     #[test]
