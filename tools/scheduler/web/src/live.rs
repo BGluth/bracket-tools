@@ -11,14 +11,13 @@ use std::{
 };
 
 use bracket_tools_scheduler_core::{
-    app::{seed_from_snapshot, AppState, NoticeLevel},
+    app::{seed_from_snapshot, AppState},
     config::{referenced_types, SchedulerConfig, SetupCounts, FALLBACK_SETUPS_PER_TYPE},
     conflict::UnixMillis,
     init::{bracket_config, build_config, parse_tournament_slug, GameSetups, InitError},
     poller::classify_provider_error,
     preflight::{preflight, PreflightEnv, PreflightReport},
     set_source::StartggSource,
-    state_doc::OverlayDoc,
     timers::{now_millis, timeout},
 };
 use bracket_tools_startgg::{types::GGRestToken, EventInfo, GGProvider};
@@ -27,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     bridge::{start, Session},
-    persist::{DeskPersistence, DeskStore, Load, Saved},
+    persist::{age_minutes, apply_saved, peek_saved, DeskPersistence, DeskStore, Load, SavedState},
     views::Desk,
     DESK_CSS,
 };
@@ -66,14 +65,6 @@ struct Prepared {
     report: PreflightReport,
     persistence: Option<Rc<DeskPersistence>>,
     saved: SavedState,
-}
-
-/// What the store held for this world when preflight ran.
-enum SavedState {
-    None,
-    Found(Box<Saved<OverlayDoc>>),
-    Corrupt,
-    Unavailable(String),
 }
 
 /// What the operator entered last time, so a reload lands on the same picks.
@@ -262,15 +253,6 @@ async fn look_up(raw_token: String, input: String) -> Result<Tournament, String>
     })
 }
 
-async fn peek_saved(persistence: &DeskPersistence) -> SavedState {
-    match persistence.load_overlay().await {
-        Ok(Load::Loaded(saved)) => SavedState::Found(Box::new(saved)),
-        Ok(Load::None) => SavedState::None,
-        Ok(Load::Recovered) => SavedState::Corrupt,
-        Err(error) => SavedState::Unavailable(error),
-    }
-}
-
 /// Bootstraps the desk the way the TUI launches: fetch-failed events seed
 /// from the saved snapshot, the saved overlay rehydrates over the fresh
 /// state (its board wins), then the loops start.
@@ -297,27 +279,7 @@ async fn open_desk(prepared: Prepared) -> (Session, String) {
         None => Vec::new(),
     };
     let mut state = AppState::new(config, writes_armed, bootstraps, now);
-    match saved {
-        SavedState::Found(saved) => {
-            let Saved { saved_at, doc } = *saved;
-            state.apply_overlay(doc, now, true);
-            let text = format!("restored the desk state saved {}m ago", age_minutes(saved_at, now));
-            state.notice(now, NoticeLevel::Info, text);
-        }
-        SavedState::Corrupt => {
-            let text = "saved desk state was corrupt or from another version; it was set aside and this desk starts fresh";
-            state.notice(now, NoticeLevel::Warn, text);
-        }
-        SavedState::Unavailable(error) => {
-            state.persist_failed = true;
-            state.notice(
-                now,
-                NoticeLevel::Error,
-                format!("browser storage unavailable, nothing will be saved: {error}"),
-            );
-        }
-        SavedState::None => {}
-    }
+    apply_saved(&mut state, saved, now);
     state.mark_seeded_stale(&seeded, now);
     (start(tournament.source, state, classify_provider_error, persistence), label)
 }
@@ -351,10 +313,6 @@ fn chosen_events(tournament: &Tournament, selected: &BTreeSet<String>) -> Vec<Ev
 
 fn bare_slug(slug: &str) -> &str {
     slug.strip_prefix("tournament/").unwrap_or(slug)
-}
-
-fn age_minutes(at: UnixMillis, now: UnixMillis) -> i64 {
-    (now - at).max(0) / 60_000
 }
 
 fn seeded_types_text(event: &EventInfo) -> String {

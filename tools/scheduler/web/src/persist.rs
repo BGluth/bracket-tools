@@ -5,6 +5,7 @@
 use std::rc::Rc;
 
 use bracket_tools_scheduler_core::{
+    app::{AppState, NoticeLevel},
     conflict::UnixMillis,
     state_doc::{OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     timers::now_millis,
@@ -87,6 +88,53 @@ impl DeskPersistence {
             }
         }
     }
+}
+
+/// What the store holds for a world, read ahead of opening its desk.
+pub enum SavedState {
+    None,
+    Found(Box<Saved<OverlayDoc>>),
+    Corrupt,
+    Unavailable(String),
+}
+
+pub async fn peek_saved(persistence: &DeskPersistence) -> SavedState {
+    match persistence.load_overlay().await {
+        Ok(Load::Loaded(saved)) => SavedState::Found(Box::new(saved)),
+        Ok(Load::None) => SavedState::None,
+        Ok(Load::Recovered) => SavedState::Corrupt,
+        Err(error) => SavedState::Unavailable(error),
+    }
+}
+
+/// Rehydrates a found overlay over the fresh `state` (its board wins) and
+/// tells the operator what happened; an unavailable store raises the badge.
+pub fn apply_saved(state: &mut AppState, saved: SavedState, now: UnixMillis) {
+    match saved {
+        SavedState::Found(saved) => {
+            let Saved { saved_at, doc } = *saved;
+            state.apply_overlay(doc, now, true);
+            let text = format!("restored the desk state saved {}m ago", age_minutes(saved_at, now));
+            state.notice(now, NoticeLevel::Info, text);
+        }
+        SavedState::Corrupt => {
+            let text = "saved desk state was corrupt or from another version; it was set aside and this desk starts fresh";
+            state.notice(now, NoticeLevel::Warn, text);
+        }
+        SavedState::Unavailable(error) => {
+            state.persist_failed = true;
+            state.notice(
+                now,
+                NoticeLevel::Error,
+                format!("browser storage unavailable, nothing will be saved: {error}"),
+            );
+        }
+        SavedState::None => {}
+    }
+}
+
+pub fn age_minutes(at: UnixMillis, now: UnixMillis) -> i64 {
+    (now - at).max(0) / 60_000
 }
 
 fn stamped<T>(doc: &T) -> Saved<&T> {

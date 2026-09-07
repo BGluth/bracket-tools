@@ -1,5 +1,6 @@
 //! A token-free world for trying the desk: a synthetic tournament played
-//! forward on a fast clock, served by the fixture source.
+//! forward on a fast clock, served by the fixture source. The desk's state
+//! persists like a live one's; "reset" forgets it and boots a fresh world.
 
 use std::{rc::Rc, time::Duration};
 
@@ -14,6 +15,7 @@ use dioxus::prelude::*;
 
 use crate::{
     bridge::{start, Session},
+    persist::{apply_saved, peek_saved, DeskPersistence, DeskStore, SavedState},
     views::Desk,
     DESK_CSS,
 };
@@ -24,19 +26,50 @@ const SYNTH_SPEC: &str = "de:32,rr:8";
 const SPEED: f64 = 20.0;
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The scheduler over the demo world, booted on mount.
+/// The scheduler over the demo world. Each reset remounts the desk under a
+/// new key, which drops the previous world's tasks with its scope.
 #[component]
 pub fn DemoTool() -> Element {
+    let mut generation = use_signal(|| 0u32);
+    rsx! {
+        DemoDesk {
+            key: "{generation}",
+            on_reset: move |_| {
+                spawn(async move {
+                    if let Ok(store) = DeskStore::open().await {
+                        let _ = DeskPersistence::new(store, &demo_world()).forget().await;
+                    }
+                    generation += 1;
+                });
+            },
+        }
+    }
+}
+
+#[component]
+fn DemoDesk(on_reset: EventHandler<MouseEvent>) -> Element {
     let booted = use_resource(boot_demo);
     let booted: Option<Result<Session, String>> = booted.read().clone();
     rsx! {
         document::Link { rel: "stylesheet", href: DESK_CSS }
         match booted {
-            Some(Ok(session)) => rsx! { Desk { session, mode: "demo world" } },
+            Some(Ok(session)) => rsx! {
+                Desk {
+                    session,
+                    mode: "demo world",
+                    toolbar: rsx! {
+                        button { class: "quiet", onclick: move |event| on_reset.call(event), "reset demo" }
+                    },
+                }
+            },
             Some(Err(error)) => rsx! { div { class: "failed", "the demo world failed to boot: {error}" } },
             None => rsx! { div { class: "loading", "building the demo world…" } },
         }
     }
+}
+
+fn demo_world() -> String {
+    format!("demo:{SYNTH_SPEC}")
 }
 
 async fn boot_demo() -> Result<Session, String> {
@@ -52,6 +85,17 @@ async fn boot_demo() -> Result<Session, String> {
         rate_limit_waits: 0,
     };
     let report = preflight(&source, &config, PREFLIGHT_TIMEOUT, true, classify_fixture_error, &env).await;
-    let state = AppState::new(config, report.writes_armed, report.into_bootstraps(), now_millis());
-    Ok(start(Rc::new(source), state, classify_fixture_error, None))
+    let now = now_millis();
+    let mut state = AppState::new(config, report.writes_armed, report.into_bootstraps(), now);
+    // The fixture always answers, so only the overlay is restored (no snapshot seeding).
+    let (persistence, saved) = match DeskStore::open().await {
+        Ok(store) => {
+            let persistence = Rc::new(DeskPersistence::new(store, &demo_world()));
+            let saved = peek_saved(&persistence).await;
+            (Some(persistence), saved)
+        }
+        Err(error) => (None, SavedState::Unavailable(error)),
+    };
+    apply_saved(&mut state, saved, now);
+    Ok(start(Rc::new(source), state, classify_fixture_error, persistence))
 }

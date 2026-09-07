@@ -14,8 +14,9 @@ use dioxus::prelude::*;
 
 use crate::bridge::Session;
 
+/// The desk; `toolbar` adds shell-specific controls next to undo.
 #[component]
-pub fn Desk(session: Session, mode: String) -> Element {
+pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] toolbar: Element) -> Element {
     let (writes_armed, persist_failed) = {
         let state = session.state.read();
         (state.writes_armed, state.persist_failed)
@@ -30,6 +31,7 @@ pub fn Desk(session: Session, mode: String) -> Element {
                 if persist_failed {
                     span { class: "writes armed", "saves failing" }
                 }
+                {toolbar}
                 button { class: "quiet", onclick: dispatcher(&session, UiAction::Undo), "undo" }
             }
             Stations { session: session.clone() }
