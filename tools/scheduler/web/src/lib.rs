@@ -5,6 +5,7 @@ mod bridge;
 mod demo;
 mod live;
 mod modals;
+mod page;
 mod persist;
 mod views;
 

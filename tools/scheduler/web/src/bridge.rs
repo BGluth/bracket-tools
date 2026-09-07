@@ -8,6 +8,7 @@ use std::{collections::HashSet, rc::Rc, time::Duration};
 use bracket_tools_scheduler_core::{
     app::{update, AppState, Msg, PollFailure},
     conflict::UnixMillis,
+    keymap::Key,
     model::BracketId,
     poller::{run_poller, PollerConfig},
     set_source::SetSource,
@@ -29,11 +30,25 @@ const SAVE_DEBOUNCE_MS: UnixMillis = 2000;
 pub struct Session {
     pub state: Signal<AppState>,
     inbox: Signal<UnboundedSender<Msg>>,
+    persistence: Signal<Option<Rc<DeskPersistence>>>,
 }
 
 impl Session {
     pub fn dispatch(&self, action: UiAction) {
         let _ = self.inbox.read().send(Msg::Action(action));
+    }
+
+    /// A key from the page, resolved through the core's keymap.
+    pub fn send_key(&self, key: Key) {
+        let _ = self.inbox.read().send(Msg::Key(key));
+    }
+
+    /// Saves whatever is dirty now, ahead of the debounce (the page is
+    /// hiding or unloading).
+    pub fn flush(&self) {
+        if let Some(persistence) = self.persistence.read().as_ref() {
+            save_dirty(self.state, persistence);
+        }
     }
 }
 
@@ -88,6 +103,7 @@ where
             }
         }
     });
+    let drain_persistence = persistence.clone();
     spawn(async move {
         let mut last_save: UnixMillis = 0;
         while let Some(msg) = rx.recv().await {
@@ -98,7 +114,7 @@ where
             for intent in effects.writes.drain(..) {
                 let _ = write_tx.send(intent);
             }
-            if let Some(persistence) = &persistence {
+            if let Some(persistence) = &drain_persistence {
                 save_if_due(state, persistence, &mut last_save);
             }
         }
@@ -106,21 +122,31 @@ where
     Session {
         state,
         inbox: Signal::new(tx),
+        persistence: Signal::new(persistence),
     }
 }
 
-/// Saves whatever is dirty once the debounce window has passed; the writes
-/// run as their own tasks and report back into the persistence badge.
-fn save_if_due(mut state: Signal<AppState>, persistence: &Rc<DeskPersistence>, last_save: &mut UnixMillis) {
+/// Saves once the debounce window has passed since the last save.
+fn save_if_due(state: Signal<AppState>, persistence: &Rc<DeskPersistence>, last_save: &mut UnixMillis) {
     let now = now_millis();
+    let dirty = {
+        let s = state.read();
+        s.overlay_dirty || s.snapshot_dirty
+    };
+    if !dirty || now - *last_save < SAVE_DEBOUNCE_MS {
+        return;
+    }
+    *last_save = now;
+    save_dirty(state, persistence);
+}
+
+/// Saves whatever is dirty; the writes run as their own tasks and report
+/// back into the persistence badge.
+fn save_dirty(mut state: Signal<AppState>, persistence: &Rc<DeskPersistence>) {
     let (overlay, snapshot) = {
         let s = state.read();
         (s.overlay_dirty, s.snapshot_dirty)
     };
-    if !(overlay || snapshot) || now - *last_save < SAVE_DEBOUNCE_MS {
-        return;
-    }
-    *last_save = now;
     if overlay {
         let doc = state.with_mut(|s| {
             s.overlay_dirty = false;

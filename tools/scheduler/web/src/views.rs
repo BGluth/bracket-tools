@@ -12,12 +12,13 @@ use bracket_tools_scheduler_core::{
 };
 use dioxus::prelude::*;
 
-use crate::{bridge::Session, modals::Modals};
+use crate::{bridge::Session, modals::Modals, page::use_page_events};
 
 /// The desk; `toolbar` adds shell-specific controls next to undo.
 #[component]
 pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] toolbar: Element) -> Element {
-    let (writes_armed, persist_failed, blocked, pending, parked) = {
+    use_page_events(session.clone());
+    let (writes_armed, persist_failed, blocked, pending, parked, digits) = {
         let state = session.state.read();
         (
             state.writes_armed,
@@ -25,6 +26,7 @@ pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] t
             state.world.blocked.len(),
             state.pending_writes.len(),
             state.pending_writes.iter().filter(|w| w.status == PendingStatus::Parked).count(),
+            state.ui.setup_entry.as_ref().map(|entry| entry.digits.clone()),
         )
     };
     rsx! {
@@ -36,6 +38,9 @@ pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] t
                 }
                 if persist_failed {
                     span { class: "writes armed", "saves failing" }
+                }
+                if let Some(digits) = digits {
+                    span { class: "hint", "setup {digits}_" }
                 }
                 div { class: "tools",
                     {toolbar}
