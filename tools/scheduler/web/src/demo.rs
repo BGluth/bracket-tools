@@ -4,6 +4,7 @@
 use std::{rc::Rc, time::Duration};
 
 use bracket_tools_scheduler_core::{
+    app::AppState,
     fixture_source::{classify_fixture_error, FixtureSource},
     preflight::{preflight, PreflightEnv},
     rehearsal::install_rehearsal,
@@ -51,12 +52,6 @@ async fn boot_demo() -> Result<Session, String> {
         rate_limit_waits: 0,
     };
     let report = preflight(&source, &config, PREFLIGHT_TIMEOUT, true, classify_fixture_error, &env).await;
-    let writes_armed = report.writes_armed;
-    Ok(start(
-        Rc::new(source),
-        config,
-        writes_armed,
-        report.into_bootstraps(),
-        classify_fixture_error,
-    ))
+    let state = AppState::new(config, report.writes_armed, report.into_bootstraps(), now_millis());
+    Ok(start(Rc::new(source), state, classify_fixture_error, None))
 }

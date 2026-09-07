@@ -7,5 +7,13 @@ license.workspace = true
 [dependencies]
 bracket-tools-scheduler-core = { path = "../core" }
 bracket-tools-startgg = { path = "../../../crates/bracket-tools-startgg", default-features = false }
+cfg-if = { workspace = true }
 dioxus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# IndexedDB for the desk's crash-recovery documents.
+idb = "0.6"
+wasm-bindgen = "0.2"

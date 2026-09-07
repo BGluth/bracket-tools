@@ -26,7 +26,7 @@ use bracket_tools_scheduler::{
     ui,
 };
 use bracket_tools_scheduler_core::{
-    app::{update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, PollHealth, SimUrgency, UpdateEffects, WriteIntent},
+    app::{seed_from_snapshot, update, AppState, BracketBootstrap, Msg, NoticeLevel, PollFailure, SimUrgency, UpdateEffects, WriteIntent},
     config::{referenced_types, resolve_roster, write_starter_template, SetupCounts},
     conflict::UnixMillis,
     fixture_source::{classify_fixture_error, FixtureSource},
@@ -438,7 +438,7 @@ where
     let mut bootstraps = report.into_bootstraps();
     // Events preflight couldn't fetch open on the persisted last-good
     // snapshot (stale-flagged) instead of a blank table.
-    let seeded = seed_from_snapshot(&mut bootstraps, &snapshot_path);
+    let seeded = seed_from_snapshot_file(&mut bootstraps, &snapshot_path);
     let events: Vec<BracketId> = bootstraps.iter().map(|b| b.id.clone()).collect();
     // Events whose preflight structure fetch failed (rate limit, blip)
     // launched without phase groups; the poller back-fills them.
@@ -447,7 +447,7 @@ where
     // --setups pins the roster for this run; otherwise the persisted board
     // (crash recovery / cross-session carryover) wins.
     restore_overlay(&mut state, &state_path, cli.setups.is_none());
-    mark_seeded_stale(&mut state, &seeded);
+    state.mark_seeded_stale(&seeded, now_millis());
 
     let (tx, rx) = unbounded_channel::<Msg>();
     let mut tasks = Tasks::new(
@@ -533,44 +533,13 @@ fn persisted_path(configured: Option<&Path>, default: &str, offline: bool) -> Pa
     }
 }
 
-/// Fills fetch-failed bootstraps from the persisted last-good snapshot.
-/// Returns what was seeded, with each table's capture time (for staleness).
-fn seed_from_snapshot(bootstraps: &mut [BracketBootstrap], path: &Path) -> Vec<(BracketId, UnixMillis)> {
-    let doc = match load_snapshot(path) {
-        Ok(Load::Loaded(doc)) => doc,
+/// Fills fetch-failed bootstraps from the persisted last-good snapshot file.
+fn seed_from_snapshot_file(bootstraps: &mut [BracketBootstrap], path: &Path) -> Vec<(BracketId, UnixMillis)> {
+    match load_snapshot(path) {
+        Ok(Load::Loaded(doc)) => seed_from_snapshot(bootstraps, &doc),
         // A corrupt snapshot is just a lost cache; overlay recovery already
         // warns loudly, so start cold quietly.
-        Ok(Load::Recovered(_)) | Ok(Load::None) | Err(_) => return Vec::new(),
-    };
-    let mut seeded = Vec::new();
-    for boot in bootstraps.iter_mut() {
-        if !boot.sets.is_empty() {
-            continue;
-        }
-        let Some(snap) = doc.brackets.iter().find(|b| b.id == boot.id && !b.sets.is_empty()) else {
-            continue;
-        };
-        boot.sets = snap.sets.clone();
-        if boot.groups.is_empty() {
-            boot.groups = snap.groups.clone();
-        }
-        seeded.push((boot.id.clone(), snap.captured_at));
-    }
-    seeded
-}
-
-/// Stamps snapshot-seeded brackets with their true capture age (the staleness
-/// badge must not read "fresh") and says so.
-fn mark_seeded_stale(state: &mut AppState, seeded: &[(BracketId, UnixMillis)]) {
-    let now = now_millis();
-    for (id, captured_at) in seeded {
-        if let Some(runtime) = state.brackets.iter_mut().find(|b| &b.state.id == id) {
-            runtime.last_good_poll = (*captured_at > 0).then_some(*captured_at);
-            runtime.health = PollHealth::Offline;
-        }
-        let age_secs = (now - captured_at) / 1000;
-        let text = format!("{}: seeded from the snapshot file ({}m old) — poller retries", id.0, age_secs / 60);
-        state.notice(now, NoticeLevel::Warn, text);
+        Ok(Load::Recovered(_)) | Ok(Load::None) | Err(_) => Vec::new(),
     }
 }
 
@@ -602,32 +571,15 @@ fn restore_overlay(state: &mut AppState, path: &Path, adopt_roster: bool) {
 /// One overlay save, tracking the badge through failure and recovery.
 fn persist_overlay(state: &mut AppState, path: &Path) {
     let result = save_overlay(path, &state.to_overlay());
-    track_persist_outcome(state, result.err().map(|e| e.to_string()));
+    state.record_persist_outcome(result.err().map(|e| e.to_string()), now_millis());
     state.overlay_dirty = false;
 }
 
 /// One snapshot-file save; shares the badge with the overlay.
 fn persist_snapshot(state: &mut AppState, path: &Path) {
     let result = save_snapshot(path, &state.to_snapshot());
-    track_persist_outcome(state, result.err().map(|e| e.to_string()));
+    state.record_persist_outcome(result.err().map(|e| e.to_string()), now_millis());
     state.snapshot_dirty = false;
-}
-
-fn track_persist_outcome(state: &mut AppState, error: Option<String>) {
-    match error {
-        None => {
-            if state.persist_failed {
-                state.notice(now_millis(), NoticeLevel::Info, "state files writable again");
-            }
-            state.persist_failed = false;
-        }
-        Some(e) => {
-            if !state.persist_failed {
-                state.notice(now_millis(), NoticeLevel::Error, format!("state save failed: {e}"));
-            }
-            state.persist_failed = true;
-        }
-    }
 }
 
 async fn event_loop<S, F>(

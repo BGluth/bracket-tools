@@ -933,6 +933,43 @@ impl AppState {
         }
     }
 
+    /// Stamps snapshot-seeded brackets with their true capture age (the
+    /// staleness badge must not read "fresh") and says so.
+    pub fn mark_seeded_stale(&mut self, seeded: &[(BracketId, UnixMillis)], now_millis: UnixMillis) {
+        for (id, captured_at) in seeded {
+            if let Some(runtime) = self.brackets.iter_mut().find(|b| &b.state.id == id) {
+                runtime.last_good_poll = (*captured_at > 0).then_some(*captured_at);
+                runtime.health = PollHealth::Offline;
+            }
+            let age_secs = (now_millis - captured_at) / 1000;
+            let text = format!(
+                "{}: seeded from the last saved snapshot ({}m old) — poller retries",
+                id.0,
+                age_secs / 60
+            );
+            self.notice(now_millis, NoticeLevel::Warn, text);
+        }
+    }
+
+    /// Tracks the persistence badge through failure and recovery: one Error
+    /// notice when saves start failing, one Info once they work again.
+    pub fn record_persist_outcome(&mut self, error: Option<String>, now_millis: UnixMillis) {
+        match error {
+            None => {
+                if self.persist_failed {
+                    self.notice(now_millis, NoticeLevel::Info, "state saves working again");
+                }
+                self.persist_failed = false;
+            }
+            Some(e) => {
+                if !self.persist_failed {
+                    self.notice(now_millis, NoticeLevel::Error, format!("state save failed: {e}"));
+                }
+                self.persist_failed = true;
+            }
+        }
+    }
+
     /// Clones everything a background rollout evaluation needs (the simulator
     /// task borrows nothing from the Elm loop).
     pub fn sim_snapshot(&self, now_millis: UnixMillis) -> SimSnapshot {
@@ -971,6 +1008,26 @@ impl AppState {
         let ix = self.bracket_ix(bracket)?;
         self.brackets[ix].state.sets.iter().find(|s| &s.key == key)
     }
+}
+
+/// Fills fetch-failed bootstraps from the last-good snapshot. Returns what
+/// was seeded, with each table's capture time (for staleness).
+pub fn seed_from_snapshot(bootstraps: &mut [BracketBootstrap], doc: &SnapshotDoc) -> Vec<(BracketId, UnixMillis)> {
+    let mut seeded = Vec::new();
+    for boot in bootstraps.iter_mut() {
+        if !boot.sets.is_empty() {
+            continue;
+        }
+        let Some(snap) = doc.brackets.iter().find(|b| b.id == boot.id && !b.sets.is_empty()) else {
+            continue;
+        };
+        boot.sets = snap.sets.clone();
+        if boot.groups.is_empty() {
+            boot.groups = snap.groups.clone();
+        }
+        seeded.push((boot.id.clone(), snap.captured_at));
+    }
+    seeded
 }
 
 pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateEffects {

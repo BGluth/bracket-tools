@@ -4,6 +4,7 @@
 mod bridge;
 mod demo;
 mod live;
+mod persist;
 mod views;
 
 pub use demo::DemoTool;

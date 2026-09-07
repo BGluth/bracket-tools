@@ -1,12 +1,13 @@
 //! The Elm loop over the scheduler core, driven by the platform's task
 //! runtime: the poller, writer and tick feed one inbox, one drain task
-//! applies every message to the shared state and routes the effects.
+//! applies every message to the shared state, routes the effects and
+//! debounces the saves.
 
 use std::{collections::HashSet, rc::Rc, time::Duration};
 
 use bracket_tools_scheduler_core::{
-    app::{update, AppState, BracketBootstrap, Msg, PollFailure},
-    config::SchedulerConfig,
+    app::{update, AppState, Msg, PollFailure},
+    conflict::UnixMillis,
     model::BracketId,
     poller::{run_poller, PollerConfig},
     set_source::SetSource,
@@ -16,6 +17,11 @@ use bracket_tools_scheduler_core::{
 };
 use dioxus::prelude::*;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+
+use crate::persist::DeskPersistence;
+
+/// Quiet time after a change before the overlay and snapshot are saved.
+const SAVE_DEBOUNCE_MS: UnixMillis = 2000;
 
 /// A running desk: the state every view reads and the inbox every view and
 /// background task writes to.
@@ -31,21 +37,29 @@ impl Session {
     }
 }
 
-/// Starts the background tasks over `source` and hands back the session.
+/// Starts the background tasks over `source` for an already-bootstrapped
+/// (and possibly restored) `state`, saving through `persistence` when given.
 /// Must run inside a component or one of its tasks.
-pub fn start<S, F>(source: Rc<S>, config: SchedulerConfig, writes_armed: bool, bootstraps: Vec<BracketBootstrap>, classify: F) -> Session
+pub fn start<S, F>(source: Rc<S>, state: AppState, classify: F, persistence: Option<Rc<DeskPersistence>>) -> Session
 where
     S: SetSource + 'static,
     F: Fn(&S::Error) -> PollFailure + Clone + 'static,
 {
-    let needs_structure: HashSet<BracketId> = bootstraps.iter().filter(|b| b.groups.is_empty()).map(|b| b.id.clone()).collect();
-    let events: Vec<BracketId> = bootstraps.iter().map(|b| b.id.clone()).collect();
-    let mut state = Signal::new(AppState::new(config.clone(), writes_armed, bootstraps, now_millis()));
+    let events: Vec<BracketId> = state.brackets.iter().map(|b| b.state.id.clone()).collect();
+    // Brackets whose structure never arrived (preflight blip or a snapshot
+    // seed without groups) get it back-filled by the poller.
+    let needs_structure: HashSet<BracketId> = state
+        .brackets
+        .iter()
+        .filter(|b| b.state.groups.is_empty())
+        .map(|b| b.state.id.clone())
+        .collect();
+    let poller_config = PollerConfig::from_scheduler(&state.config);
+    let mut state = Signal::new(state);
     let (tx, mut rx) = unbounded_channel::<Msg>();
     let (force_tx, force_rx) = unbounded_channel::<BracketId>();
     let (write_tx, write_rx) = unbounded_channel();
 
-    let poller_config = PollerConfig::from_scheduler(&config);
     let poll_source = source.clone();
     let poll_classify = classify.clone();
     let poll_tx = tx.clone();
@@ -75,6 +89,7 @@ where
         }
     });
     spawn(async move {
+        let mut last_save: UnixMillis = 0;
         while let Some(msg) = rx.recv().await {
             let mut effects = state.with_mut(|s| update(s, msg, now_millis()));
             for bracket in effects.force_poll.drain(..) {
@@ -83,10 +98,49 @@ where
             for intent in effects.writes.drain(..) {
                 let _ = write_tx.send(intent);
             }
+            if let Some(persistence) = &persistence {
+                save_if_due(state, persistence, &mut last_save);
+            }
         }
     });
     Session {
         state,
         inbox: Signal::new(tx),
+    }
+}
+
+/// Saves whatever is dirty once the debounce window has passed; the writes
+/// run as their own tasks and report back into the persistence badge.
+fn save_if_due(mut state: Signal<AppState>, persistence: &Rc<DeskPersistence>, last_save: &mut UnixMillis) {
+    let now = now_millis();
+    let (overlay, snapshot) = {
+        let s = state.read();
+        (s.overlay_dirty, s.snapshot_dirty)
+    };
+    if !(overlay || snapshot) || now - *last_save < SAVE_DEBOUNCE_MS {
+        return;
+    }
+    *last_save = now;
+    if overlay {
+        let doc = state.with_mut(|s| {
+            s.overlay_dirty = false;
+            s.to_overlay()
+        });
+        let persistence = persistence.clone();
+        spawn(async move {
+            let outcome = persistence.save_overlay(&doc).await.err();
+            state.with_mut(|s| s.record_persist_outcome(outcome, now_millis()));
+        });
+    }
+    if snapshot {
+        let doc = state.with_mut(|s| {
+            s.snapshot_dirty = false;
+            s.to_snapshot()
+        });
+        let persistence = persistence.clone();
+        spawn(async move {
+            let outcome = persistence.save_snapshot(&doc).await.err();
+            state.with_mut(|s| s.record_persist_outcome(outcome, now_millis()));
+        });
     }
 }
