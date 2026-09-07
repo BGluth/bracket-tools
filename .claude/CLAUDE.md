@@ -13,13 +13,14 @@ Rust mono-repo for esports tournament tooling targeting the start.gg platform, b
 | bracket-tools-startgg | crates/bracket-tools-startgg | Main SDK: caching, rate-limited start.gg client |
 | bracket-tools-scheduler-core | tools/scheduler/core | Scheduler core: bracket model, scheduling, Elm loop, poll/write loops (also builds for wasm32) |
 | bracket-tools-scheduler | tools/scheduler/tui | `scheduler` TUI for the TO desk over the core (runs live at events) |
-| bracket-tools-app | tools/app | Dioxus browser + desktop shell over the scheduler core (`dx serve` in that dir; demo world, no token yet) |
+| bracket-tools-scheduler-web | tools/scheduler/web | Scheduler browser/desktop UI: Dioxus components over the core (`SchedulerTool`, `DemoTool`), mounted by the app |
+| bracket-tools-app | tools/app | Dioxus site shell: router, home, settings (start.gg token in localStorage); mounts the tool crates as routes (`dx serve` in that dir) |
 | bracket-tools-admin | tools/admin | `gg-admin` CLI: registration admin (roster / add / find / pool) |
 | reporter-cli, reporter-state | tools/reporter/* | ratatui set-reporting TUI + its store layer (early) |
 | bracket-tools-daemon | tools/daemon | Background scraper daemon (skeleton) |
 | edmonton-smash | web/edmonton-smash | Leptos community site (not in the workspace yet) |
 
-Per-crate file maps and design rationale live in the project's auto-memory as cold `architecture_*` files (`architecture_sdk`, `architecture_scheduler`, `architecture_admin_tool`, `architecture_repo_layout`). Grep the crate name there before orienting in a crate; there is no in-repo codebase map.
+Per-crate file maps and design rationale live in the project's auto-memory as cold `architecture_*` files (`architecture_sdk`, `architecture_scheduler`, `architecture_app`, `architecture_admin_tool`, `architecture_repo_layout`). Grep the crate name there before orienting in a crate; there is no in-repo codebase map.
 
 ## Where state lives
 

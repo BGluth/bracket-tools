@@ -1,40 +1,22 @@
 :root { color-scheme: dark; --bg: #14161a; --panel: #1e2127; --line: #2c3038; --text: #e6e6e6; --dim: #9aa0a8; --free: #2f7d4f; --called: #b8860b; --busy: #8b3a3a; --accent: #4c8dff; }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; }
-header { display: flex; align-items: baseline; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+a { color: var(--accent); }
+header { display: flex; align-items: baseline; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
 header h1 { margin: 0; font-size: 18px; }
-header .mode { color: var(--dim); }
-header button { margin-left: auto; }
-.desk { padding: 12px 16px; display: grid; gap: 12px; }
-.stations { display: flex; flex-wrap: wrap; gap: 8px; }
-.station { min-width: 150px; padding: 8px; border-radius: 6px; background: var(--panel); border-left: 4px solid var(--line); }
-.station.free { border-left-color: var(--free); }
-.station.called { border-left-color: var(--called); }
-.station.in-progress { border-left-color: var(--busy); }
-.station .placard { font-weight: 700; font-size: 16px; }
-.station .type { margin-left: 6px; color: var(--dim); font-weight: 400; font-size: 12px; }
-.station .occupant { min-height: 2.8em; color: var(--dim); }
-.station .actions { display: flex; gap: 4px; flex-wrap: wrap; }
-.columns { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
-section h2, aside h2 { margin: 0 0 6px; font-size: 14px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
-table { width: 100%; border-collapse: collapse; background: var(--panel); }
-th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
-th { color: var(--dim); font-weight: 500; }
-td.num { text-align: right; font-variant-numeric: tabular-nums; }
+header h1 a { color: var(--text); text-decoration: none; }
+header nav { display: flex; gap: 14px; margin-left: auto; }
+header nav a { color: var(--dim); text-decoration: none; }
+header nav a.active { color: var(--text); }
 button { background: var(--accent); color: white; border: 0; border-radius: 4px; padding: 3px 8px; cursor: pointer; }
 button.quiet { background: var(--line); color: var(--text); }
-.summary { padding: 6px 8px; margin-bottom: 6px; background: var(--panel); border-radius: 4px; display: flex; gap: 10px; flex-wrap: wrap; }
-.notice { padding: 4px 8px; border-left: 3px solid var(--line); margin-bottom: 4px; display: flex; gap: 8px; align-items: center; }
-.notice.warn { border-left-color: var(--called); }
-.notice.error { border-left-color: var(--busy); }
-.notice.acked { color: var(--dim); }
-.notice .text { flex: 1; }
-.modal { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: grid; place-items: center; }
-.dialog { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 420px; max-height: 80vh; overflow: auto; }
-.dialog h2 { text-transform: none; font-size: 16px; color: var(--text); }
-.dialog .hint { margin-left: 8px; color: var(--dim); font-size: 12px; }
-.dialog ul { list-style: none; padding: 0; margin: 0 0 10px; }
-.dialog li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
-.dialog li .label { flex: 1; }
-.dialog li.hold { color: var(--dim); }
-.loading, .failed { padding: 40px; text-align: center; color: var(--dim); }
+.page { padding: 12px 16px; display: grid; gap: 12px; max-width: 720px; }
+.page h2 { margin: 0; font-size: 16px; }
+.dim { color: var(--dim); }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.card { display: block; padding: 12px; background: var(--panel); border-radius: 6px; border-left: 4px solid var(--accent); color: var(--text); text-decoration: none; }
+.card h3 { margin: 0 0 4px; font-size: 15px; }
+.card p { margin: 0; color: var(--dim); }
+.field { display: grid; gap: 4px; }
+.field input { padding: 6px 8px; background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; font: inherit; }
+.row { display: flex; gap: 8px; align-items: center; }

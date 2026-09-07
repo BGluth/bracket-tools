@@ -1,13 +1,16 @@
-//! The browser and desktop shell over the scheduler core: the same Elm
-//! loop the TUI runs, rendered with Dioxus.
+//! The tools site: a shell with a home page, the settings page, and one
+//! route per tool component.
 
-mod bridge;
-mod demo;
-mod views;
+mod home;
+mod settings;
 
+use bracket_tools_scheduler_web::{DemoTool, SchedulerTool};
 use dioxus::prelude::*;
 
-use crate::{bridge::Session, demo::boot_demo, views::Desk};
+use crate::{
+    home::Home,
+    settings::{provide_settings, use_settings, Settings},
+};
 
 const MAIN_CSS: Asset = asset!("/assets/main.css");
 
@@ -15,23 +18,51 @@ fn main() {
     dioxus::launch(App);
 }
 
+#[derive(Routable, Clone, PartialEq)]
+enum Route {
+    #[layout(Shell)]
+    #[route("/")]
+    Home {},
+    #[route("/scheduler")]
+    Scheduler {},
+    #[route("/scheduler/demo")]
+    SchedulerDemo {},
+    #[route("/settings")]
+    Settings {},
+}
+
 #[component]
 fn App() -> Element {
-    let session = use_resource(boot_demo);
-    let booted: Option<Result<Session, String>> = session.read().clone();
     rsx! {
         document::Link { rel: "stylesheet", href: MAIN_CSS }
+        Router::<Route> {}
+    }
+}
+
+/// The header and navigation around every page; owns the site settings.
+#[component]
+fn Shell() -> Element {
+    provide_settings();
+    rsx! {
         header {
-            h1 { "bracket-tools" }
-            span { class: "mode", "demo world" }
-            if let Some(Ok(session)) = booted.clone() {
-                button { class: "quiet", onclick: move |_| session.dispatch(bracket_tools_scheduler_core::ui_action::UiAction::Undo), "undo" }
+            h1 { Link { to: Route::Home {}, "bracket-tools" } }
+            nav {
+                Link { to: Route::Scheduler {}, active_class: "active", "scheduler" }
+                Link { to: Route::SchedulerDemo {}, active_class: "active", "demo" }
+                Link { to: Route::Settings {}, active_class: "active", "settings" }
             }
         }
-        match booted {
-            Some(Ok(session)) => rsx! { Desk { session } },
-            Some(Err(error)) => rsx! { div { class: "failed", "the demo world failed to boot: {error}" } },
-            None => rsx! { div { class: "loading", "building the demo world…" } },
-        }
+        Outlet::<Route> {}
     }
+}
+
+#[component]
+fn Scheduler() -> Element {
+    let settings = use_settings();
+    rsx! { SchedulerTool { token: settings.token() } }
+}
+
+#[component]
+fn SchedulerDemo() -> Element {
+    rsx! { DemoTool {} }
 }

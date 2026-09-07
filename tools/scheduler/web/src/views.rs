@@ -15,9 +15,13 @@ use dioxus::prelude::*;
 use crate::bridge::Session;
 
 #[component]
-pub fn Desk(session: Session) -> Element {
+pub fn Desk(session: Session, mode: String) -> Element {
     rsx! {
         main { class: "desk",
+            div { class: "toolbar",
+                span { class: "mode", {mode} }
+                button { class: "quiet", onclick: dispatcher(&session, UiAction::Undo), "undo" }
+            }
             Stations { session: session.clone() }
             section { class: "columns",
                 Queue { session: session.clone() }
@@ -26,7 +30,7 @@ pub fn Desk(session: Session) -> Element {
                     Notices { session: session.clone() }
                 }
             }
-            Picker { session }
+            Picker { session: session.clone() }
         }
     }
 }
