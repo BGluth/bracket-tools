@@ -5,6 +5,7 @@
 use bracket_tools_scheduler::{
     app::{update, AppState, BracketBootstrap, Msg, PollOutcome, PollResult},
     config::{BracketConfig, BracketMode, SchedulerConfig, SetupCounts},
+    keymap::Key,
     model::{live_sets_from_schema, BracketId, LiveSet, Prereq, SetId, Slot},
     synth::{make_de_bracket, SynthBracket},
     ui,
@@ -13,7 +14,6 @@ use bracket_tools_startgg_schema::{
     get_sets_for_event::{Entrant, Participant, PhaseGroup, Player, Set, SetSlot},
     scalars::Id,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
 
 const NOW: i64 = 1_751_000_000_000;
@@ -182,13 +182,9 @@ fn adversarial_snapshot_survives_the_full_pipeline() {
     // Keys, picker, ticks, and rendering must all survive the nonsense.
     render(&state);
     for key in ['1', 'z', 'u', 'p', 'f', 'r', '/', 'x', 't'] {
-        update(
-            &mut state,
-            Msg::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
-            NOW + 2000,
-        );
+        update(&mut state, Msg::Key(Key::Char(key)), NOW + 2000);
     }
-    update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), NOW + 2000);
+    update(&mut state, Msg::Key(Key::Enter), NOW + 2000);
     update(&mut state, Msg::Tick, NOW + 3000);
     render(&state);
 }

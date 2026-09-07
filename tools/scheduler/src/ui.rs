@@ -18,10 +18,11 @@ use ratatui::{
 use crate::{
     app::{
         blocked_entries, filtered_roster, find_set_rows, flag_label, picker_rows, reassign_options, report_roster, setups_rows, AppState,
-        ListView, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, SetupsRow, Side,
+        ListView, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, SetupsRow,
     },
     conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
     model::{strip_sponsor, BracketId, SetKey},
+    ui_action::Side,
     world::RolloutRow,
 };
 
@@ -1041,13 +1042,13 @@ fn fmt_clock(millis: UnixMillis) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
 
     use super::draw;
     use crate::{
         app::{update, AppState, BracketBootstrap, Msg},
         config::{BracketConfig, BracketMode, CallAction, SchedulerConfig, SetupCounts, DEFAULT_SETUP_TYPE},
+        keymap::Key,
         model::BracketId,
         synth::{make_se_bracket, materialize_ids},
     };
@@ -1112,8 +1113,8 @@ mod tests {
     #[test]
     fn armed_banner_and_called_setup_render() {
         let mut state = test_state(true);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)), NOW);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('1')), NOW);
+        update(&mut state, Msg::Key(Key::Enter), NOW);
 
         let text = render(&state);
         assert!(text.contains("WRITES ARMED"), "armed banner:\n{text}");
@@ -1135,17 +1136,17 @@ mod tests {
                 name: "Fox".to_owned(),
             },
         ];
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)), NOW);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), NOW);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('1')), NOW);
+        update(&mut state, Msg::Key(Key::Enter), NOW);
+        update(&mut state, Msg::Key(Key::Char('g')), NOW);
 
         let text = render(&state);
         assert!(text.contains("Report —"), "report title:\n{text}");
         assert!(text.contains("score:"), "score line:\n{text}");
 
         // The character picker stage shows the filtered roster.
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)), NOW);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('c')), NOW);
+        update(&mut state, Msg::Key(Key::Char('f')), NOW);
         let text = render(&state);
         assert!(text.contains("character for"), "picker prompt:\n{text}");
         assert!(text.contains("Fox"), "filtered roster:\n{text}");
@@ -1154,7 +1155,7 @@ mod tests {
     #[test]
     fn call_picker_modal_renders_candidates() {
         let mut state = test_state(false);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('2')), NOW);
 
         let text = render(&state);
         assert!(text.contains("Call on setup 2"), "picker title:\n{text}");
@@ -1190,7 +1191,7 @@ mod tests {
             }),
             NOW,
         );
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('2')), NOW);
 
         let text = render(&state);
         assert!(text.contains("[rollout"), "rollout-labeled title:\n{text}");
@@ -1203,9 +1204,9 @@ mod tests {
         let mut state = test_state(false);
         // Call R1 A: the final stays blocked on slots; the other R1 set on
         // player-busy checks isn't (players are disjoint in an SE4).
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)), NOW);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), NOW);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('1')), NOW);
+        update(&mut state, Msg::Key(Key::Enter), NOW);
+        update(&mut state, Msg::Key(Key::Char('i')), NOW);
 
         let text = render(&state);
         assert!(text.contains("Blocked sets"), "inspection title:\n{text}");
@@ -1216,7 +1217,7 @@ mod tests {
     fn notices_page_renders_with_unread_count() {
         let mut state = test_state(false);
         state.notice(NOW, crate::app::NoticeLevel::Warn, "wifi looked shaky");
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('n')), NOW);
 
         let text = render(&state);
         assert!(text.contains("Notices (1 unread)"), "notices title:\n{text}");
@@ -1227,17 +1228,13 @@ mod tests {
     fn pending_writes_view_renders_divergence_ledger() {
         let mut state = test_state(true);
         // Call on setup 1, then no-show re-queue: suppress_remote_called set.
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)), NOW);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('1')), NOW);
+        update(&mut state, Msg::Key(Key::Enter), NOW);
         let (bracket, set_key) = {
             let pending = &state.pending_writes[0].intent;
             (pending.bracket.clone(), pending.key.clone())
         };
-        update(
-            &mut state,
-            Msg::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
-            NOW + 1000,
-        );
+        update(&mut state, Msg::Key(Key::Char('r')), NOW + 1000);
 
         // The site still shows the set CALLED (state int 6).
         let ix = state.brackets.iter().position(|b| b.state.id == bracket).unwrap();
@@ -1245,11 +1242,7 @@ mod tests {
         set.state_int = Some(6);
         state.called_ints = vec![6];
 
-        update(
-            &mut state,
-            Msg::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
-            NOW + 2000,
-        );
+        update(&mut state, Msg::Key(Key::Char('w')), NOW + 2000);
         let text = render(&state);
         assert!(text.contains("Pending writes"), "writes title:\n{text}");
         assert!(
@@ -1269,7 +1262,7 @@ mod tests {
     #[test]
     fn help_overlay_renders() {
         let mut state = test_state(false);
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('?')), NOW);
 
         let text = render(&state);
         assert!(text.contains("snooze the highlighted queue entry"), "help body:\n{text}");
@@ -1283,9 +1276,9 @@ mod tests {
         for id in 3..=30 {
             state.board.add_setup(crate::config::SetupId(id), "default".to_owned());
         }
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Char('s')), NOW);
         for _ in 0..30 {
-            update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)), NOW);
+            update(&mut state, Msg::Key(Key::Down), NOW);
         }
 
         let text = render(&state);
@@ -1296,7 +1289,7 @@ mod tests {
         // bottom edge).
         let offset = state.ui.modal_view.scroll.get();
         assert!(offset > 0, "the long list scrolled");
-        update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)), NOW);
+        update(&mut state, Msg::Key(Key::Up), NOW);
         render(&state);
         assert_eq!(
             state.ui.modal_view.scroll.get(),

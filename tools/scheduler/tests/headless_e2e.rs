@@ -12,12 +12,12 @@ use bracket_tools_scheduler::{
     app::{update, AppState, Msg, PollFailure},
     config::{BracketConfig, SchedulerConfig, SetupCounts},
     fixture_source::{classify_fixture_error, FixtureSource},
+    keymap::Key,
     model::BracketId,
     poller::{poll_cycle, PollerConfig},
     preflight::{preflight, PreflightEnv},
     ui,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
 
 const NOW: i64 = 1_751_000_000_000;
@@ -103,12 +103,8 @@ async fn full_fbr_world_boots_polls_and_renders() {
     assert!(state.brackets.iter().all(|b| b.applied_seq == 1));
 
     // Drive some keys and render frames at realistic sizes.
-    update(
-        &mut state,
-        Msg::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
-        NOW + 31_000,
-    );
-    update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), NOW + 31_000);
+    update(&mut state, Msg::Key(Key::Char('1')), NOW + 31_000);
+    update(&mut state, Msg::Key(Key::Esc), NOW + 31_000);
     update(&mut state, Msg::Tick, NOW + 32_000);
 
     for (width, height) in [(80, 24), (130, 40), (200, 60)] {

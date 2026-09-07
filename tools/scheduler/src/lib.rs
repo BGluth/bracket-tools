@@ -12,15 +12,18 @@ pub mod set_source;
 pub mod simulator;
 #[doc(hidden)]
 pub mod synth;
+pub mod ui_action;
 pub mod world;
 
-// Terminal, filesystem and tokio-runtime shells. The modules above are the
+// Terminal, filesystem and tokio-runtime shells, plus the Elm core and its
+// keymap, which reach the persistence documents. The modules above are the
 // wasm32-clean core (guarded by scripts/wasm-check.sh).
 cfg_if! {
     if #[cfg(not(target_arch = "wasm32"))] {
         pub mod app;
         pub mod cli;
         pub mod fixture_source;
+        pub mod keymap;
         pub mod persist;
         pub mod poller;
         pub mod preflight;

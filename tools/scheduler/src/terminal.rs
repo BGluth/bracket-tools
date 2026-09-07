@@ -12,10 +12,13 @@ use std::{
 
 use crossterm::{
     cursor::Show,
+    event::{KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+
+use crate::keymap::Key;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -62,9 +65,40 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// The keys the scheduler models; anything else arrives as [`Key::Other`].
+pub fn key_from_event(event: KeyEvent) -> Key {
+    match event.code {
+        KeyCode::Char('c') if event.modifiers.contains(KeyModifiers::CONTROL) => Key::CtrlC,
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Esc => Key::Esc,
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        _ => Key::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::restore_terminal;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{key_from_event, restore_terminal};
+    use crate::keymap::Key;
+
+    #[test]
+    fn key_from_event_models_ctrl_c_and_maps_the_rest() {
+        assert_eq!(key_from_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), Key::CtrlC);
+        assert_eq!(
+            key_from_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Key::Char('c')
+        );
+        assert_eq!(key_from_event(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)), Key::PageDown);
+        assert_eq!(key_from_event(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)), Key::Other);
+    }
 
     #[test]
     fn restore_is_idempotent_outside_raw_mode() {

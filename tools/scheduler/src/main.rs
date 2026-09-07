@@ -32,7 +32,7 @@ use bracket_tools_scheduler::{
     rehearsal::{install_rehearsal, seed_fixture_from_live},
     replay::{generate_replay, play_replay, render_replay},
     set_source::SetSource,
-    terminal::{install_panic_hook, TerminalGuard},
+    terminal::{install_panic_hook, key_from_event, TerminalGuard},
     ui,
     world::{rollout_rankings, snapshot_within_sim_ceiling, SimSnapshot, ROLLOUT_TOP_K},
     writer::{run_writer, WriterConfig},
@@ -900,8 +900,8 @@ where
 fn spawn_input_thread(tx: UnboundedSender<Msg>) {
     thread::spawn(move || loop {
         match crossterm::event::read() {
-            Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                if tx.send(Msg::Key(key)).is_err() {
+            Ok(Event::Key(event)) if event.kind == KeyEventKind::Press => {
+                if tx.send(Msg::Key(key_from_event(event))).is_err() {
                     return;
                 }
             }

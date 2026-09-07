@@ -13,7 +13,6 @@ use std::{
 };
 
 use bracket_tools_startgg::{CharacterInfo, GameReport, GameSelection, SetMutationResult, StartGgId};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -23,11 +22,17 @@ use crate::{
         ConflictInputs, ConflictKey, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones, UnixMillis,
     },
     duration::{diff_snapshots, DurationModel},
+    keymap::{parse_setup_digits, resolve_key, Key, KeyOutcome},
     model::{abbreviate_round, strip_sponsor, BracketId, LiveSet, ModelWarning, PhaseGroupInfo, SetKey, SkippedSet},
     persist::{BracketSnapshot, OverlayDoc, SnapshotDoc, OVERLAY_VERSION, SNAPSHOT_VERSION},
     ranker::GreedyRanker,
+    ui_action::{Move, ReportAction, Side, UiAction},
     world::{assigned_sets, recompute, BracketState, QueueEntry, RolloutRankings, RolloutRow, SimSnapshot, World, WorldInputs},
 };
+
+/// The `p` hot key's hint, shared by the keymap (nothing selected) and the
+/// handler (the selection isn't a Called setup).
+pub(crate) const SELECT_CALLED_SETUP_FIRST: &str = "select a Called setup first (digit), then p";
 
 /// How long `z` parks a queue entry.
 pub const SNOOZE_SECS: i64 = 300;
@@ -43,7 +48,8 @@ pub const WORLD_REFRESH_MS: i64 = 10_000;
 
 #[derive(Debug)]
 pub enum Msg {
-    Key(KeyEvent),
+    /// A terminal key, resolved through the keymap.
+    Key(Key),
     Poll(PollResult),
     Write(WriteResult),
     /// A background rollout evaluation landed.
@@ -270,6 +276,23 @@ pub enum Modal {
     Help,
 }
 
+impl Modal {
+    /// The cursor of a list modal.
+    pub fn selected_mut(&mut self) -> Option<&mut usize> {
+        match self {
+            Modal::CallPicker { selected, .. }
+            | Modal::Inspection { selected }
+            | Modal::Notices { selected }
+            | Modal::PendingWrites { selected }
+            | Modal::PlayerFlags { selected, .. }
+            | Modal::Reassign { selected, .. }
+            | Modal::Setups { selected }
+            | Modal::FindSet { selected, .. } => Some(selected),
+            Modal::Report(_) | Modal::Help => None,
+        }
+    }
+}
+
 /// The in-flight report the modal edits. Winner taps are the hot path (`1`/
 /// `2` per game); characters are optional and per game — a new game copies
 /// the previous game's picks, and editing a game re-propagates from it
@@ -300,28 +323,6 @@ pub struct ReportDraft {
 pub struct GameDraft {
     pub winner: Side,
     pub chars: [Option<i32>; 2],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Side {
-    Left,
-    Right,
-}
-
-impl Side {
-    pub fn ix(self) -> usize {
-        match self {
-            Side::Left => 0,
-            Side::Right => 1,
-        }
-    }
-
-    fn other(self) -> Side {
-        match self {
-            Side::Left => Side::Right,
-            Side::Right => Side::Left,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -980,7 +981,11 @@ pub fn update(state: &mut AppState, msg: Msg, now_millis: UnixMillis) -> UpdateE
     // decision-point requests handlers add themselves.
     match msg {
         Msg::Key(key) => {
-            handle_key(state, key, now_millis, &mut effects);
+            match resolve_key(state, key) {
+                KeyOutcome::Action(action) => apply_action(state, action, now_millis, &mut effects),
+                KeyOutcome::Reject(text) => state.notice(now_millis, NoticeLevel::Warn, text),
+                KeyOutcome::Ignore => {}
+            }
             state.overlay_dirty = true;
             if state.dirty {
                 effects.want_sim(SimUrgency::Routine);
@@ -1053,197 +1058,143 @@ fn apply_sim_result(state: &mut AppState, rankings: RolloutRankings) {
     }
 }
 
-// --- keys
+// --- actions
 
-fn handle_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mut UpdateEffects) {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        effects.quit = true;
-        return;
-    }
-    if state.ui.modal.is_some() {
-        handle_modal_key(state, key, now, effects);
-        return;
-    }
-    match key.code {
-        KeyCode::Char('q') => effects.quit = true,
-        KeyCode::Char('?') => state.ui.modal = Some(Modal::Help),
-        KeyCode::Char(c @ '0'..='9') => enter_setup_digit(state, c, now, effects),
-        KeyCode::Enter if state.ui.setup_entry.is_some() => commit_setup_entry(state, now, effects),
-        KeyCode::Enter => quick_call_selected(state, now, effects),
-        KeyCode::Esc => state.ui.setup_entry = None,
-        KeyCode::Char('p') => progress_selected(state, now, effects),
-        KeyCode::Char('f') => free_selected(state, now, effects),
-        KeyCode::Char('r') => requeue_selected(state, now, effects),
-        KeyCode::Char('z') => snooze_selected(state, now),
-        KeyCode::Char('u') => undo(state, now),
-        KeyCode::Char('s') => {
+fn apply_action(state: &mut AppState, action: UiAction, now: UnixMillis, effects: &mut UpdateEffects) {
+    match action {
+        UiAction::Quit => effects.quit = true,
+        UiAction::Undo => undo(state, now),
+        UiAction::ToggleSponsors => toggle_sponsors(state, now),
+        UiAction::MoveQueueCursor(direction) => {
+            let page = state.ui.queue_view.page();
+            state.ui.queue_ix = step_cursor(state.ui.queue_ix, state.world.queue.len(), direction, page);
+        }
+        UiAction::MoveModalCursor(direction) => move_modal_cursor(state, direction),
+        UiAction::CloseModal => close_modal(state),
+        UiAction::OpenHelp => state.ui.modal = Some(Modal::Help),
+        UiAction::OpenInspection => state.ui.modal = Some(Modal::Inspection { selected: 0 }),
+        UiAction::OpenNotices => state.ui.modal = Some(Modal::Notices { selected: 0 }),
+        UiAction::OpenPendingWrites => state.ui.modal = Some(Modal::PendingWrites { selected: 0 }),
+        UiAction::OpenSetups => {
             state.ui.setups_count_entry.clear();
             state.ui.modal = Some(Modal::Setups { selected: 0 });
         }
-        KeyCode::Char('i') => state.ui.modal = Some(Modal::Inspection { selected: 0 }),
-        KeyCode::Char('n') => state.ui.modal = Some(Modal::Notices { selected: 0 }),
-        KeyCode::Char('w') => state.ui.modal = Some(Modal::PendingWrites { selected: 0 }),
-        KeyCode::Char('d') => open_flags_modal(state, now),
-        KeyCode::Char('a') => open_reassign_modal(state, now),
-        KeyCode::Char('g') => open_report_modal(state, now),
-        KeyCode::Char('/') => {
+        UiAction::OpenFindSet => {
             state.ui.modal = Some(Modal::FindSet {
                 query: String::new(),
                 selected: 0,
             })
         }
-        KeyCode::Char('t') => {
-            state.hide_sponsors = !state.hide_sponsors;
-            let text = if state.hide_sponsors {
-                "sponsor prefixes hidden (t restores)"
-            } else {
-                "sponsor prefixes shown"
-            };
-            state.notice(now, NoticeLevel::Info, text);
+        UiAction::OpenFlags(queue_ix) => open_flags(state, queue_ix, now),
+        UiAction::OpenReassign(setup) => open_reassign(state, setup, now),
+        UiAction::OpenReport(setup) => open_report(state, setup, now),
+        UiAction::SelectSetup(setup) => {
+            state.ui.setup_entry = None;
+            select_setup(state, setup, now, effects);
         }
-        KeyCode::Up => state.ui.queue_ix = state.ui.queue_ix.saturating_sub(1),
-        KeyCode::Down => {
-            state.ui.queue_ix = (state.ui.queue_ix + 1).min(state.world.queue.len().saturating_sub(1));
+        UiAction::BufferSetupDigits(digits) => state.ui.setup_entry = Some(PendingSetupEntry { digits, at: now }),
+        UiAction::ClearSetupEntry => state.ui.setup_entry = None,
+        UiAction::Call { setup, candidate } => commit_call(state, setup, candidate, now, effects),
+        UiAction::QuickCall(queue_ix) => quick_call(state, queue_ix, now, effects),
+        UiAction::Progress(setup) => progress(state, setup, now, effects),
+        UiAction::Free(setup) => free(state, setup, now, effects),
+        UiAction::Requeue(setup) => requeue(state, setup, now, effects),
+        UiAction::Snooze(queue_ix) => snooze(state, queue_ix, now),
+        UiAction::AckNotice(ix) => ack_notice(state, ix),
+        UiAction::ClearNotices => clear_notices(state),
+        UiAction::RetryParked(ix) => retry_parked(state, ix, now, effects),
+        UiAction::DiscardPending(ix) => discard_pending(state, ix, now),
+        UiAction::CycleFlag(ix) => cycle_flag_at(state, ix, now),
+        UiAction::ApplyReassign { setup, option } => apply_reassign(state, setup, option, now),
+        UiAction::SetFindQuery(query) => state.ui.modal = Some(Modal::FindSet { query, selected: 0 }),
+        UiAction::OpenFoundSet(ix) => {
+            if let Some(Modal::FindSet { query, .. }) = state.ui.modal.clone() {
+                open_found_set(state, ix, &query, now);
+            }
         }
-        KeyCode::PageUp => state.ui.queue_ix = state.ui.queue_ix.saturating_sub(state.ui.queue_view.page()),
-        KeyCode::PageDown => {
-            state.ui.queue_ix = (state.ui.queue_ix + state.ui.queue_view.page()).min(state.world.queue.len().saturating_sub(1));
+        UiAction::SetSetupsCountEntry(entry) => state.ui.setups_count_entry = entry,
+        UiAction::ApplySetupsRow(row) => {
+            state.ui.setups_count_entry.clear();
+            apply_setups_row(state, row, now, effects);
         }
-        _ => {}
+        UiAction::ApplySetupsCount { row, target } => {
+            state.ui.setups_count_entry.clear();
+            apply_setups_count(state, row, target, now, effects);
+        }
+        UiAction::Report(action) => {
+            if let Some(draft) = take_report_draft(state) {
+                report_action(state, draft, action, now, effects);
+            }
+        }
     }
 }
 
-fn handle_modal_key(state: &mut AppState, key: KeyEvent, now: UnixMillis, effects: &mut UpdateEffects) {
-    if key.code == KeyCode::Esc {
-        // The report modal steps back a stage instead of losing the draft.
-        if let Some(Modal::Report(mut draft)) = state.ui.modal.take() {
-            if draft.stage != ReportStage::Games {
-                draft.stage = ReportStage::Games;
-                state.ui.modal = Some(Modal::Report(draft));
-                return;
-            }
-        }
-        close_modal(state);
-        return;
-    }
-    match state.ui.modal.clone() {
-        Some(Modal::CallPicker {
-            setup,
-            selected,
-            refreshed,
-        }) => {
-            let (rows, _) = picker_rows(state, setup);
-            match key.code {
-                KeyCode::Up => {
-                    state.ui.modal = Some(Modal::CallPicker {
-                        setup,
-                        selected: selected.saturating_sub(1),
-                        refreshed,
-                    });
-                }
-                KeyCode::Down => {
-                    state.ui.modal = Some(Modal::CallPicker {
-                        setup,
-                        selected: (selected + 1).min(rows.len().saturating_sub(1)),
-                        refreshed,
-                    });
-                }
-                KeyCode::Enter => commit_call(state, setup, selected, now, effects),
-                // An exhausted pool presents an empty picker; `a` jumps
-                // straight to reassignment for the same setup.
-                KeyCode::Char('a') => state.ui.modal = Some(Modal::Reassign { setup, selected: 0 }),
-                _ => {}
-            }
-        }
-        Some(Modal::Inspection { selected }) => {
-            let count = blocked_entries(state).len();
-            match scroll(state, key.code, selected, count) {
-                Some(next) => state.ui.modal = Some(Modal::Inspection { selected: next }),
-                None => state.ui.modal = None,
-            }
-        }
-        Some(Modal::Notices { selected }) => match key.code {
-            KeyCode::Enter => ack_notice(state, selected),
-            KeyCode::Char('c') => {
-                state.notices.clear();
-                state.ui.modal = Some(Modal::Notices { selected: 0 });
-            }
-            code => match scroll(state, code, selected, state.notices.len()) {
-                Some(next) => state.ui.modal = Some(Modal::Notices { selected: next }),
-                None => state.ui.modal = None,
-            },
-        },
-        Some(Modal::PendingWrites { selected }) => match key.code {
-            KeyCode::Enter => retry_parked(state, selected, now, effects),
-            KeyCode::Char('d') => discard_pending(state, selected, now),
-            code => match scroll(state, code, selected, state.pending_writes.len()) {
-                Some(next) => state.ui.modal = Some(Modal::PendingWrites { selected: next }),
-                None => state.ui.modal = None,
-            },
-        },
-        Some(Modal::PlayerFlags { players, selected }) => match key.code {
-            KeyCode::Enter => cycle_selected_flag(state, &players, selected, now),
-            code => match scroll(state, code, selected, players.len()) {
-                Some(next) => state.ui.modal = Some(Modal::PlayerFlags { players, selected: next }),
-                None => state.ui.modal = None,
-            },
-        },
-        Some(Modal::Reassign { setup, selected }) => match key.code {
-            KeyCode::Enter => apply_reassign(state, setup, selected, now),
-            code => match scroll(state, code, selected, reassign_options(state).len()) {
-                Some(next) => state.ui.modal = Some(Modal::Reassign { setup, selected: next }),
-                None => state.ui.modal = None,
-            },
-        },
-        Some(Modal::FindSet { mut query, selected }) => match key.code {
-            KeyCode::Enter => open_found_set(state, selected, &query, now),
-            KeyCode::Char(c) => {
-                query.push(c);
-                state.ui.modal = Some(Modal::FindSet { query, selected: 0 });
-            }
-            KeyCode::Backspace => {
-                query.pop();
-                state.ui.modal = Some(Modal::FindSet { query, selected: 0 });
-            }
-            code => match scroll(state, code, selected, find_set_rows(state, &query).len()) {
-                Some(next) => state.ui.modal = Some(Modal::FindSet { query, selected: next }),
-                None => state.ui.modal = None,
-            },
-        },
-        Some(Modal::Setups { selected }) => match key.code {
-            KeyCode::Char(c @ '0'..='9') if state.ui.setups_count_entry.len() < 3 => {
-                state.ui.setups_count_entry.push(c);
-                state.ui.modal = Some(Modal::Setups { selected });
-            }
-            KeyCode::Backspace if !state.ui.setups_count_entry.is_empty() => {
-                state.ui.setups_count_entry.pop();
-                state.ui.modal = Some(Modal::Setups { selected });
-            }
-            KeyCode::Enter => match std::mem::take(&mut state.ui.setups_count_entry).parse::<u32>() {
-                Ok(target) => apply_setups_count(state, selected, target, now, effects),
-                Err(_) => apply_setups_row(state, selected, now, effects),
-            },
-            code => match scroll(state, code, selected, setups_rows(state).len()) {
-                Some(next) => state.ui.modal = Some(Modal::Setups { selected: next }),
-                None => state.ui.modal = None,
-            },
-        },
-        Some(Modal::Report(draft)) => handle_report_key(state, *draft, key.code, now, effects),
-        // Help modal: any other key closes it too.
-        Some(Modal::Help) | None => state.ui.modal = None,
+/// One cursor step over a `count`-row list, clamped; a page is the box
+/// height.
+fn step_cursor(selected: usize, count: usize, direction: Move, page: usize) -> usize {
+    let last = count.saturating_sub(1);
+    match direction {
+        Move::Up => selected.saturating_sub(1),
+        Move::Down => (selected + 1).min(last),
+        Move::PageUp => selected.saturating_sub(page),
+        Move::PageDown => (selected + page).min(last),
     }
 }
 
-/// Shared list-modal cursor: Up/Down move, PgUp/PgDn jump a box height
-/// (clamped), anything else closes.
-fn scroll(state: &AppState, code: KeyCode, selected: usize, count: usize) -> Option<usize> {
+fn move_modal_cursor(state: &mut AppState, direction: Move) {
+    let count = modal_len(state);
     let page = state.ui.modal_view.page();
-    match code {
-        KeyCode::Up => Some(selected.saturating_sub(1)),
-        KeyCode::Down => Some((selected + 1).min(count.saturating_sub(1))),
-        KeyCode::PageUp => Some(selected.saturating_sub(page)),
-        KeyCode::PageDown => Some((selected + page).min(count.saturating_sub(1))),
-        _ => None,
+    if let Some(selected) = state.ui.modal.as_mut().and_then(Modal::selected_mut) {
+        *selected = step_cursor(*selected, count, direction, page);
+    }
+}
+
+/// Rows the open list modal offers.
+fn modal_len(state: &AppState) -> usize {
+    match &state.ui.modal {
+        Some(Modal::CallPicker { setup, .. }) => picker_rows(state, *setup).0.len(),
+        Some(Modal::Inspection { .. }) => state.world.blocked.len(),
+        Some(Modal::Notices { .. }) => state.notices.len(),
+        Some(Modal::PendingWrites { .. }) => state.pending_writes.len(),
+        Some(Modal::PlayerFlags { players, .. }) => players.len(),
+        Some(Modal::Reassign { .. }) => reassign_options(state).len(),
+        Some(Modal::FindSet { query, .. }) => find_set_rows(state, query).len(),
+        Some(Modal::Setups { .. }) => setups_rows(state).len(),
+        Some(Modal::Report(_) | Modal::Help) | None => 0,
+    }
+}
+
+fn toggle_sponsors(state: &mut AppState, now: UnixMillis) {
+    state.hide_sponsors = !state.hide_sponsors;
+    let text = if state.hide_sponsors {
+        "sponsor prefixes hidden (t restores)"
+    } else {
+        "sponsor prefixes shown"
+    };
+    state.notice(now, NoticeLevel::Info, text);
+}
+
+/// Clearing from inside the notices modal also resets its cursor.
+fn clear_notices(state: &mut AppState) {
+    state.notices.clear();
+    if let Some(Modal::Notices { .. }) = state.ui.modal {
+        state.ui.modal = Some(Modal::Notices { selected: 0 });
+    }
+}
+
+fn cycle_flag_at(state: &mut AppState, selected: usize, now: UnixMillis) {
+    if let Some(Modal::PlayerFlags { players, .. }) = state.ui.modal.clone() {
+        cycle_selected_flag(state, &players, selected, now);
+    }
+}
+
+fn take_report_draft(state: &mut AppState) -> Option<ReportDraft> {
+    match state.ui.modal.take() {
+        Some(Modal::Report(draft)) => Some(*draft),
+        other => {
+            state.ui.modal = other;
+            None
+        }
     }
 }
 
@@ -1274,40 +1225,15 @@ pub(crate) fn picker_rows(state: &AppState, setup: SetupId) -> (Vec<RolloutRow>,
     (greedy, false)
 }
 
-/// Digits map straight to the TO's setup numbering (`SetupId(d)`, `0` = 10).
-/// One digit toward a setup number. Boards of ten or fewer stations keep the
-/// classic instant keys (`1`-`9`, `0` = 10); bigger boards buffer digits
-/// until the number can no longer grow into a station (or Enter / the tick
-/// grace window commits it).
-fn enter_setup_digit(state: &mut AppState, digit: char, now: UnixMillis, effects: &mut UpdateEffects) {
-    let max_station = state.board.setups().iter().map(|s| s.id.0).max().unwrap_or(0);
-    let mut digits = state.ui.setup_entry.take().map(|p| p.digits).unwrap_or_default();
-    digits.push(digit);
-    let number = parse_setup_digits(&digits);
-    if max_station > 10 && number != 10 && number * 10 <= max_station {
-        state.ui.setup_entry = Some(PendingSetupEntry { digits, at: now });
-        return;
-    }
-    select_setup(state, number, now, effects);
-}
-
-/// A lone `0` keeps meaning setup 10.
-fn parse_setup_digits(digits: &str) -> u32 {
-    match digits.parse().unwrap_or(0) {
-        0 if digits.len() == 1 => 10,
-        n => n,
-    }
-}
-
+/// The grace tick commits digits still waiting on a second keystroke.
 fn commit_setup_entry(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffects) {
     let Some(pending) = state.ui.setup_entry.take() else { return };
-    select_setup(state, parse_setup_digits(&pending.digits), now, effects);
+    select_setup(state, SetupId(parse_setup_digits(&pending.digits)), now, effects);
 }
 
-fn select_setup(state: &mut AppState, number: u32, now: UnixMillis, effects: &mut UpdateEffects) {
-    let setup = SetupId(number);
-    let Some(status) = state.board.setups().iter().find(|s| s.id == setup).map(|s| s.status.clone()) else {
-        state.notice(now, NoticeLevel::Warn, format!("no setup {number} configured"));
+fn select_setup(state: &mut AppState, setup: SetupId, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(status) = setup_status(state, setup) else {
+        state.notice(now, NoticeLevel::Warn, format!("no setup {} configured", setup.0));
         return;
     };
     match status {
@@ -1349,10 +1275,10 @@ fn commit_call(state: &mut AppState, setup: SetupId, selected: usize, now: UnixM
     commit_entry(state, setup, entry, now, effects);
 }
 
-/// Enter on the queue: call the highlighted entry on its lowest-numbered
-/// free candidate setup — the TO often doesn't care which station.
-fn quick_call_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffects) {
-    let Some(entry) = state.world.queue.get(state.ui.queue_ix).cloned() else {
+/// Calls a queue entry on its lowest-numbered free candidate setup — the TO
+/// often doesn't care which station.
+fn quick_call(state: &mut AppState, queue_ix: usize, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(entry) = state.world.queue.get(queue_ix).cloned() else {
         state.notice(now, NoticeLevel::Warn, "nothing in the queue to call");
         return;
     };
@@ -1473,19 +1399,16 @@ fn open_found_set(state: &mut AppState, selected: usize, query: &str, now: UnixM
     };
     state.ui.modal = None;
     state.ui.selected_setup = Some(row.setup);
-    open_report_modal(state, now);
+    open_report(state, row.setup, now);
 }
 
-/// The status the hot keys act on, with its set identity.
-fn selected_assignment(state: &AppState) -> Option<(SetupId, SetupStatus)> {
-    let setup = state.ui.selected_setup?;
-    let status = state.board.setups().iter().find(|s| s.id == setup)?.status.clone();
-    Some((setup, status))
+fn setup_status(state: &AppState, setup: SetupId) -> Option<SetupStatus> {
+    state.board.setups().iter().find(|s| s.id == setup).map(|s| s.status.clone())
 }
 
-fn progress_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffects) {
-    let Some((setup, SetupStatus::Called { bracket, set })) = selected_assignment(state) else {
-        state.notice(now, NoticeLevel::Warn, "select a Called setup first (digit), then p");
+fn progress(state: &mut AppState, setup: SetupId, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(SetupStatus::Called { bracket, set }) = setup_status(state, setup) else {
+        state.notice(now, NoticeLevel::Warn, SELECT_CALLED_SETUP_FIRST);
         return;
     };
     push_undo(state, format!("mark setup {} in progress", setup.0));
@@ -1501,9 +1424,9 @@ fn progress_selected(state: &mut AppState, now: UnixMillis, effects: &mut Update
     enqueue_write(state, effects, &bracket, &set, &id, WriteKind::InProgress, now);
 }
 
-fn free_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffects) {
-    let Some((setup, status)) = selected_assignment(state) else {
-        state.notice(now, NoticeLevel::Warn, "select a setup first (digit), then f");
+fn free(state: &mut AppState, setup: SetupId, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(status) = setup_status(state, setup) else {
+        state.notice(now, NoticeLevel::Warn, format!("no setup {} configured", setup.0));
         return;
     };
     let (SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set }) = status else {
@@ -1523,9 +1446,9 @@ fn free_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffe
     state.notice(now, NoticeLevel::Info, format!("setup {} freed, awaiting result", setup.0));
 }
 
-fn requeue_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateEffects) {
-    let Some((setup, status)) = selected_assignment(state) else {
-        state.notice(now, NoticeLevel::Warn, "select a setup first (digit), then r");
+fn requeue(state: &mut AppState, setup: SetupId, now: UnixMillis, effects: &mut UpdateEffects) {
+    let Some(status) = setup_status(state, setup) else {
+        state.notice(now, NoticeLevel::Warn, format!("no setup {} configured", setup.0));
         return;
     };
     let (SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set }) = status else {
@@ -1546,8 +1469,8 @@ fn requeue_selected(state: &mut AppState, now: UnixMillis, effects: &mut UpdateE
     state.notice(now, NoticeLevel::Info, format!("setup {} re-queued its set", setup.0));
 }
 
-fn snooze_selected(state: &mut AppState, now: UnixMillis) {
-    let Some(entry) = state.world.queue.get(state.ui.queue_ix).cloned() else {
+fn snooze(state: &mut AppState, queue_ix: usize, now: UnixMillis) {
+    let Some(entry) = state.world.queue.get(queue_ix).cloned() else {
         return;
     };
     push_undo(state, format!("snooze {}", entry.players));
@@ -1696,10 +1619,9 @@ fn discard_pending(state: &mut AppState, selected: usize, now: UnixMillis) {
     );
 }
 
-/// `d` on the main view: tri-state flags for the highlighted queue entry's
-/// players.
-fn open_flags_modal(state: &mut AppState, now: UnixMillis) {
-    let Some(entry) = state.world.queue.get(state.ui.queue_ix) else {
+/// Tri-state flags for a queue entry's players.
+fn open_flags(state: &mut AppState, queue_ix: usize, now: UnixMillis) {
+    let Some(entry) = state.world.queue.get(queue_ix) else {
         state.notice(now, NoticeLevel::Warn, "highlight a queue entry first (Up/Down), then d");
         return;
     };
@@ -1719,16 +1641,21 @@ fn open_flags_modal(state: &mut AppState, now: UnixMillis) {
     state.ui.modal = Some(Modal::PlayerFlags { players, selected: 0 });
 }
 
-/// `a` on the main view: reassign the selected setup's pool.
-fn open_reassign_modal(state: &mut AppState, now: UnixMillis) {
-    let Some(setup) = state.ui.selected_setup else {
-        state.notice(now, NoticeLevel::Warn, "select a setup first (digit), then a");
+fn open_reassign(state: &mut AppState, setup: SetupId, now: UnixMillis) {
+    if setup_status(state, setup).is_none() {
+        state.notice(now, NoticeLevel::Warn, format!("no setup {} configured", setup.0));
         return;
-    };
+    }
     state.ui.modal = Some(Modal::Reassign { setup, selected: 0 });
 }
 
+/// Pool overrides only ever name stations on the board (retiring one drops
+/// its override), so a stale target is refused rather than persisted.
 fn apply_reassign(state: &mut AppState, setup: SetupId, selected: usize, now: UnixMillis) {
+    if setup_status(state, setup).is_none() {
+        state.notice(now, NoticeLevel::Warn, format!("no setup {} configured", setup.0));
+        return;
+    }
     let options = reassign_options(state);
     let Some(option) = options.get(selected) else {
         return;
@@ -1859,14 +1786,14 @@ fn add_setup_station(state: &mut AppState, setup_type: String, now: UnixMillis, 
     state.notice(now, NoticeLevel::Info, format!("added setup {} ({setup_type})", id.0));
 }
 
-/// `g` on the main view: report the selected setup's set, game by game.
-fn open_report_modal(state: &mut AppState, now: UnixMillis) {
+/// Game-by-game reporting for the set on `setup`.
+fn open_report(state: &mut AppState, setup: SetupId, now: UnixMillis) {
     if !state.writes_armed {
         state.notice(now, NoticeLevel::Warn, "reporting needs writes armed (advisor-only session)");
         return;
     }
-    let Some((setup, status)) = selected_assignment(state) else {
-        state.notice(now, NoticeLevel::Warn, "select a setup first (digit), then g");
+    let Some(status) = setup_status(state, setup) else {
+        state.notice(now, NoticeLevel::Warn, format!("no setup {} configured", setup.0));
         return;
     };
     let (SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set }) = status else {
@@ -1921,68 +1848,46 @@ fn open_report_modal(state: &mut AppState, now: UnixMillis) {
     state.ui.modal = Some(Modal::Report(Box::new(draft)));
 }
 
-fn handle_report_key(state: &mut AppState, mut draft: ReportDraft, code: KeyCode, now: UnixMillis, effects: &mut UpdateEffects) {
-    match draft.stage.clone() {
-        ReportStage::Games => match code {
-            KeyCode::Char('1') => record_game(state, draft, Side::Left),
-            KeyCode::Char('2') => record_game(state, draft, Side::Right),
-            KeyCode::Backspace => {
-                draft.games.pop();
-                draft.game_cursor = draft.game_cursor.min(draft.games.len().saturating_sub(1));
-                state.ui.modal = Some(Modal::Report(Box::new(draft)));
-            }
-            KeyCode::Up => {
-                draft.game_cursor = draft.game_cursor.saturating_sub(1);
-                state.ui.modal = Some(Modal::Report(Box::new(draft)));
-            }
-            KeyCode::Down => {
-                draft.game_cursor = (draft.game_cursor + 1).min(draft.games.len().saturating_sub(1));
-                state.ui.modal = Some(Modal::Report(Box::new(draft)));
-            }
-            KeyCode::Char('c') => {
-                if report_roster(state, &draft.bracket).is_empty() {
-                    state.notice(now, NoticeLevel::Warn, "no character data for this event");
-                } else {
-                    draft.stage = ReportStage::Characters {
-                        side: Side::Left,
-                        filter: String::new(),
-                        cursor: character_cursor(state, &draft, Side::Left),
-                    };
-                }
-                state.ui.modal = Some(Modal::Report(Box::new(draft)));
-            }
-            KeyCode::Char('d') => {
-                draft.stage = ReportStage::DqPick;
-                state.ui.modal = Some(Modal::Report(Box::new(draft)));
-            }
-            KeyCode::Enter => {
-                if draft.games.is_empty() {
-                    state.notice(now, NoticeLevel::Warn, "record game winners first (1/2)");
-                } else if draft.leader().is_none() {
-                    state.notice(now, NoticeLevel::Warn, "score is tied — record the decider first");
-                } else {
-                    draft.stage = ReportStage::Confirm { dq: None };
-                }
-                state.ui.modal = Some(Modal::Report(Box::new(draft)));
-            }
-            _ => state.ui.modal = Some(Modal::Report(Box::new(draft))),
-        },
-        ReportStage::Characters { side, filter, cursor } => {
-            handle_character_key(state, draft, side, filter, cursor, code);
+fn report_action(state: &mut AppState, mut draft: ReportDraft, action: ReportAction, now: UnixMillis, effects: &mut UpdateEffects) {
+    match (draft.stage.clone(), action) {
+        (_, ReportAction::Back) => draft.stage = ReportStage::Games,
+        (ReportStage::Games, ReportAction::RecordGame(side)) => return record_game(state, draft, side),
+        (ReportStage::Games, ReportAction::UndoGame) => {
+            draft.games.pop();
+            draft.game_cursor = draft.game_cursor.min(draft.games.len().saturating_sub(1));
         }
-        ReportStage::DqPick => {
-            match code {
-                KeyCode::Char('1') => draft.stage = ReportStage::Confirm { dq: Some(Side::Left) },
-                KeyCode::Char('2') => draft.stage = ReportStage::Confirm { dq: Some(Side::Right) },
-                _ => {}
-            }
-            state.ui.modal = Some(Modal::Report(Box::new(draft)));
+        (ReportStage::Games, ReportAction::MoveGameCursor(direction)) => {
+            draft.game_cursor = step_cursor(draft.game_cursor, draft.games.len(), direction, 1);
         }
-        ReportStage::Confirm { dq } => match code {
-            KeyCode::Enter | KeyCode::Char('y') => submit_report(state, draft, dq, now, effects),
-            _ => state.ui.modal = Some(Modal::Report(Box::new(draft))),
-        },
+        (ReportStage::Games, ReportAction::OpenCharacterPicker) => {
+            if report_roster(state, &draft.bracket).is_empty() {
+                state.notice(now, NoticeLevel::Warn, "no character data for this event");
+            } else {
+                draft.stage = ReportStage::Characters {
+                    side: Side::Left,
+                    filter: String::new(),
+                    cursor: character_cursor(state, &draft, Side::Left),
+                };
+            }
+        }
+        (ReportStage::Games, ReportAction::StartDq) => draft.stage = ReportStage::DqPick,
+        (ReportStage::Games, ReportAction::FinishGames) => {
+            if draft.games.is_empty() {
+                state.notice(now, NoticeLevel::Warn, "record game winners first (1/2)");
+            } else if draft.leader().is_none() {
+                state.notice(now, NoticeLevel::Warn, "score is tied — record the decider first");
+            } else {
+                draft.stage = ReportStage::Confirm { dq: None };
+            }
+        }
+        (ReportStage::Characters { side, filter, cursor }, action) => {
+            return character_action(state, draft, side, filter, cursor, action);
+        }
+        (ReportStage::DqPick, ReportAction::PickDq(side)) => draft.stage = ReportStage::Confirm { dq: Some(side) },
+        (ReportStage::Confirm { dq }, ReportAction::Submit) => return submit_report(state, draft, dq, now, effects),
+        _ => {}
     }
+    state.ui.modal = Some(Modal::Report(Box::new(draft)));
 }
 
 fn record_game(state: &mut AppState, mut draft: ReportDraft, winner: Side) {
@@ -2001,13 +1906,9 @@ fn record_game(state: &mut AppState, mut draft: ReportDraft, winner: Side) {
     state.ui.modal = Some(Modal::Report(Box::new(draft)));
 }
 
-fn handle_character_key(state: &mut AppState, mut draft: ReportDraft, side: Side, mut filter: String, cursor: usize, code: KeyCode) {
-    let matches_len = filtered_roster(report_roster(state, &draft.bracket), &filter).len();
-    match code {
-        KeyCode::Enter => {
-            let choice = filtered_roster(report_roster(state, &draft.bracket), &filter)
-                .get(cursor)
-                .map(|c| c.id);
+fn character_action(state: &mut AppState, mut draft: ReportDraft, side: Side, filter: String, cursor: usize, action: ReportAction) {
+    match action {
+        ReportAction::PickCharacter(choice) => {
             if let Some(id) = choice {
                 // Apply from the targeted game onward — carry-forward means
                 // a switch mid-set holds for the rest of it.
@@ -2019,30 +1920,15 @@ fn handle_character_key(state: &mut AppState, mut draft: ReportDraft, side: Side
             }
             advance_character_stage(state, &mut draft, side);
         }
-        // Tab keeps whatever the side already had (sticky or nothing).
-        KeyCode::Tab => advance_character_stage(state, &mut draft, side),
-        KeyCode::Up => {
+        ReportAction::MoveCharacterCursor(direction) => {
+            let matches_len = filtered_roster(report_roster(state, &draft.bracket), &filter).len();
             draft.stage = ReportStage::Characters {
                 side,
                 filter,
-                cursor: cursor.saturating_sub(1),
+                cursor: step_cursor(cursor, matches_len, direction, 1),
             };
         }
-        KeyCode::Down => {
-            draft.stage = ReportStage::Characters {
-                side,
-                filter,
-                cursor: (cursor + 1).min(matches_len.saturating_sub(1)),
-            };
-        }
-        KeyCode::Backspace => {
-            filter.pop();
-            draft.stage = ReportStage::Characters { side, filter, cursor: 0 };
-        }
-        KeyCode::Char(c) if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '.' | '&') => {
-            filter.push(c);
-            draft.stage = ReportStage::Characters { side, filter, cursor: 0 };
-        }
+        ReportAction::SetCharacterFilter(filter) => draft.stage = ReportStage::Characters { side, filter, cursor: 0 },
         _ => {}
     }
     state.ui.modal = Some(Modal::Report(Box::new(draft)));
@@ -2691,7 +2577,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     use bracket_tools_startgg::SetMutationResult;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
         find_set_rows, recompute_world, setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus,
@@ -2702,6 +2587,7 @@ mod tests {
         config::{BracketConfig, BracketMode, CallAction, OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
         conflict::{BlockReason, PoolOverride, SetupBoard, SetupStatus},
         fixture_source::FixtureSource,
+        keymap::Key,
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
         set_source::SetSource,
         synth::{complete, make_de_bracket_with, make_se_bracket, materialize_ids, SynthBracket, SynthPlayer},
@@ -2709,8 +2595,8 @@ mod tests {
 
     const NOW: i64 = 1_751_000_000_000;
 
-    fn key(code: KeyCode) -> Msg {
-        Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    fn key(key: Key) -> Msg {
+        Msg::Key(key)
     }
 
     fn test_config(setups: &[u32], brackets: &[&str]) -> SchedulerConfig {
@@ -2856,17 +2742,17 @@ mod tests {
             Some(Modal::Report(d)) => d.best_of = Some(3),
             _ => unreachable!(),
         }
-        update(&mut state, key(KeyCode::Char('1')), NOW);
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         assert!(
             matches!(draft(&state).stage, super::ReportStage::Confirm { dq: None }),
             "clinch jumps once"
         );
 
         // It was really a Bo5: step back and record the remaining games.
-        update(&mut state, key(KeyCode::Esc), NOW);
+        update(&mut state, key(Key::Esc), NOW);
         for _ in 0..3 {
-            update(&mut state, key(KeyCode::Char('2')), NOW);
+            update(&mut state, key(Key::Char('2')), NOW);
             assert!(
                 matches!(draft(&state).stage, super::ReportStage::Games),
                 "already-clinched drafts stay on the game taps"
@@ -2874,13 +2760,13 @@ mod tests {
         }
         assert_eq!(draft(&state).games.len(), 5);
 
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         let (right_entrant, summary) = match &state.ui.modal {
             Some(Modal::Report(d)) => (d.right.entrant_id.clone(), d.summary(None)),
             other => panic!("expected confirm, got {other:?}"),
         };
         assert!(summary.contains("3-2"), "{summary}");
-        let effects = update(&mut state, key(KeyCode::Char('y')), NOW);
+        let effects = update(&mut state, key(Key::Char('y')), NOW);
         assert_eq!(
             report_payload(&effects).winner_entrant_id,
             Some(right_entrant),
@@ -2893,23 +2779,23 @@ mod tests {
         let mut state = se4_app(true);
         call_top_candidate(&mut state, '1');
 
-        update(&mut state, key(KeyCode::Char('/')), NOW);
+        update(&mut state, key(Key::Char('/')), NOW);
         assert!(matches!(state.ui.modal, Some(Modal::FindSet { .. })));
         let rows = find_set_rows(&state, "");
         assert_eq!(rows.len(), 1, "one on-station set: {rows:?}");
         let called_setup = rows[0].setup;
 
         // A miss keeps the modal open; Enter on a miss is a no-op.
-        update(&mut state, key(KeyCode::Char('z')), NOW);
-        update(&mut state, key(KeyCode::Char('z')), NOW);
+        update(&mut state, key(Key::Char('z')), NOW);
+        update(&mut state, key(Key::Char('z')), NOW);
         assert!(find_set_rows(&state, "zz").is_empty());
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert!(matches!(state.ui.modal, Some(Modal::FindSet { .. })));
 
         // Trim back to a hit and report it.
-        update(&mut state, key(KeyCode::Backspace), NOW);
-        update(&mut state, key(KeyCode::Backspace), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Backspace), NOW);
+        update(&mut state, key(Key::Backspace), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         match &state.ui.modal {
             Some(Modal::Report(d)) => assert_eq!(d.setup, called_setup),
             other => panic!("expected the report modal, got {other:?}"),
@@ -2919,7 +2805,7 @@ mod tests {
     #[test]
     fn sponsor_toggle_flips_and_rides_the_overlay() {
         let mut state = se4_app(true);
-        update(&mut state, key(KeyCode::Char('t')), NOW);
+        update(&mut state, key(Key::Char('t')), NOW);
         assert!(state.hide_sponsors);
         assert!(state.to_overlay().hide_sponsors);
 
@@ -2928,7 +2814,7 @@ mod tests {
         fresh.apply_overlay(doc, NOW, true);
         assert!(fresh.hide_sponsors);
 
-        update(&mut state, key(KeyCode::Char('t')), NOW);
+        update(&mut state, key(Key::Char('t')), NOW);
         assert!(!state.hide_sponsors);
     }
 
@@ -2938,27 +2824,27 @@ mod tests {
         assert_eq!(state.board.setups().len(), 2);
 
         // 6 on the highlighted (default-type) row: adds four stations.
-        update(&mut state, key(KeyCode::Char('s')), NOW);
-        update(&mut state, key(KeyCode::Char('6')), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Char('s')), NOW);
+        update(&mut state, key(Key::Char('6')), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert_eq!(state.board.setups().len(), 6);
         assert!(matches!(state.ui.modal, Some(Modal::Setups { .. })), "modal stays for batch edits");
 
         // Occupy a station, then ask for 1: free stations retire, the
         // occupied one is kept with a warning.
-        update(&mut state, key(KeyCode::Esc), NOW);
+        update(&mut state, key(Key::Esc), NOW);
         call_top_candidate(&mut state, '1');
-        update(&mut state, key(KeyCode::Char('s')), NOW);
-        update(&mut state, key(KeyCode::Char('1')), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Char('s')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert_eq!(state.board.setups().len(), 1, "{:?}", state.board.setups());
         assert!(
             !matches!(state.board.setups()[0].status, SetupStatus::Free),
             "the occupied station survives"
         );
 
-        update(&mut state, key(KeyCode::Char('0')), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Char('0')), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert_eq!(state.board.setups().len(), 1);
         assert!(state.notices.iter().any(|n| n.text.contains("occupied")), "shortfall warns");
     }
@@ -2966,12 +2852,12 @@ mod tests {
     #[test]
     fn notices_clear_from_the_modal() {
         let mut state = se4_app(true);
-        update(&mut state, key(KeyCode::Char('t')), NOW);
-        update(&mut state, key(KeyCode::Char('t')), NOW);
+        update(&mut state, key(Key::Char('t')), NOW);
+        update(&mut state, key(Key::Char('t')), NOW);
         assert!(state.notices.len() >= 2);
 
-        update(&mut state, key(KeyCode::Char('n')), NOW);
-        update(&mut state, key(KeyCode::Char('c')), NOW);
+        update(&mut state, key(Key::Char('n')), NOW);
+        update(&mut state, key(Key::Char('c')), NOW);
         assert!(state.notices.is_empty());
         assert!(matches!(state.ui.modal, Some(Modal::Notices { .. })));
     }
@@ -3008,10 +2894,10 @@ mod tests {
             .collect();
         let mut state = AppState::new(config, true, boots, NOW);
         call_top_candidate(&mut state, '1');
-        update(&mut state, key(KeyCode::Char('g')), NOW);
+        update(&mut state, key(Key::Char('g')), NOW);
 
         // Nothing picked yet: the cast opens at the top.
-        update(&mut state, key(KeyCode::Char('c')), NOW);
+        update(&mut state, key(Key::Char('c')), NOW);
         assert!(matches!(
             draft(&state).stage,
             super::ReportStage::Characters {
@@ -3022,14 +2908,14 @@ mod tests {
         ));
 
         // Pick the third character for left, keep right unset.
-        update(&mut state, key(KeyCode::Down), NOW);
-        update(&mut state, key(KeyCode::Down), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
-        update(&mut state, key(KeyCode::Tab), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        update(&mut state, key(Key::Enter), NOW);
+        update(&mut state, key(Key::Tab), NOW);
         assert!(matches!(draft(&state).stage, super::ReportStage::Games));
 
         // Reopening starts on the current pick, not the top of the cast.
-        update(&mut state, key(KeyCode::Char('c')), NOW);
+        update(&mut state, key(Key::Char('c')), NOW);
         match &draft(&state).stage {
             super::ReportStage::Characters { side, cursor, .. } => {
                 assert_eq!(*side, super::Side::Left);
@@ -3049,21 +2935,21 @@ mod tests {
 
         // 2-1 doesn't decide a Bo5: warned, not blocked.
         for k in ['1', '1', '2'] {
-            update(&mut state, key(KeyCode::Char(k)), NOW);
+            update(&mut state, key(Key::Char(k)), NOW);
         }
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         let warn = draft(&state).tally_warning(None).expect("short tally warns");
         assert!(warn.contains("2-1") && warn.contains("Bo5"), "{warn}");
 
         // Completing the clinch clears it.
-        update(&mut state, key(KeyCode::Esc), NOW);
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Esc), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         assert!(matches!(draft(&state).stage, super::ReportStage::Confirm { dq: None }));
         assert_eq!(draft(&state).tally_warning(None), None, "3-1 decides a Bo5");
 
         // Going past the clinch warns again (4-1), and a DQ never does.
-        update(&mut state, key(KeyCode::Esc), NOW);
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Esc), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         let warn = draft(&state).tally_warning(None).expect("overshoot warns");
         assert!(warn.contains("4-1") && warn.contains("overshoots"), "{warn}");
         assert_eq!(draft(&state).tally_warning(Some(super::Side::Left)), None);
@@ -3077,9 +2963,9 @@ mod tests {
     }
 
     fn call_top_candidate(state: &mut AppState, setup_digit: char) -> super::UpdateEffects {
-        update(state, key(KeyCode::Char(setup_digit)), NOW);
+        update(state, key(Key::Char(setup_digit)), NOW);
         assert!(matches!(state.ui.modal, Some(Modal::CallPicker { .. })), "picker should open");
-        update(state, key(KeyCode::Enter), NOW)
+        update(state, key(Key::Enter), NOW)
     }
 
     #[test]
@@ -3106,7 +2992,7 @@ mod tests {
         assert!(state.world.queue.iter().all(|e| e.key != called_key));
 
         // p: mark in progress.
-        let effects = update(&mut state, key(KeyCode::Char('p')), NOW);
+        let effects = update(&mut state, key(Key::Char('p')), NOW);
         assert_eq!(effects.writes.len(), 1);
         assert_eq!(effects.writes[0].kind, WriteKind::InProgress);
 
@@ -3197,7 +3083,7 @@ mod tests {
         let mut state = AppState::new(config, false, boots, NOW);
 
         // Find and call P1's ultimate set via the picker.
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         let Some(Modal::CallPicker { setup, .. }) = state.ui.modal.clone() else {
             panic!("picker open");
         };
@@ -3212,9 +3098,9 @@ mod tests {
             })
             .expect("P1 has a callable set");
         for _ in 0..p1_pos {
-            update(&mut state, key(KeyCode::Down), NOW);
+            update(&mut state, key(Key::Down), NOW);
         }
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
 
         // M1's melee set must now be blocked through the alias.
         assert!(
@@ -3281,7 +3167,7 @@ mod tests {
         call_top_candidate(&mut state, '1');
         assert!(matches!(state.board.setups()[0].status, SetupStatus::Called { .. }));
 
-        update(&mut state, key(KeyCode::Char('u')), NOW);
+        update(&mut state, key(Key::Char('u')), NOW);
         assert_eq!(state.board.setups()[0].status, SetupStatus::Free);
         assert_eq!(state.world.queue.len(), 2, "the un-called set ranks again");
         assert!(state.notices.iter().any(|n| n.text.starts_with("undid:")));
@@ -3290,7 +3176,7 @@ mod tests {
     #[test]
     fn snooze_hides_then_expires() {
         let mut state = se4_app(false);
-        update(&mut state, key(KeyCode::Char('z')), NOW);
+        update(&mut state, key(Key::Char('z')), NOW);
         assert_eq!(state.world.queue.len(), 1, "snoozed set hidden");
 
         // Just before expiry: still hidden. After (plus the tick refresh
@@ -3350,7 +3236,7 @@ mod tests {
         assert_eq!(set.state_int, Some(42));
 
         // Terminal failure parks the pending entry.
-        update(&mut state, key(KeyCode::Char('u')), NOW + 2000); // free the setup again
+        update(&mut state, key(Key::Char('u')), NOW + 2000); // free the setup again
         let effects = call_top_candidate(&mut state, '1');
         let intent2 = effects.writes[0].clone();
         update(
@@ -3371,7 +3257,7 @@ mod tests {
     fn free_requests_a_targeted_force_poll() {
         let mut state = se4_app(false);
         call_top_candidate(&mut state, '1');
-        let effects = update(&mut state, key(KeyCode::Char('f')), NOW + 1000);
+        let effects = update(&mut state, key(Key::Char('f')), NOW + 1000);
 
         assert_eq!(effects.force_poll, vec![BracketId("ultimate".to_owned())]);
         assert_eq!(state.board.setups()[0].status, SetupStatus::Free);
@@ -3386,7 +3272,7 @@ mod tests {
         call_top_candidate(&mut state, '1');
         assert_eq!(state.world.queue.len(), 1);
 
-        update(&mut state, key(KeyCode::Char('r')), NOW + 1000);
+        update(&mut state, key(Key::Char('r')), NOW + 1000);
         assert_eq!(state.board.setups()[0].status, SetupStatus::Free);
         assert_eq!(state.world.queue.len(), 2, "re-queued set ranks again");
     }
@@ -3394,8 +3280,8 @@ mod tests {
     #[test]
     fn quit_keys_quit() {
         let mut state = se4_app(false);
-        assert!(update(&mut state, key(KeyCode::Char('q')), NOW).quit);
-        assert!(update(&mut state, Msg::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)), NOW).quit);
+        assert!(update(&mut state, key(Key::Char('q')), NOW).quit);
+        assert!(update(&mut state, Msg::Key(Key::CtrlC), NOW).quit);
     }
 
     #[test]
@@ -3621,7 +3507,7 @@ mod tests {
     #[test]
     fn setups_modal_adds_and_undo_restores() {
         let mut state = se4_app(false);
-        update(&mut state, key(KeyCode::Char('s')), NOW);
+        update(&mut state, key(Key::Char('s')), NOW);
         assert!(matches!(state.ui.modal, Some(Modal::Setups { selected: 0 })));
         assert_eq!(
             setups_rows(&state),
@@ -3634,9 +3520,9 @@ mod tests {
 
         // Enter on the add row: setup 3 appears, the modal stays open, and
         // the roster change demands an immediate rollout re-evaluation.
-        update(&mut state, key(KeyCode::Down), NOW);
-        update(&mut state, key(KeyCode::Down), NOW);
-        let effects = update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        let effects = update(&mut state, key(Key::Enter), NOW);
         assert_eq!(effects.sim, Some(SimUrgency::Immediate));
         assert!(
             matches!(state.ui.modal, Some(Modal::Setups { .. })),
@@ -3647,8 +3533,8 @@ mod tests {
         assert!(state.world.per_setup.contains_key(&SetupId(3)), "the new station ranks immediately");
 
         // Esc + u: the whole roster edit rolls back.
-        update(&mut state, key(KeyCode::Esc), NOW);
-        update(&mut state, key(KeyCode::Char('u')), NOW);
+        update(&mut state, key(Key::Esc), NOW);
+        update(&mut state, key(Key::Char('u')), NOW);
         assert_eq!(state.board.setups().len(), 2, "undo restores the roster");
     }
 
@@ -3658,17 +3544,17 @@ mod tests {
         call_top_candidate(&mut state, '1');
         state.pool_overrides.insert(SetupId(2), PoolOverride::AllowAny);
         state.ui.selected_setup = Some(SetupId(2));
-        update(&mut state, key(KeyCode::Char('s')), NOW);
+        update(&mut state, key(Key::Char('s')), NOW);
 
         // Row 0 is the occupied setup 1: Enter refuses with a warning.
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert_eq!(state.board.setups().len(), 2, "occupied stations don't retire");
         assert!(state.notices.iter().any(|n| n.text.contains("occupied")));
 
         // Row 1 is the free setup 2: retired, its override and selection go
         // with it (a stale Dedicated must not re-attach to a reused number).
-        update(&mut state, key(KeyCode::Down), NOW);
-        let effects = update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        let effects = update(&mut state, key(Key::Enter), NOW);
         assert_eq!(effects.sim, Some(SimUrgency::Immediate));
         let ids: Vec<u32> = state.board.setups().iter().map(|s| s.id.0).collect();
         assert_eq!(ids, vec![1]);
@@ -3679,13 +3565,13 @@ mod tests {
     #[test]
     fn setups_modal_add_reuses_the_lowest_retired_number() {
         let mut state = se4_app(false);
-        update(&mut state, key(KeyCode::Char('s')), NOW);
+        update(&mut state, key(Key::Char('s')), NOW);
         // Retire setup 1 (row 0, free), then add: the arrival becomes the
         // new setup 1 (physical placard reuse).
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert_eq!(state.board.setups().len(), 1);
-        update(&mut state, key(KeyCode::Down), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         let ids: Vec<u32> = state.board.setups().iter().map(|s| s.id.0).collect();
         assert_eq!(ids, vec![1, 2]);
     }
@@ -3742,13 +3628,13 @@ mod tests {
         );
 
         // The modal still offers pokemon's add row; Enter seeds station 2.
-        update(&mut state, key(KeyCode::Char('s')), NOW);
+        update(&mut state, key(Key::Char('s')), NOW);
         let rows = setups_rows(&state);
         let pokemon_add = rows.iter().position(|r| r == &SetupsRow::Add("pokemon".to_owned())).unwrap();
         for _ in 0..pokemon_add {
-            update(&mut state, key(KeyCode::Down), NOW);
+            update(&mut state, key(Key::Down), NOW);
         }
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         let added = state.board.setups().iter().find(|s| s.setup_type == "pokemon").unwrap();
         assert_eq!(added.id, SetupId(2));
     }
@@ -3836,14 +3722,14 @@ mod tests {
         assert_eq!(state.world.queue.len(), 2);
 
         // d opens the flags modal for the highlighted entry's players.
-        update(&mut state, key(KeyCode::Char('d')), NOW);
+        update(&mut state, key(Key::Char('d')), NOW);
         let Some(Modal::PlayerFlags { ref players, .. }) = state.ui.modal else {
             panic!("flags modal should open: {:?}", state.ui.modal);
         };
         assert_eq!(players.len(), 2, "singles set has two players");
 
         // Enter: resting. The player's set leaves the queue.
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert_eq!(state.flags.resting.len(), 1);
         assert_eq!(state.world.queue.len(), 1, "resting player's set blocked");
         assert!(state
@@ -3853,17 +3739,17 @@ mod tests {
             .any(|reasons| reasons.iter().any(|r| matches!(r, BlockReason::PlayerResting { .. }))));
 
         // Cycle on: departed → force-available → clear restores the queue.
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert_eq!(state.flags.departed.len(), 1);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert_eq!(state.flags.force_available.len(), 1);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         assert!(state.flags.force_available.is_empty());
         assert_eq!(state.world.queue.len(), 2, "cleared flags unblock");
 
         // Undo restores the last flag state (single level).
-        update(&mut state, key(KeyCode::Esc), NOW);
-        update(&mut state, key(KeyCode::Char('u')), NOW);
+        update(&mut state, key(Key::Esc), NOW);
+        update(&mut state, key(Key::Char('u')), NOW);
         assert_eq!(state.flags.force_available.len(), 1, "undo restored the pre-clear flags");
     }
 
@@ -3895,7 +3781,7 @@ mod tests {
         assert_eq!(state.rollout.as_ref().map(|r| r.computed_at), Some(NOW));
 
         // Open the picker: it consumes ONE refresh (marked), then holds back.
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         assert!(matches!(state.ui.modal, Some(Modal::CallPicker { refreshed: false, .. })));
         let second = rankings_at(NOW + 1000, &state);
         update(&mut state, Msg::SimResult(second), NOW + 1000);
@@ -3910,12 +3796,12 @@ mod tests {
         );
 
         // Closing applies the held-back result.
-        update(&mut state, key(KeyCode::Esc), NOW + 3000);
+        update(&mut state, key(Key::Esc), NOW + 3000);
         assert_eq!(state.rollout.as_ref().map(|r| r.computed_at), Some(NOW + 2000));
 
         // Enter commits the rollout-ranked candidate (rows come from picker_rows).
-        update(&mut state, key(KeyCode::Char('1')), NOW + 4000);
-        let effects = update(&mut state, key(KeyCode::Enter), NOW + 4000);
+        update(&mut state, key(Key::Char('1')), NOW + 4000);
+        let effects = update(&mut state, key(Key::Enter), NOW + 4000);
         assert!(matches!(state.board.setups()[0].status, SetupStatus::Called { .. }));
         assert!(effects.writes.is_empty(), "writes disarmed in this fixture");
     }
@@ -3927,7 +3813,7 @@ mod tests {
         assert_eq!(effects.sim, Some(super::SimUrgency::Routine), "a call is routine");
 
         // f frees the setup: the decision-point exemption fires.
-        let effects = update(&mut state, key(KeyCode::Char('f')), NOW + 1000);
+        let effects = update(&mut state, key(Key::Char('f')), NOW + 1000);
         assert_eq!(effects.sim, Some(super::SimUrgency::Immediate));
 
         // A poll applying a snapshot is routine…
@@ -3972,11 +3858,11 @@ mod tests {
 
         // Select setup 2 (opens the picker on a free setup), then a → the
         // reassign modal for the same setup; dedicate it to melee (option 1).
-        update(&mut state, key(KeyCode::Char('2')), NOW);
-        update(&mut state, key(KeyCode::Char('a')), NOW);
+        update(&mut state, key(Key::Char('2')), NOW);
+        update(&mut state, key(Key::Char('a')), NOW);
         assert!(matches!(state.ui.modal, Some(Modal::Reassign { setup: SetupId(2), .. })));
-        update(&mut state, key(KeyCode::Down), NOW); // options: [ultimate, melee, any, restore]
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Down), NOW); // options: [ultimate, melee, any, restore]
+        update(&mut state, key(Key::Enter), NOW);
 
         assert_eq!(
             state.pool_overrides.get(&SetupId(2)),
@@ -4009,7 +3895,7 @@ mod tests {
         );
 
         // Undo reverts it.
-        update(&mut state, key(KeyCode::Char('u')), NOW);
+        update(&mut state, key(Key::Char('u')), NOW);
         assert!(state.pool_overrides.is_empty());
         assert!(state.world.queue.iter().any(|e| e.candidate_setups.contains(&SetupId(2))));
     }
@@ -4020,10 +3906,10 @@ mod tests {
         state.notice(NOW, NoticeLevel::Warn, "older warning");
         state.notice(NOW + 1000, NoticeLevel::Error, "newest error");
 
-        update(&mut state, key(KeyCode::Char('n')), NOW + 2000);
+        update(&mut state, key(Key::Char('n')), NOW + 2000);
         assert!(matches!(state.ui.modal, Some(Modal::Notices { selected: 0 })));
         // Selected 0 = newest.
-        update(&mut state, key(KeyCode::Enter), NOW + 2000);
+        update(&mut state, key(Key::Enter), NOW + 2000);
         assert!(state.notices.iter().any(|n| n.text == "newest error" && n.acked));
         assert!(state.notices.iter().any(|n| n.text == "older warning" && !n.acked));
     }
@@ -4044,8 +3930,8 @@ mod tests {
         assert!(state.pending_writes.iter().any(|p| p.status == PendingStatus::Parked));
 
         // Enter re-queues the parked write with a fresh attempt budget.
-        update(&mut state, key(KeyCode::Char('w')), NOW + 2000);
-        let effects = update(&mut state, key(KeyCode::Enter), NOW + 2000);
+        update(&mut state, key(Key::Char('w')), NOW + 2000);
+        let effects = update(&mut state, key(Key::Enter), NOW + 2000);
         assert_eq!(effects.writes, vec![intent.clone()]);
         assert!(state.pending_writes.iter().all(|p| p.status == PendingStatus::Queued));
 
@@ -4059,7 +3945,7 @@ mod tests {
             NOW + 3000,
         );
         assert!(matches!(state.ui.modal, Some(Modal::PendingWrites { .. })));
-        update(&mut state, key(KeyCode::Char('d')), NOW + 4000);
+        update(&mut state, key(Key::Char('d')), NOW + 4000);
         assert!(state.pending_writes.is_empty());
         assert!(state.notices.iter().any(|n| n.text.contains("discarded write")));
     }
@@ -4083,7 +3969,7 @@ mod tests {
     fn reporting_app() -> AppState {
         let mut state = se4_app(true);
         call_top_candidate(&mut state, '1');
-        update(&mut state, key(KeyCode::Char('g')), NOW);
+        update(&mut state, key(Key::Char('g')), NOW);
         assert!(matches!(state.ui.modal, Some(Modal::Report(_))), "{:?}", state.ui.modal);
         state
     }
@@ -4114,13 +4000,13 @@ mod tests {
             (d.left.entrant_id.clone(), d.right.name.clone())
         };
 
-        update(&mut state, key(KeyCode::Char('1')), NOW);
-        update(&mut state, key(KeyCode::Char('2')), NOW);
-        update(&mut state, key(KeyCode::Char('1')), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW); // finish → confirm
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Char('2')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Enter), NOW); // finish → confirm
         assert!(matches!(draft(&state).stage, super::ReportStage::Confirm { dq: None }));
 
-        let effects = update(&mut state, key(KeyCode::Char('y')), NOW);
+        let effects = update(&mut state, key(Key::Char('y')), NOW);
         let report = report_payload(&effects);
         assert_eq!(report.winner_entrant_id, Some(left_entrant));
         assert!(!report.is_dq);
@@ -4143,17 +4029,17 @@ mod tests {
             Some(Modal::Report(d)) => d.best_of = Some(3),
             _ => unreachable!(),
         }
-        update(&mut state, key(KeyCode::Char('2')), NOW);
-        update(&mut state, key(KeyCode::Char('2')), NOW);
+        update(&mut state, key(Key::Char('2')), NOW);
+        update(&mut state, key(Key::Char('2')), NOW);
         assert!(matches!(draft(&state).stage, super::ReportStage::Confirm { dq: None }));
         // Esc steps back to the game taps instead of losing the draft.
-        update(&mut state, key(KeyCode::Esc), NOW);
+        update(&mut state, key(Key::Esc), NOW);
         assert!(matches!(draft(&state).stage, super::ReportStage::Games));
         assert_eq!(draft(&state).games.len(), 2, "the draft survived");
 
         // DQ: d, pick the side, confirm — winner is the other side, no games.
-        update(&mut state, key(KeyCode::Char('d')), NOW);
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Char('d')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         let (left_name, right_entrant) = {
             let d = draft(&state);
             assert!(matches!(
@@ -4164,7 +4050,7 @@ mod tests {
             ));
             (d.left.name.clone(), d.right.entrant_id.clone())
         };
-        let effects = update(&mut state, key(KeyCode::Enter), NOW);
+        let effects = update(&mut state, key(Key::Enter), NOW);
         let report = report_payload(&effects);
         assert!(report.is_dq);
         assert_eq!(report.winner_entrant_id, Some(right_entrant));
@@ -4177,7 +4063,7 @@ mod tests {
     fn report_needs_writes_armed() {
         let mut state = se4_app(false);
         call_top_candidate(&mut state, '1');
-        update(&mut state, key(KeyCode::Char('g')), NOW);
+        update(&mut state, key(Key::Char('g')), NOW);
         assert!(state.ui.modal.is_none());
         assert!(state.notices.iter().any(|n| n.text.contains("advisor-only")));
     }
@@ -4201,18 +4087,18 @@ mod tests {
         let mut state = se4_app(true);
         state.brackets[0].characters = roster;
         call_top_candidate(&mut state, '1');
-        update(&mut state, key(KeyCode::Char('g')), NOW);
+        update(&mut state, key(Key::Char('g')), NOW);
 
         // Left side: filter "mar", cursor down to Marth, pick.
-        update(&mut state, key(KeyCode::Char('c')), NOW);
+        update(&mut state, key(Key::Char('c')), NOW);
         for c in "mar".chars() {
-            update(&mut state, key(KeyCode::Char(c)), NOW);
+            update(&mut state, key(Key::Char(c)), NOW);
         }
-        update(&mut state, key(KeyCode::Down), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Down), NOW);
+        update(&mut state, key(Key::Enter), NOW);
         // Right side: "f" → Fox.
-        update(&mut state, key(KeyCode::Char('f')), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Char('f')), NOW);
+        update(&mut state, key(Key::Enter), NOW);
 
         let (chars, left_key, right_key) = {
             let d = draft(&state);
@@ -4224,9 +4110,9 @@ mod tests {
         assert_eq!(state.last_characters.get(&right_key), Some(&3));
 
         // The picks ride along on every reported game.
-        update(&mut state, key(KeyCode::Char('1')), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
-        let effects = update(&mut state, key(KeyCode::Char('y')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Enter), NOW);
+        let effects = update(&mut state, key(Key::Char('y')), NOW);
         let report = report_payload(&effects);
         assert_eq!(report.games.len(), 1);
         let selections = &report.games[0].selections;
@@ -4259,33 +4145,33 @@ mod tests {
         let mut state = se4_app(true);
         state.brackets[0].characters = roster;
         call_top_candidate(&mut state, '1');
-        update(&mut state, key(KeyCode::Char('g')), NOW);
+        update(&mut state, key(Key::Char('g')), NOW);
 
         // Base picks before any game: Marth / Fox.
-        update(&mut state, key(KeyCode::Char('c')), NOW);
+        update(&mut state, key(Key::Char('c')), NOW);
         for c in "marth".chars() {
-            update(&mut state, key(KeyCode::Char(c)), NOW);
+            update(&mut state, key(Key::Char(c)), NOW);
         }
-        update(&mut state, key(KeyCode::Enter), NOW);
-        update(&mut state, key(KeyCode::Char('f')), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
+        update(&mut state, key(Key::Enter), NOW);
+        update(&mut state, key(Key::Char('f')), NOW);
+        update(&mut state, key(Key::Enter), NOW);
 
         // Two games copy them; then the left player switches to Mario for
         // game 2 onward (cursor already sits on the last recorded game).
-        update(&mut state, key(KeyCode::Char('1')), NOW);
-        update(&mut state, key(KeyCode::Char('2')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Char('2')), NOW);
         assert_eq!(draft(&state).game_cursor, 1);
-        update(&mut state, key(KeyCode::Char('c')), NOW);
+        update(&mut state, key(Key::Char('c')), NOW);
         for c in "mario".chars() {
-            update(&mut state, key(KeyCode::Char(c)), NOW);
+            update(&mut state, key(Key::Char(c)), NOW);
         }
-        update(&mut state, key(KeyCode::Enter), NOW);
-        update(&mut state, key(KeyCode::Tab), NOW); // right keeps Fox
+        update(&mut state, key(Key::Enter), NOW);
+        update(&mut state, key(Key::Tab), NOW); // right keeps Fox
 
         // Game 3 inherits the switched pick.
-        update(&mut state, key(KeyCode::Char('1')), NOW);
-        update(&mut state, key(KeyCode::Enter), NOW);
-        let effects = update(&mut state, key(KeyCode::Char('y')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Enter), NOW);
+        let effects = update(&mut state, key(Key::Char('y')), NOW);
         let report = report_payload(&effects);
         assert_eq!(report.games.len(), 3);
         let left_char = |ix: usize| report.games[ix].selections[0].character_id;
@@ -4305,11 +4191,11 @@ mod tests {
         let mut state = twelve_station_app();
 
         // "1" is ambiguous while stations 10-12 exist: it buffers…
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         assert!(state.ui.modal.is_none());
         assert_eq!(state.ui.setup_entry.as_ref().map(|p| p.digits.as_str()), Some("1"));
         // …and "12" cannot grow further, so it selects setup 12.
-        update(&mut state, key(KeyCode::Char('2')), NOW);
+        update(&mut state, key(Key::Char('2')), NOW);
         assert!(state.ui.setup_entry.is_none());
         assert!(matches!(state.ui.modal, Some(Modal::CallPicker { setup: SetupId(12), .. })));
     }
@@ -4317,7 +4203,7 @@ mod tests {
     #[test]
     fn buffered_setup_digit_commits_on_the_grace_tick() {
         let mut state = twelve_station_app();
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         update(&mut state, Msg::Tick, NOW + 200);
         assert!(state.ui.setup_entry.is_some(), "inside the grace window");
         update(&mut state, Msg::Tick, NOW + super::SETUP_ENTRY_GRACE_MS);
@@ -4328,7 +4214,7 @@ mod tests {
     #[test]
     fn small_boards_keep_instant_digit_selection() {
         let mut state = se4_app(true);
-        update(&mut state, key(KeyCode::Char('1')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
         assert!(state.ui.setup_entry.is_none(), "two stations: no buffering");
         assert!(matches!(state.ui.modal, Some(Modal::CallPicker { setup: SetupId(1), .. })));
     }
@@ -4338,7 +4224,7 @@ mod tests {
         let mut state = se4_app(true);
         let players = state.world.queue.first().map(|e| e.players.clone()).expect("a callable entry");
 
-        let effects = update(&mut state, key(KeyCode::Enter), NOW);
+        let effects = update(&mut state, key(Key::Enter), NOW);
         let called = state
             .board
             .setups()
