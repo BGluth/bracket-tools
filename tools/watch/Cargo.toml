@@ -1,0 +1,22 @@
+[package]
+name = "bracket-tools-watch"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gg-watch"
+path = "src/main.rs"
+
+[dependencies]
+bracket-tools-cache = { path = "../../crates/bracket-tools-cache" }
+bracket-tools-startgg = { path = "../../crates/bracket-tools-startgg" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+directories = { workspace = true }
+icalendar = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+toml = { workspace = true }

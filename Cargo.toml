@@ -8,6 +8,7 @@ members = [
     "tools/reporter/reporter-cli",
     "tools/reporter/reporter-state",
     "tools/admin",
+    "tools/watch",
     "tools/daemon",
     "tools/scheduler/core",
     "tools/scheduler/tui",
@@ -56,6 +57,8 @@ cfg-if = "1"
 gloo-timers = { version = "0.4", features = ["futures"] }
 # The scheduler's browser/desktop UI (tools/scheduler/web) and the site shell (tools/app).
 dioxus = "0.7"
+# iCalendar feed writer for the event watcher (tools/watch).
+icalendar = "0.17"
 
 [profile.release]
 opt-level = 3
