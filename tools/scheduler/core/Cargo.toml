@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync"] }
 toml = { workspace = true }
 web-time = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 # Virtual-time tests (start_paused) for the poller loop.

@@ -7,6 +7,30 @@ use crate::{
     ui_action::{Move, ReportAction, Side, UiAction},
 };
 
+/// The key legend the `?` help shows (the terminal shell appends its quit
+/// line).
+pub const HELP_LINES: &[&str] = &[
+    "1-9/0     pick a free setup (call picker) / select an occupied one",
+    "          (boards past 10 stations buffer digits: 1 4 = setup 14)",
+    "Enter     call the highlighted queue entry on its first free setup",
+    "          (in picker: commit the selected call)",
+    "p         selected setup: called -> in progress",
+    "f         selected setup: free, awaiting remote result",
+    "r         selected setup: un-call, set returns to the queue",
+    "g         report the selected setup's set (games + characters + DQ)",
+    "/         find an on-station set by player name (Enter reports it)",
+    "t         toggle sponsor prefixes on player names",
+    "z         snooze the highlighted queue entry (5m)",
+    "d         player flags for the highlighted entry (rest/depart)",
+    "a         reassign the selected setup's pool (redeploy)",
+    "s         stations: add/retire setups mid-event",
+    "i         inspect blocked sets (why not callable)",
+    "n         notices page (Enter acks, c clears all)",
+    "w         pending writes + divergence ledger",
+    "Up/Down   move the queue highlight (PgUp/PgDn jump 10)",
+    "u         undo the last local action (single level)",
+];
+
 /// The keys the scheduler reacts to, independent of the terminal library.
 /// `Other` is any key it doesn't model (those still dismiss list modals).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

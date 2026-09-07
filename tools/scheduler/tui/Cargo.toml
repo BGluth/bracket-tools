@@ -14,7 +14,6 @@ bracket-tools-cache = { path = "../../../crates/bracket-tools-cache", default-fe
 bracket-tools-startgg = { path = "../../../crates/bracket-tools-startgg", default-features = false }
 bracket-tools-startgg-schema = { path = "../../../crates/bracket-tools-startgg-schema" }
 anyhow = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true }
 cynic = { workspace = true }
 directories = { workspace = true }

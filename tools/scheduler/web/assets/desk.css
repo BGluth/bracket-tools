@@ -43,6 +43,21 @@
 .dialog input[type=number] { width: 5em; text-align: right; }
 .dialog table { margin-bottom: 8px; }
 .dialog button:disabled { opacity: .45; cursor: default; }
+.dialog { min-width: 480px; max-width: 90vw; }
+.dialog tr.targeted td { background: var(--line); }
+.dialog tr.warn td { color: var(--called); }
+.dialog tr.error td { color: var(--busy); }
+.dialog tr.acked td { color: var(--dim); }
+.dialog h3 { margin: 12px 0 4px; font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+.dialog ul.blocked li { display: block; }
+.dialog details summary { cursor: pointer; }
+.dialog details ul { margin: 4px 0 0 1.2em; }
+.dialog details li { display: list-item; border-bottom: none; padding: 2px 0; color: var(--dim); }
+.dialog pre.keys { margin: 0 0 10px; font-size: 13px; line-height: 1.4; }
+.station.selected { outline: 2px solid var(--accent); }
+.desk tr.cursor td { background: var(--line); }
+.desk h2 button.link { margin-left: 8px; padding: 0 4px; font-size: 12px; text-transform: none; letter-spacing: 0; }
+.desk .toolbar button.alert { color: var(--busy); }
 .loading, .failed, .empty { padding: 40px; text-align: center; color: var(--dim); }
 .desk .toolbar .writes { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: var(--line); color: var(--dim); }
 .desk .toolbar .writes.armed { background: var(--busy); color: var(--text); }

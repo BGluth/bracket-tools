@@ -2,8 +2,9 @@
 //! asked. The keymap produces them from keys; `app::update` applies them.
 
 use crate::{
+    app::{ReassignOption, WriteIntent},
     config::SetupId,
-    conflict::UnixMillis,
+    conflict::{ConflictKey, UnixMillis},
     model::{BracketId, SetKey},
 };
 
@@ -126,6 +127,16 @@ pub enum UiAction {
         setup_type: String,
         target: u32,
     },
+    ReassignSetup {
+        setup: SetupId,
+        option: ReassignOption,
+    },
+    /// Cycle the flag of one of the open flags modal's players.
+    CycleFlagFor(ConflictKey),
+    /// Retry exactly this parked write.
+    RetryWrite(Box<WriteIntent>),
+    /// Drop exactly this parked write.
+    DiscardWrite(Box<WriteIntent>),
 }
 
 /// Intents inside the report modal.

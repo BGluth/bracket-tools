@@ -1,27 +1,44 @@
 //! The desk's dialogs over `ui.modal`: the call picker, the report flow,
-//! the stations editor and the set finder.
+//! the stations editor, the set finder, and the browse/fix dialogs the
+//! terminal shell keeps behind letter keys.
 
 use bracket_tools_scheduler_core::{
-    app::{filtered_roster, find_set_rows, picker_rows, report_roster, setups_rows, AppState, Modal, ReportDraft, ReportStage, SetupsRow},
+    app::{
+        blocked_entries, divergence_ledger, filtered_roster, find_set_rows, flag_label, picker_rows, reassign_options, report_roster,
+        setups_rows, AppState, Modal, NoticeLevel, PendingStatus, ReassignOption, ReportDraft, ReportStage, SetupsRow,
+    },
     config::SetupId,
-    conflict::SetupStatus,
+    conflict::{ConflictKey, PoolOverride, SetupStatus},
+    keymap::HELP_LINES,
+    model::{BracketId, SetKey},
+    text::{fmt_age, players_line, reason_line, reason_tag, short_name},
+    timers::now_millis,
     ui_action::{ReportAction, Side, UiAction},
     world::RolloutRow,
 };
 use dioxus::prelude::*;
 
-use crate::{bridge::Session, views::dispatcher};
+use crate::{
+    bridge::Session,
+    views::{dispatcher, level_class},
+};
 
 /// Whichever dialog the state has open.
 #[component]
 pub fn Modals(session: Session) -> Element {
     let modal = session.state.read().ui.modal.clone();
     match modal {
-        Some(Modal::CallPicker { setup, .. }) => rsx! { CallPicker { session, setup } },
+        Some(Modal::CallPicker { setup, selected, .. }) => rsx! { CallPicker { session, setup, selected } },
         Some(Modal::Report(draft)) => rsx! { Report { session, draft: *draft } },
-        Some(Modal::Setups { .. }) => rsx! { Setups { session } },
-        Some(Modal::FindSet { query, .. }) => rsx! { FindSet { session, query } },
-        _ => rsx! {},
+        Some(Modal::Setups { selected }) => rsx! { Setups { session, selected } },
+        Some(Modal::FindSet { query, selected }) => rsx! { FindSet { session, query, selected } },
+        Some(Modal::Reassign { setup, selected }) => rsx! { Reassign { session, setup, selected } },
+        Some(Modal::PlayerFlags { players, selected }) => rsx! { Flags { session, players, selected } },
+        Some(Modal::PendingWrites { selected }) => rsx! { PendingWrites { session, selected } },
+        Some(Modal::Inspection { selected }) => rsx! { Inspection { session, selected } },
+        Some(Modal::Notices { selected }) => rsx! { Notices { session, selected } },
+        Some(Modal::Help) => rsx! { Help { session } },
+        None => rsx! {},
     }
 }
 
@@ -42,19 +59,29 @@ fn Dialog(title: String, #[props(default)] hint: String, children: Element) -> E
     }
 }
 
+/// The keyboard cursor's row class.
+fn targeted(is_cursor: bool) -> &'static str {
+    if is_cursor {
+        "targeted"
+    } else {
+        ""
+    }
+}
+
 #[component]
-fn CallPicker(session: Session, setup: SetupId) -> Element {
+fn CallPicker(session: Session, setup: SetupId, selected: usize) -> Element {
     let state = session.state.read();
     let (rows, from_rollout) = picker_rows(&state, setup);
+    let empty = rows.is_empty();
     rsx! {
         Dialog {
             title: format!("Setup {}", setup.0),
             hint: if from_rollout { "rollout ranking" } else { "greedy ranking" },
             ul {
-                for row in rows {
+                for (ix, row) in rows.into_iter().enumerate() {
                     match row {
                         RolloutRow::Call(entry) => rsx! {
-                            li {
+                            li { class: targeted(ix == selected),
                                 span { class: "label", "{entry.players} — {entry.round_text} ({entry.bracket.0})" }
                                 button {
                                     onclick: dispatcher(&session, UiAction::CallSet { setup, bracket: entry.bracket.clone(), key: entry.key.clone() }),
@@ -62,11 +89,19 @@ fn CallPicker(session: Session, setup: SetupId) -> Element {
                                 }
                             }
                         },
-                        RolloutRow::Hold { .. } => rsx! { li { class: "hold", "hold this setup open" } },
+                        RolloutRow::Hold { .. } => rsx! { li { class: "hold {targeted(ix == selected)}", "hold this setup open" } },
                     }
                 }
+                if empty {
+                    li { class: "hold", "nothing callable on this setup's pool" }
+                }
             }
-            button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
+            div { class: "row",
+                if empty {
+                    button { class: "quiet", onclick: dispatcher(&session, UiAction::OpenReassign(setup)), "reassign pool" }
+                }
+                button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
+            }
         }
     }
 }
@@ -86,7 +121,7 @@ fn Report(session: Session, draft: ReportDraft) -> Element {
             ul { class: "games",
                 for (ix, game) in draft.games.iter().enumerate() {
                     li {
-                        class: if in_games && ix == draft.game_cursor { "targeted" } else { "" },
+                        class: targeted(in_games && ix == draft.game_cursor),
                         onclick: dispatcher(&session, report(ReportAction::TargetGame(ix))),
                         span { class: "label", "game {ix + 1}: {draft.side(game.winner).name}" }
                         if game.chars.iter().any(Option::is_some) {
@@ -170,7 +205,7 @@ fn characters_stage(session: &Session, state: &AppState, draft: &ReportDraft, si
         }
         ul { class: "roster",
             for (ix, character) in matches.iter().enumerate() {
-                li { class: if ix == cursor { "targeted" } else { "" },
+                li { class: targeted(ix == cursor),
                     span { class: "label", "{character.name}" }
                     button { onclick: dispatcher(session, report(ReportAction::PickCharacter(Some(character.id)))), "pick" }
                 }
@@ -228,18 +263,18 @@ fn character_names(state: &AppState, draft: &ReportDraft, chars: &[Option<i32>; 
 }
 
 #[component]
-fn Setups(session: Session) -> Element {
+fn Setups(session: Session, selected: usize) -> Element {
     let state = session.state.read();
     let count_of = |setup_type: &str| state.board.setups().iter().filter(|s| s.setup_type == setup_type).count();
     rsx! {
         Dialog { title: "Stations", hint: "retire free stations, add arrivals, or set a type's count",
             ul {
-                for row in setups_rows(&state) {
+                for (ix, row) in setups_rows(&state).into_iter().enumerate() {
                     match row {
                         SetupsRow::Retire(id, setup_type) => {
                             let free = state.board.setups().iter().any(|s| s.id == id && s.status == SetupStatus::Free);
                             rsx! {
-                                li {
+                                li { class: targeted(ix == selected),
                                     span { class: "label",
                                         "setup {id.0} "
                                         span { class: "hint", "{setup_type} · " if free { "free" } else { "occupied" } }
@@ -255,7 +290,7 @@ fn Setups(session: Session) -> Element {
                             }
                         }
                         SetupsRow::Add(setup_type) => rsx! {
-                            li { class: "add",
+                            li { class: "add {targeted(ix == selected)}",
                                 span { class: "label", "{count_of(&setup_type)} × {setup_type}" }
                                 TypeCount { key: "{setup_type}", session: session.clone(), setup_type: setup_type.clone() }
                                 button { onclick: dispatcher(&session, UiAction::AddSetup(setup_type.clone())), "add one" }
@@ -297,7 +332,7 @@ fn TypeCount(session: Session, setup_type: String) -> Element {
 }
 
 #[component]
-fn FindSet(session: Session, query: String) -> Element {
+fn FindSet(session: Session, query: String, selected: usize) -> Element {
     let state = session.state.read();
     let rows = find_set_rows(&state, &query);
     let armed = state.writes_armed;
@@ -328,11 +363,11 @@ fn FindSet(session: Session, query: String) -> Element {
                     tr { th { "setup" } th { "status" } th { "bracket" } th { "round" } th { "players" } th {} }
                 }
                 tbody {
-                    for row in rows {
-                        tr {
+                    for (ix, row) in rows.into_iter().enumerate() {
+                        tr { class: targeted(ix == selected),
                             td { "{row.setup.0}" }
                             td { "{row.status}" }
-                            td { "{row.bracket.0}" }
+                            td { {short_name(&row.bracket)} }
                             td { "{row.round_text}" }
                             td { "{row.players}" }
                             td {
@@ -363,4 +398,211 @@ fn FindSet(session: Session, query: String) -> Element {
 fn report_found(session: &Session, setup: SetupId) {
     session.dispatch(UiAction::CloseModal);
     session.dispatch(UiAction::OpenReport(setup));
+}
+
+#[component]
+fn Reassign(session: Session, setup: SetupId, selected: usize) -> Element {
+    let state = session.state.read();
+    let current = match state.pool_overrides.get(&setup) {
+        Some(PoolOverride::Dedicated(bracket)) => format!("only {}", short_name(bracket)),
+        Some(PoolOverride::AllowAny) => "any bracket".to_owned(),
+        None => "config pools".to_owned(),
+    };
+    rsx! {
+        Dialog { title: "Reassign setup {setup.0}", hint: "now: {current}",
+            ul {
+                for (ix, option) in reassign_options(&state).into_iter().enumerate() {
+                    li { class: targeted(ix == selected),
+                        span { class: "label", {reassign_label(&option)} }
+                        button { onclick: dispatcher(&session, UiAction::ReassignSetup { setup, option: option.clone() }), "apply" }
+                    }
+                }
+            }
+            button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
+        }
+    }
+}
+
+fn reassign_label(option: &ReassignOption) -> String {
+    match option {
+        ReassignOption::Dedicate(bracket) => format!("only {}", short_name(bracket)),
+        ReassignOption::AllowAny => "allow any bracket".to_owned(),
+        ReassignOption::RestoreConfig => "restore config pools".to_owned(),
+    }
+}
+
+#[component]
+fn Flags(session: Session, players: Vec<(ConflictKey, String)>, selected: usize) -> Element {
+    let state = session.state.read();
+    rsx! {
+        Dialog { title: "Player flags", hint: "resting → departed → force-available → clear",
+            ul {
+                for (ix, (key, name)) in players.iter().enumerate() {
+                    li { class: targeted(ix == selected),
+                        span { class: "label",
+                            "{name} "
+                            span { class: "hint", {flag_label(&state.flags, key)} }
+                        }
+                        button { onclick: dispatcher(&session, UiAction::CycleFlagFor(key.clone())), "cycle" }
+                    }
+                }
+            }
+            button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
+        }
+    }
+}
+
+#[component]
+fn PendingWrites(session: Session, selected: usize) -> Element {
+    let state = session.state.read();
+    let ledger = divergence_ledger(&state);
+    rsx! {
+        Dialog { title: "Pending writes ({state.pending_writes.len()})", hint: "parked writes wait for a retry or a discard",
+            table {
+                thead {
+                    tr { th { "write" } th { "set" } th { "bracket" } th { "status" } th { class: "num", "tries" } th { "last error" } th {} }
+                }
+                tbody {
+                    for (ix, pending) in state.pending_writes.iter().enumerate() {
+                        tr { class: targeted(ix == selected),
+                            td { {pending.intent.kind.label()} }
+                            td { "{pending.intent.id}" }
+                            td { {short_name(&pending.intent.bracket)} }
+                            td { {pending_status(pending.status)} }
+                            td { class: "num", "{pending.attempts}" }
+                            td { class: "hint", {pending.last_error.clone().unwrap_or_default()} }
+                            td {
+                                if pending.status == PendingStatus::Parked {
+                                    button { onclick: dispatcher(&session, UiAction::RetryWrite(Box::new(pending.intent.clone()))), "retry" }
+                                    " "
+                                    button { class: "quiet", onclick: dispatcher(&session, UiAction::DiscardWrite(Box::new(pending.intent.clone()))), "discard" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if state.pending_writes.is_empty() {
+                p { class: "hint", "nothing pending" }
+            }
+            h3 { "Remote shows called, locally re-queued ({ledger.len()})" }
+            ul {
+                for (bracket, key) in ledger.iter() {
+                    li { {ledger_line(&state, bracket, key)} }
+                }
+            }
+            button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
+        }
+    }
+}
+
+fn pending_status(status: PendingStatus) -> &'static str {
+    match status {
+        PendingStatus::Queued => "queued",
+        PendingStatus::AwaitingReconnect => "awaiting reconnect",
+        PendingStatus::Parked => "PARKED",
+    }
+}
+
+fn ledger_line(state: &AppState, bracket: &BracketId, key: &SetKey) -> String {
+    format!(
+        "{} R{} {} — {} (desk board is authoritative)",
+        short_name(bracket),
+        key.round,
+        key.identifier,
+        players_line(state, bracket, key)
+    )
+}
+
+#[component]
+fn Inspection(session: Session, selected: usize) -> Element {
+    let state = session.state.read();
+    let entries = blocked_entries(&state);
+    rsx! {
+        Dialog { title: "Blocked sets ({entries.len()})", hint: "why a set isn't callable; open a row for the details",
+            ul { class: "blocked",
+                for (ix, (bracket, key)) in entries.iter().enumerate() {
+                    li { class: targeted(ix == selected),
+                        details { open: ix == selected,
+                            summary {
+                                strong { {short_name(bracket)} }
+                                " R{key.round} {key.identifier} — {players_line(&state, bracket, key)} "
+                                span { class: "hint", {reason_tags(&state, bracket, key)} }
+                            }
+                            ul {
+                                for reason in state.world.blocked.get(&(bracket.clone(), key.clone())).into_iter().flatten() {
+                                    li { {reason_line(&state, reason)} }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if entries.is_empty() {
+                p { class: "hint", "nothing is blocked" }
+            }
+            button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
+        }
+    }
+}
+
+fn reason_tags(state: &AppState, bracket: &BracketId, key: &SetKey) -> String {
+    state
+        .world
+        .blocked
+        .get(&(bracket.clone(), key.clone()))
+        .map(|reasons| reasons.iter().map(reason_tag).collect::<Vec<_>>().join(", "))
+        .unwrap_or_default()
+}
+
+#[component]
+fn Notices(session: Session, selected: usize) -> Element {
+    let state = session.state.read();
+    let now = now_millis();
+    let unread = state.notices.iter().filter(|n| !n.acked && n.level != NoticeLevel::Info).count();
+    rsx! {
+        Dialog { title: "Notices", hint: "{unread} unread",
+            table {
+                thead {
+                    tr { th { "age" } th { "level" } th { "notice" } th {} }
+                }
+                tbody {
+                    for (ix, notice) in state.notices.iter().rev().enumerate() {
+                        tr { class: "{level_class(notice.level, notice.acked)} {targeted(ix == selected)}",
+                            td { {fmt_age(now - notice.at)} }
+                            td { {level_text(notice.level)} }
+                            td { "{notice.text}" }
+                            td {
+                                if !notice.acked {
+                                    button { class: "quiet", onclick: dispatcher(&session, UiAction::AckNoticeAt(notice.at)), "ok" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            div { class: "row",
+                button { class: "quiet", onclick: dispatcher(&session, UiAction::ClearNotices), "clear all" }
+                button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
+            }
+        }
+    }
+}
+
+fn level_text(level: NoticeLevel) -> &'static str {
+    match level {
+        NoticeLevel::Info => "info",
+        NoticeLevel::Warn => "warn",
+        NoticeLevel::Error => "ERROR",
+    }
+}
+
+#[component]
+fn Help(session: Session) -> Element {
+    rsx! {
+        Dialog { title: "Keys", hint: "the desk's keyboard, the same as the terminal's",
+            pre { class: "keys", {HELP_LINES.join("\n")} }
+            button { class: "quiet", onclick: dispatcher(&session, UiAction::CloseModal), "close" }
+        }
+    }
 }

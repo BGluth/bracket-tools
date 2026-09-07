@@ -22,6 +22,7 @@ pub mod simulator;
 pub mod state_doc;
 #[doc(hidden)]
 pub mod synth;
+pub mod text;
 pub mod timers;
 pub mod ui_action;
 pub mod world;

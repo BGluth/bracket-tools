@@ -1222,6 +1222,18 @@ fn apply_action(state: &mut AppState, action: UiAction, now: UnixMillis, effects
             set_setup_count(state, setup_type, target, now, effects);
             clamp_setups_cursor(state);
         }
+        UiAction::ReassignSetup { setup, option } => reassign_setup(state, setup, &option, now),
+        UiAction::CycleFlagFor(key) => cycle_flag_for(state, &key, now),
+        UiAction::RetryWrite(intent) => {
+            if let Some(ix) = pending_ix(state, &intent) {
+                retry_parked(state, ix, now, effects);
+            }
+        }
+        UiAction::DiscardWrite(intent) => {
+            if let Some(ix) = pending_ix(state, &intent) {
+                discard_pending(state, ix, now);
+            }
+        }
     }
 }
 
@@ -1701,6 +1713,26 @@ pub fn blocked_entries(state: &AppState) -> Vec<(BracketId, SetKey)> {
     keys
 }
 
+/// Re-queued sets whose remote state still carries CALLED evidence.
+pub fn divergence_ledger(state: &AppState) -> Vec<(BracketId, SetKey)> {
+    let mut pairs: Vec<(BracketId, SetKey)> = state
+        .tombstones
+        .suppress_remote_called
+        .iter()
+        .filter(|(bracket, key)| {
+            state
+                .brackets
+                .iter()
+                .find(|b| &b.state.id == bracket)
+                .and_then(|b| b.state.sets.iter().find(|s| &s.key == key))
+                .is_some_and(|s| !s.is_completed() && s.called_evidence(&state.called_ints))
+        })
+        .cloned()
+        .collect();
+    pairs.sort();
+    pairs
+}
+
 /// Acks the notice at `display_ix` in newest-first order (the notices page's
 /// presentation order).
 fn ack_notice(state: &mut AppState, display_ix: usize) {
@@ -1711,6 +1743,12 @@ fn ack_notice(state: &mut AppState, display_ix: usize) {
     if let Some(notice) = state.notices.get_mut(len - 1 - display_ix) {
         notice.acked = true;
     }
+}
+
+/// The pending-writes row holding exactly this intent (a result landing
+/// between render and click shifts the indexes).
+fn pending_ix(state: &AppState, intent: &WriteIntent) -> Option<usize> {
+    state.pending_writes.iter().position(|p| p.intent == *intent)
 }
 
 /// Enter on a parked write: re-queue it with a fresh attempt budget.
@@ -1784,17 +1822,20 @@ fn open_reassign(state: &mut AppState, setup: SetupId, now: UnixMillis) {
     state.ui.modal = Some(Modal::Reassign { setup, selected: 0 });
 }
 
+/// Enter in the reassign modal: the highlighted option.
+fn apply_reassign(state: &mut AppState, setup: SetupId, selected: usize, now: UnixMillis) {
+    if let Some(option) = reassign_options(state).into_iter().nth(selected) {
+        reassign_setup(state, setup, &option, now);
+    }
+}
+
 /// Pool overrides only ever name stations on the board (retiring one drops
 /// its override), so a stale target is refused rather than persisted.
-fn apply_reassign(state: &mut AppState, setup: SetupId, selected: usize, now: UnixMillis) {
+fn reassign_setup(state: &mut AppState, setup: SetupId, option: &ReassignOption, now: UnixMillis) {
     if setup_status(state, setup).is_none() {
         state.notice(now, NoticeLevel::Warn, format!("no setup {} configured", setup.0));
         return;
     }
-    let options = reassign_options(state);
-    let Some(option) = options.get(selected) else {
-        return;
-    };
     push_undo(state, format!("reassign setup {}", setup.0));
     let text = match option {
         ReassignOption::Dedicate(bracket) => {
@@ -2207,9 +2248,23 @@ fn game_selections(draft: &ReportDraft, game: &GameDraft) -> Vec<GameSelection> 
 }
 
 fn cycle_selected_flag(state: &mut AppState, players: &[(ConflictKey, String)], selected: usize, now: UnixMillis) {
-    let Some((key, name)) = players.get(selected) else {
+    if let Some((key, name)) = players.get(selected) {
+        cycle_named_flag(state, key, name, now);
+    }
+}
+
+/// The identity-keyed form: the key must be one of the open modal's players
+/// (that is where its display name comes from).
+fn cycle_flag_for(state: &mut AppState, key: &ConflictKey, now: UnixMillis) {
+    let Some(Modal::PlayerFlags { players, .. }) = &state.ui.modal else {
         return;
     };
+    if let Some((_, name)) = players.iter().find(|(k, _)| k == key).cloned() {
+        cycle_named_flag(state, key, &name, now);
+    }
+}
+
+fn cycle_named_flag(state: &mut AppState, key: &ConflictKey, name: &str, now: UnixMillis) {
     push_undo(state, format!("flag change for {name}"));
     let label = cycle_flag(&mut state.flags, key);
     state.dirty = true;
@@ -2727,12 +2782,12 @@ mod tests {
 
     use super::{
         find_set_rows, recompute_world, setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus,
-        PollFailure, PollOutcome, PollResult, SetupsRow, SimUrgency, StructureUpdate, WriteIntent, WriteKind, WriteOutcome, WriteResult,
-        WORLD_REFRESH_MS,
+        PollFailure, PollOutcome, PollResult, ReassignOption, SetupsRow, SimUrgency, StructureUpdate, WriteIntent, WriteKind, WriteOutcome,
+        WriteResult, WORLD_REFRESH_MS,
     };
     use crate::{
         config::{BracketConfig, BracketMode, CallAction, OneOrMany, SchedulerConfig, SetupCounts, SetupId, DEFAULT_SETUP_TYPE},
-        conflict::{BlockReason, PoolOverride, SetupBoard, SetupStatus},
+        conflict::{BlockReason, ConflictKey, PoolOverride, SetupBoard, SetupStatus},
         fixture_source::FixtureSource,
         keymap::Key,
         model::{live_sets_from_schema, BracketId, LiveSet, PlayerId},
@@ -4267,6 +4322,47 @@ mod tests {
         assert!(report.games.is_empty(), "DQ reports carry no game data");
         assert!(report.summary.contains("DQ"), "{}", report.summary);
         assert!(report.summary.contains(&left_name), "{}", report.summary);
+    }
+
+    #[test]
+    fn identity_keyed_reassign_and_flag_intents() {
+        let mut state = se4_app(true);
+        let dedicate = UiAction::ReassignSetup {
+            setup: SetupId(2),
+            option: ReassignOption::Dedicate(BracketId("ultimate".to_owned())),
+        };
+        update(&mut state, Msg::Action(dedicate), NOW);
+        assert!(matches!(
+            state.pool_overrides.get(&SetupId(2)),
+            Some(PoolOverride::Dedicated(b)) if b.0 == "ultimate"
+        ));
+        let restore = UiAction::ReassignSetup {
+            setup: SetupId(2),
+            option: ReassignOption::RestoreConfig,
+        };
+        update(&mut state, Msg::Action(restore), NOW);
+        assert!(state.pool_overrides.is_empty());
+
+        let entry = state.world.queue[0].clone();
+        let open = UiAction::OpenFlagsFor {
+            bracket: entry.bracket,
+            key: entry.key,
+        };
+        update(&mut state, Msg::Action(open), NOW);
+        let Some(Modal::PlayerFlags { players, .. }) = state.ui.modal.clone() else {
+            panic!("expected the flags modal, got {:?}", state.ui.modal);
+        };
+        let (key, _) = players[1].clone();
+        update(&mut state, Msg::Action(UiAction::CycleFlagFor(key.clone())), NOW);
+        assert!(state.flags.resting.contains(&key));
+        assert!(!state.flags.resting.contains(&players[0].0), "only the named player changed");
+        // A key outside the modal's players is ignored.
+        update(
+            &mut state,
+            Msg::Action(UiAction::CycleFlagFor(ConflictKey::Player(PlayerId("999".to_owned())))),
+            NOW,
+        );
+        assert_eq!(state.flags.resting.len(), 1);
     }
 
     #[test]

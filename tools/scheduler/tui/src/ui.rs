@@ -8,15 +8,17 @@
 
 use bracket_tools_scheduler_core::{
     app::{
-        blocked_entries, filtered_roster, find_set_rows, flag_label, picker_rows, reassign_options, report_roster, setups_rows, AppState,
-        ListView, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage, SetupsRow,
+        blocked_entries, divergence_ledger, filtered_roster, find_set_rows, flag_label, picker_rows, reassign_options, report_roster,
+        setups_rows, AppState, ListView, Modal, NoticeLevel, PendingStatus, PollHealth, ReassignOption, ReportDraft, ReportStage,
+        SetupsRow,
     },
-    conflict::{occupant_keys, BlockReason, BusySource, ConflictKey, SetupStatus, UnixMillis},
-    model::{strip_sponsor, BracketId, SetKey},
+    conflict::{ConflictKey, SetupStatus, UnixMillis},
+    keymap::HELP_LINES,
+    model::{strip_sponsor, BracketId},
+    text::{fmt_age, fmt_clock, reason_line, reason_tag, short_name, show_tag, truncate},
     ui_action::Side,
     world::RolloutRow,
 };
-use chrono::{DateTime, Local};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -445,93 +447,6 @@ fn draw_inspection(frame: &mut Frame<'_>, state: &AppState, selected: usize) {
     );
 }
 
-/// Short tag for the row summary column.
-fn reason_tag(reason: &BlockReason) -> &'static str {
-    match reason {
-        BlockReason::ConflictOnlyBracket => "conflict-only",
-        BlockReason::Completed => "done",
-        BlockReason::RemotelyActive => "remote-active",
-        BlockReason::RemotelyCalled => "remote-called",
-        BlockReason::AwaitingRemoteCompletion => "awaiting-result",
-        BlockReason::SlotsUnresolved => "slots",
-        BlockReason::HasPlaceholder => "placeholder",
-        BlockReason::BracketHeld => "held",
-        BlockReason::BracketNotOpen { .. } => "not-open",
-        BlockReason::NoPermittedFreeSetup => "no-setup",
-        BlockReason::PlayerBusy { .. } => "busy",
-        BlockReason::PlayerResting { .. } => "resting",
-        BlockReason::PlayerDeparted { .. } => "departed",
-        BlockReason::RestWindow { .. } => "rest",
-        BlockReason::PlayerDisqualified { .. } => "dq",
-        BlockReason::Snoozed { .. } => "snoozed",
-    }
-}
-
-/// Full explanation with the correction hint inline.
-fn reason_line(state: &AppState, reason: &BlockReason) -> String {
-    match reason {
-        BlockReason::ConflictOnlyBracket => "conflict-only bracket — feeds the filter, never called from here".to_owned(),
-        BlockReason::Completed => "already completed".to_owned(),
-        BlockReason::RemotelyActive => "site shows it started — r on its setup re-queues if that's wrong".to_owned(),
-        BlockReason::RemotelyCalled => "site shows it called (someone else's call?) — d force-available overrides a player".to_owned(),
-        BlockReason::AwaitingRemoteCompletion => "desk finished it; waiting for the server to confirm".to_owned(),
-        BlockReason::SlotsUnresolved => "waiting on prerequisite sets to finish".to_owned(),
-        BlockReason::HasPlaceholder => "a slot is still a placeholder".to_owned(),
-        BlockReason::BracketHeld => "bracket is manually held".to_owned(),
-        BlockReason::BracketNotOpen { starts_at } => match starts_at {
-            Some(at) => format!("bracket not open yet (starts {})", fmt_clock(at * 1000)),
-            None => "bracket not open yet".to_owned(),
-        },
-        BlockReason::NoPermittedFreeSetup => "no free setup in this bracket's pool".to_owned(),
-        BlockReason::PlayerBusy { key, source } => format!("{} busy: {}", name_for_key(state, key), busy_source_line(source)),
-        BlockReason::PlayerResting { key } => format!("{} resting (d cycles flags)", name_for_key(state, key)),
-        BlockReason::PlayerDeparted { key } => format!("{} departed for the night", name_for_key(state, key)),
-        BlockReason::RestWindow { key, until } => {
-            format!("{} inside the rest window until {}", name_for_key(state, key), fmt_clock(*until))
-        }
-        BlockReason::PlayerDisqualified { key } => format!("{} disqualified on site", name_for_key(state, key)),
-        BlockReason::Snoozed { until } => format!("snoozed until {}", fmt_clock(*until)),
-    }
-}
-
-/// Which evidence marks a player busy, with the blocking set named.
-fn busy_source_line(source: &BusySource) -> String {
-    match source {
-        BusySource::LocalSetup { setup, bracket, set } => {
-            format!("on setup {} ({} R{} {})", setup.0, short_name(bracket), set.round, set.identifier)
-        }
-        BusySource::RemoteActive { bracket, set } => {
-            format!("started remotely in {} (R{} {})", short_name(bracket), set.round, set.identifier)
-        }
-        BusySource::RemoteCalled { bracket, set } => {
-            format!("called remotely in {} (R{} {})", short_name(bracket), set.round, set.identifier)
-        }
-        BusySource::SoftDeviation { bracket, set } => {
-            format!(
-                "unrecognized state change in {} (R{} {})",
-                short_name(bracket),
-                set.round,
-                set.identifier
-            )
-        }
-    }
-}
-
-/// Best-effort display name for a conflict key (scans current snapshots).
-fn name_for_key(state: &AppState, key: &ConflictKey) -> String {
-    state
-        .brackets
-        .iter()
-        .flat_map(|b| b.state.sets.iter())
-        .flat_map(|s| s.occupants())
-        .find(|o| occupant_keys(o, &state.aliases).contains(key))
-        .map(|o| o.display_name.clone())
-        .unwrap_or_else(|| match key {
-            ConflictKey::Player(p) => format!("player {}", p.0),
-            ConflictKey::Entrant(e) => format!("entrant {}", e.0),
-        })
-}
-
 fn draw_notices(frame: &mut Frame<'_>, state: &AppState, selected: usize, now: UnixMillis) {
     let area = centered_rect(frame.area(), 80, 70);
     frame.render_widget(Clear, area);
@@ -637,26 +552,6 @@ fn draw_pending_writes(frame: &mut Frame<'_>, state: &AppState, selected: usize)
             .block(Block::bordered().title(ledger_title)),
         ledger_area,
     );
-}
-
-/// Re-queued sets whose remote state still carries CALLED evidence.
-fn divergence_ledger(state: &AppState) -> Vec<(BracketId, SetKey)> {
-    let mut pairs: Vec<(BracketId, SetKey)> = state
-        .tombstones
-        .suppress_remote_called
-        .iter()
-        .filter(|(bracket, key)| {
-            state
-                .brackets
-                .iter()
-                .find(|b| &b.state.id == bracket)
-                .and_then(|b| b.state.sets.iter().find(|s| &s.key == key))
-                .is_some_and(|s| !s.is_completed() && s.called_evidence(&state.called_ints))
-        })
-        .cloned()
-        .collect();
-    pairs.sort();
-    pairs
 }
 
 fn draw_reassign(frame: &mut Frame<'_>, state: &AppState, setup: bracket_tools_scheduler_core::config::SetupId, selected: usize) {
@@ -913,42 +808,14 @@ fn character_name(state: &AppState, draft: &ReportDraft, chars: &[Option<i32>; 2
 fn draw_help(frame: &mut Frame<'_>) {
     let area = centered_rect(frame.area(), 60, 60);
     frame.render_widget(Clear, area);
-    let text = [
-        "1-9/0     pick a free setup (call picker) / select an occupied one",
-        "          (boards past 10 stations buffer digits: 1 4 = setup 14)",
-        "Enter     call the highlighted queue entry on its first free setup",
-        "          (in picker: commit the selected call)",
-        "p         selected setup: called -> in progress",
-        "f         selected setup: free, awaiting remote result",
-        "r         selected setup: un-call, set returns to the queue",
-        "g         report the selected setup's set (games + characters + DQ)",
-        "/         find an on-station set by player name (Enter reports it)",
-        "t         toggle sponsor prefixes on player names",
-        "z         snooze the highlighted queue entry (5m)",
-        "d         player flags for the highlighted entry (rest/depart)",
-        "a         reassign the selected setup's pool (redeploy)",
-        "s         stations: add/retire setups mid-event",
-        "i         inspect blocked sets (why not callable)",
-        "n         notices page (Enter acks, c clears all)",
-        "w         pending writes + divergence ledger",
-        "Up/Down   move the queue highlight (PgUp/PgDn jump 10)",
-        "u         undo the last local action (single level)",
-        "q/Ctrl-C  quit",
-    ]
-    .into_iter()
-    .map(Line::from)
-    .collect::<Vec<_>>();
+    let text = HELP_LINES
+        .iter()
+        .copied()
+        .chain(["q/Ctrl-C  quit"])
+        .map(Line::from)
+        .collect::<Vec<_>>();
     let help = Paragraph::new(text).block(Block::bordered().title("Keys — Esc closes"));
     frame.render_widget(help, area);
-}
-
-/// Sponsor-prefix-aware display of one tag (`t` toggle).
-fn show_tag<'a>(state: &AppState, name: &'a str) -> &'a str {
-    if state.hide_sponsors {
-        strip_sponsor(name)
-    } else {
-        name
-    }
 }
 
 /// The toggle applied to an already-joined "A vs B" string.
@@ -1008,35 +875,6 @@ fn centered_rect(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
     ])
     .areas(vertical);
     horizontal
-}
-
-fn short_name(id: &BracketId) -> &str {
-    id.0.rsplit('/').next().unwrap_or(&id.0)
-}
-
-fn truncate(name: &str, max: usize) -> String {
-    if name.chars().count() <= max {
-        name.to_owned()
-    } else {
-        name.chars().take(max.saturating_sub(1)).chain(['…']).collect()
-    }
-}
-
-fn fmt_age(millis: i64) -> String {
-    let secs = (millis / 1000).max(0);
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    }
-}
-
-fn fmt_clock(millis: UnixMillis) -> String {
-    DateTime::from_timestamp_millis(millis)
-        .map(|utc| utc.with_timezone(&Local).format("%H:%M").to_string())
-        .unwrap_or_else(|| "?".to_owned())
 }
 
 #[cfg(test)]

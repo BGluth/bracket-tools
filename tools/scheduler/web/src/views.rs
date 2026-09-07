@@ -2,10 +2,11 @@
 //! picker, all rendered from the session's `AppState`.
 
 use bracket_tools_scheduler_core::{
-    app::{AppState, NoticeLevel},
+    app::{AppState, NoticeLevel, PendingStatus},
     config::SetupId,
     conflict::{SetupStatus, UnixMillis},
     model::{BracketId, SetKey},
+    text::players_line,
     timers::now_millis,
     ui_action::UiAction,
 };
@@ -16,9 +17,15 @@ use crate::{bridge::Session, modals::Modals};
 /// The desk; `toolbar` adds shell-specific controls next to undo.
 #[component]
 pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] toolbar: Element) -> Element {
-    let (writes_armed, persist_failed) = {
+    let (writes_armed, persist_failed, blocked, pending, parked) = {
         let state = session.state.read();
-        (state.writes_armed, state.persist_failed)
+        (
+            state.writes_armed,
+            state.persist_failed,
+            state.world.blocked.len(),
+            state.pending_writes.len(),
+            state.pending_writes.iter().filter(|w| w.status == PendingStatus::Parked).count(),
+        )
     };
     rsx! {
         main { class: "desk",
@@ -34,6 +41,13 @@ pub fn Desk(session: Session, mode: String, #[props(default = VNode::empty())] t
                     {toolbar}
                     button { class: "quiet", onclick: dispatcher(&session, UiAction::OpenSetups), "stations" }
                     button { class: "quiet", onclick: dispatcher(&session, UiAction::OpenFindSet), "find set" }
+                    button { class: "quiet", onclick: dispatcher(&session, UiAction::OpenInspection), "blocked {blocked}" }
+                    button {
+                        class: if parked > 0 { "quiet alert" } else { "quiet" },
+                        onclick: dispatcher(&session, UiAction::OpenPendingWrites),
+                        "writes {pending}"
+                    }
+                    button { class: "quiet", onclick: dispatcher(&session, UiAction::OpenHelp), "keys" }
                     button { class: "quiet", onclick: dispatcher(&session, UiAction::Undo), "undo" }
                 }
             }
@@ -66,7 +80,7 @@ fn Stations(session: Session) -> Element {
     rsx! {
         section { class: "stations",
             for setup in state.board.setups().iter().cloned() {
-                div { class: "station {status_class(&setup.status)}",
+                div { class: "station {status_class(&setup.status)} {selected_class(&state, setup.id)}",
                     div { class: "placard", "{setup.id.0}" span { class: "type", "{setup.setup_type}" } }
                     div { class: "occupant", "{occupant_text(&state, &setup.status)}" }
                     div { class: "actions",
@@ -87,6 +101,7 @@ fn Stations(session: Session) -> Element {
                             },
                             SetupStatus::OccupiedExternal { .. } => rsx! { span { "in use elsewhere" } },
                         }
+                        button { class: "quiet", onclick: dispatcher(&session, UiAction::OpenReassign(setup.id)), "pool" }
                     }
                 }
             }
@@ -106,7 +121,7 @@ fn Queue(session: Session) -> Element {
                 }
                 tbody {
                     for (ix, entry) in state.world.queue.iter().enumerate() {
-                        tr {
+                        tr { class: if ix == state.ui.queue_ix { "cursor" } else { "" },
                             td { "{ix + 1}" }
                             td { "{entry.players}" }
                             td { "{entry.round_text}" }
@@ -117,6 +132,8 @@ fn Queue(session: Session) -> Element {
                                 button { onclick: dispatcher(&session, quick_call(&entry.bracket, &entry.key)), "call" }
                                 " "
                                 button { class: "quiet", onclick: dispatcher(&session, snooze(&entry.bracket, &entry.key)), "snooze" }
+                                " "
+                                button { class: "quiet", onclick: dispatcher(&session, flags(&entry.bracket, &entry.key)), "flags" }
                             }
                         }
                     }
@@ -147,7 +164,10 @@ fn Summaries(session: Session) -> Element {
 fn Notices(session: Session) -> Element {
     let state = session.state.read();
     rsx! {
-        h2 { "Notices" }
+        h2 {
+            "Notices"
+            button { class: "quiet link", onclick: dispatcher(&session, UiAction::OpenNotices), "all" }
+        }
         for notice in state.notices.iter().rev().take(8) {
             div { class: "notice {level_class(notice.level, notice.acked)}",
                 span { class: "text", "{notice.text}" }
@@ -179,6 +199,13 @@ fn snooze(bracket: &BracketId, key: &SetKey) -> UiAction {
     }
 }
 
+fn flags(bracket: &BracketId, key: &SetKey) -> UiAction {
+    UiAction::OpenFlagsFor {
+        bracket: bracket.clone(),
+        key: key.clone(),
+    }
+}
+
 fn status_class(status: &SetupStatus) -> &'static str {
     match status {
         SetupStatus::Free => "free",
@@ -195,11 +222,15 @@ fn occupant_text(state: &AppState, status: &SetupStatus) -> String {
         SetupStatus::InProgress { bracket, set } => (bracket, set, "playing"),
         SetupStatus::OccupiedExternal { .. } => return "occupied".to_owned(),
     };
-    let players = state
-        .find_set(bracket, key)
-        .map(|set| set.occupants().map(|o| o.display_name.as_str()).collect::<Vec<_>>().join(" vs "))
-        .unwrap_or_default();
-    format!("{verb}: {players}")
+    format!("{verb}: {}", players_line(state, bracket, key))
+}
+
+fn selected_class(state: &AppState, setup: SetupId) -> &'static str {
+    if state.ui.selected_setup == Some(setup) {
+        "selected"
+    } else {
+        ""
+    }
 }
 
 fn setups_text(setups: &[SetupId]) -> String {
@@ -214,7 +245,7 @@ fn finish_text(finish: Option<UnixMillis>, blocked: bool, now: UnixMillis) -> St
     }
 }
 
-fn level_class(level: NoticeLevel, acked: bool) -> String {
+pub(crate) fn level_class(level: NoticeLevel, acked: bool) -> String {
     let level = match level {
         NoticeLevel::Info => "info",
         NoticeLevel::Warn => "warn",
