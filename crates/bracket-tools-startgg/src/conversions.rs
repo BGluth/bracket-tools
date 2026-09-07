@@ -10,13 +10,14 @@ use bracket_tools_startgg_schema::{
     get_sets_for_event::{self, GetSetsForEvent},
     get_tournament_for_id::{self, GetTournamentForId},
     get_tournament_header::GetTournamentHeader,
-    get_tournaments_for_owner::{self, GetTournamentsForOwner},
+    list_tournaments::{self, ListTournaments},
     mark_set_called::MarkSetCalled,
     mark_set_in_progress::MarkSetInProgress,
     register_for_tournament::RegisterForTournament,
     report_bracket_set::ReportBracketSet,
     scalars::{Id as ScalarId, Timestamp},
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::gg_data_types::{GgCharacterSelection, HydratedGgGame, HydratedGgPlayer, HydratedGgSet, Matchup, SlotData, StartGgId};
@@ -194,7 +195,7 @@ pub fn extract_report_bracket_set(response: ReportBracketSet, reported_id: Start
 /// One playable character of an event's videogame. `id` is the numeric
 /// vocabulary `reportBracketSet` selections use. Serde: rosters are static
 /// per videogame, so callers cache them on disk.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterInfo {
     pub id: i32,
     pub name: String,
@@ -287,7 +288,7 @@ fn parse_scalar_id(id: &ScalarId) -> Option<StartGgId> {
 /// A tournament event as listed by the admin roster query: the numeric id the
 /// registration mutations take, plus display fields. Serde: rosters are
 /// cached on disk by callers (past tournaments' rosters are frozen).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminEvent {
     pub id: StartGgId,
     pub slug: String,
@@ -297,7 +298,7 @@ pub struct AdminEvent {
 /// The page-1 header of the admin roster query: tournament identity, start
 /// date (unix seconds), and event list (the slug → id vocabulary for
 /// registration).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminTournament {
     pub id: Option<StartGgId>,
     pub name: Option<String>,
@@ -308,7 +309,7 @@ pub struct AdminTournament {
 /// One tournament participant through the admin lens. `user_id` is the handle
 /// the registration mutations take; a participant without a user account
 /// (e.g. an admin-created shell) carries `None` and cannot be targeted.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminParticipant {
     pub id: Option<StartGgId>,
     pub gamer_tag: String,
@@ -436,20 +437,66 @@ pub fn extract_tournament_header(response: GetTournamentHeader) -> Result<Tourna
     })
 }
 
-/// One tournament from a filtered tournament listing (series-scan material).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One tournament from a filtered listing: identity, schedule, venue,
+/// registration state, and its events. Serde: callers persist listings
+/// between runs (feeds, change detection).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TournamentSummary {
     pub id: StartGgId,
+    /// The pinned `tournament/foo` form.
     pub slug: String,
     pub name: Option<String>,
     pub start_at: Option<i64>,
+    pub end_at: Option<i64>,
+    pub created_at: Option<i64>,
+    /// Bumped by start.gg's nightly batch on completed tournaments as well as
+    /// by real edits; not a reliable change signal on its own.
+    pub updated_at: Option<i64>,
+    pub city: Option<String>,
+    pub addr_state: Option<String>,
+    pub country_code: Option<String>,
+    pub venue_name: Option<String>,
+    pub venue_address: Option<String>,
+    /// IANA name, e.g. `America/Edmonton`.
+    pub timezone: Option<String>,
+    pub registration_open: Option<bool>,
+    pub registration_closes_at: Option<i64>,
+    pub num_attendees: Option<i32>,
+    pub owner_id: Option<StartGgId>,
+    pub events: Vec<EventSummary>,
+}
+
+impl TournamentSummary {
+    /// The public start.gg page for this tournament.
+    pub fn url(&self) -> String {
+        format!("https://www.start.gg/{}", self.slug)
+    }
+
+    /// The distinct game names across this tournament's events, in event order.
+    pub fn games(&self) -> Vec<&str> {
+        let mut games: Vec<&str> = Vec::new();
+        for game in self.events.iter().filter_map(|e| e.videogame.as_deref()) {
+            if !games.contains(&game) {
+                games.push(game);
+            }
+        }
+        games
+    }
+}
+
+/// One event of a listed tournament, with its game's display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSummary {
+    pub id: StartGgId,
+    pub name: Option<String>,
+    pub videogame: Option<String>,
 }
 
 /// Extracts one page of a filtered tournament listing plus the connection's
 /// total page count. A missing connection (nothing matched the filter) is an
 /// empty page, not an error. Suitable as the `extract_page` argument to
 /// [`GGProvider::fetch_all_pages`](crate::provider).
-pub fn extract_tournaments_page(response: &GetTournamentsForOwner) -> Result<Page<TournamentSummary>, GgConversionError> {
+pub fn extract_tournaments_page(response: &ListTournaments) -> Result<Page<TournamentSummary>, GgConversionError> {
     let connection = response.tournaments.as_ref();
 
     let total_pages = connection
@@ -464,12 +511,41 @@ pub fn extract_tournaments_page(response: &GetTournamentsForOwner) -> Result<Pag
     Ok(Page { items, total_pages })
 }
 
-fn tournament_summary(t: &get_tournaments_for_owner::Tournament) -> Option<TournamentSummary> {
+fn tournament_summary(t: &list_tournaments::Tournament) -> Option<TournamentSummary> {
+    let unix = |ts: Option<Timestamp>| ts.map(|ts| ts.0);
+    let events = t
+        .events
+        .iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            Some(EventSummary {
+                id: e.id.as_ref().and_then(parse_scalar_id)?,
+                name: e.name.clone(),
+                videogame: e.videogame.as_ref().and_then(|v| v.name.clone()),
+            })
+        })
+        .collect();
+
     Some(TournamentSummary {
         id: t.id.as_ref().and_then(parse_scalar_id)?,
         slug: t.slug.clone()?,
         name: t.name.clone(),
-        start_at: t.start_at.map(|ts| ts.0),
+        start_at: unix(t.start_at),
+        end_at: unix(t.end_at),
+        created_at: unix(t.created_at),
+        updated_at: unix(t.updated_at),
+        city: t.city.clone(),
+        addr_state: t.addr_state.clone(),
+        country_code: t.country_code.clone(),
+        venue_name: t.venue_name.clone(),
+        venue_address: t.venue_address.clone(),
+        timezone: t.timezone.clone(),
+        registration_open: t.is_registration_open,
+        registration_closes_at: unix(t.registration_closes_at),
+        num_attendees: t.num_attendees,
+        owner_id: t.owner.as_ref().and_then(|o| o.id.as_ref()).and_then(parse_scalar_id),
+        events,
     })
 }
 
@@ -569,7 +645,7 @@ mod tests {
         enums::ActivityState,
         generate_registration_token as grt, get_event_structure as ges, get_games_for_set as gfs, get_participants_for_tournament as gpt,
         get_player_for_player_id as gp, get_sets_for_event as gse, get_tournament_for_id as gt, get_tournament_header as gth,
-        get_tournaments_for_owner as gto, mark_set_called as msc, mark_set_in_progress as msip, register_for_tournament as rft,
+        list_tournaments as lt, mark_set_called as msc, mark_set_in_progress as msip, register_for_tournament as rft,
         scalars::{Id, Timestamp},
     };
 
@@ -685,30 +761,79 @@ mod tests {
         assert!(extract_tournament_header(gth::GetTournamentHeader { tournament: None }).is_err());
     }
 
+    fn listed_tournament(id: &str, slug: &str) -> lt::Tournament {
+        lt::Tournament {
+            id: Some(Id::new(id)),
+            name: Some(format!("T {id}")),
+            slug: Some(format!("tournament/{slug}")),
+            start_at: Some(Timestamp(1000)),
+            end_at: Some(Timestamp(2000)),
+            created_at: None,
+            updated_at: None,
+            city: Some("Town".into()),
+            addr_state: Some("AB".into()),
+            country_code: Some("CA".into()),
+            venue_name: None,
+            venue_address: None,
+            timezone: Some("America/Edmonton".into()),
+            is_registration_open: Some(true),
+            registration_closes_at: None,
+            num_attendees: Some(12),
+            owner: Some(lt::User { id: Some(Id::new("77")) }),
+            events: Some(vec![
+                Some(lt::Event {
+                    id: Some(Id::new("5")),
+                    name: Some("Singles".into()),
+                    videogame: Some(lt::Videogame {
+                        id: Some(Id::new("1386")),
+                        name: Some("Ultimate".into()),
+                    }),
+                }),
+                None,
+                Some(lt::Event {
+                    id: Some(Id::new("6")),
+                    name: Some("Doubles".into()),
+                    videogame: Some(lt::Videogame {
+                        id: Some(Id::new("1386")),
+                        name: Some("Ultimate".into()),
+                    }),
+                }),
+                Some(lt::Event {
+                    id: None,
+                    name: Some("id-less".into()),
+                    videogame: None,
+                }),
+            ]),
+        }
+    }
+
     #[test]
     fn tournaments_page_extraction() {
-        let node = |id: &str, slug: &str| {
-            Some(gto::Tournament {
-                id: Some(Id::new(id)),
-                name: Some(format!("T {id}")),
-                slug: Some(format!("tournament/{slug}")),
-                start_at: Some(Timestamp(1000)),
-            })
-        };
-        let response = gto::GetTournamentsForOwner {
-            tournaments: Some(gto::TournamentConnection {
-                page_info: Some(gto::PageInfo { total_pages: Some(2) }),
-                nodes: Some(vec![node("1", "fbr-99"), None, node("2", "fbr-100")]),
+        let response = lt::ListTournaments {
+            tournaments: Some(lt::TournamentConnection {
+                page_info: Some(lt::PageInfo { total_pages: Some(2) }),
+                nodes: Some(vec![
+                    Some(listed_tournament("1", "fbr-99")),
+                    None,
+                    Some(listed_tournament("2", "fbr-100")),
+                ]),
             }),
         };
 
         let page = extract_tournaments_page(&response).unwrap();
         assert_eq!(page.total_pages, 2);
         assert_eq!(page.items.len(), 2);
-        assert_eq!(page.items[1].slug, "tournament/fbr-100");
+        let second = &page.items[1];
+        assert_eq!(second.slug, "tournament/fbr-100");
+        assert_eq!(second.url(), "https://www.start.gg/tournament/fbr-100");
+        assert_eq!(second.owner_id, Some(77));
+        assert_eq!(second.registration_open, Some(true));
+        // Id-less events are dropped; games are deduplicated.
+        assert_eq!(second.events.len(), 2);
+        assert_eq!(second.games(), vec!["Ultimate"]);
 
         // Nothing matched the filter: empty page, not an error.
-        let empty = extract_tournaments_page(&gto::GetTournamentsForOwner { tournaments: None }).unwrap();
+        let empty = extract_tournaments_page(&lt::ListTournaments { tournaments: None }).unwrap();
         assert!(empty.items.is_empty());
         assert_eq!(empty.total_pages, 1);
     }

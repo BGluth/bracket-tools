@@ -23,9 +23,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use bracket_tools_cache::null_storage::NullStorage;
-use bracket_tools_startgg::{types::GGRestToken, AdminEvent, AdminParticipant, AdminTournament, GGProvider, StartGgId, TournamentSummary};
+use bracket_tools_startgg::{
+    slug::{bare_slug, normalize_tournament_slug, series_stem},
+    types::GGRestToken,
+    AdminEvent, AdminParticipant, AdminTournament, GGProvider, StartGgId, TournamentSummary,
+};
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
 
@@ -690,32 +694,6 @@ fn event_short(slug: &str) -> &str {
     slug.rsplit('/').next().unwrap_or(slug)
 }
 
-/// Accepts a bare slug, `tournament/foo`, or a full start.gg URL; returns the
-/// pinned `tournament/foo` form.
-fn normalize_tournament_slug(input: &str) -> String {
-    let trimmed = input.trim().trim_end_matches('/');
-    if let Some(ix) = trimmed.find("tournament/") {
-        let rest = &trimmed[ix + "tournament/".len()..];
-        let slug = rest.split('/').next().unwrap_or(rest);
-        return format!("tournament/{slug}");
-    }
-    format!("tournament/{trimmed}")
-}
-
-/// The bare slug (`french-bread-rumble-100`) from any accepted tournament form.
-fn bare_slug(input: &str) -> String {
-    normalize_tournament_slug(input).trim_start_matches("tournament/").to_string()
-}
-
-/// The series stem of a bare slug: `french-bread-rumble-100` →
-/// `french-bread-rumble`. A slug without a trailing number is its own stem.
-fn series_stem(bare: &str) -> &str {
-    match bare.rfind('-') {
-        Some(ix) if !bare[ix + 1..].is_empty() && bare[ix + 1..].chars().all(|c| c.is_ascii_digit()) => &bare[..ix],
-        _ => bare,
-    }
-}
-
 fn format_date(unix_secs: Option<i64>) -> String {
     unix_secs
         .and_then(|secs| DateTime::from_timestamp(secs, 0))
@@ -750,8 +728,7 @@ fn resolve_token(flag: Option<&Path>) -> Result<GGRestToken> {
 }
 
 fn token_from_file(path: &Path) -> Result<GGRestToken> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("reading token file {}", path.display()))?;
-    GGRestToken::from_str(raw.trim()).map_err(|e| anyhow!("invalid token in {}: {e}", path.display()))
+    Ok(GGRestToken::from_file(path)?)
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -765,10 +742,7 @@ fn expand_home(path: &str) -> PathBuf {
 mod tests {
     use bracket_tools_startgg::{AdminEvent, AdminParticipant};
 
-    use super::{
-        bare_slug, cache_usable, display_tag, event_short, normalize_tournament_slug, resolve_event, resolve_participant, series_stem,
-        ROSTER_FROZEN_AFTER_SECS,
-    };
+    use super::{cache_usable, display_tag, event_short, resolve_event, resolve_participant, ROSTER_FROZEN_AFTER_SECS};
 
     fn event(id: u64, short: &str, name: &str) -> AdminEvent {
         AdminEvent {
@@ -788,18 +762,6 @@ mod tests {
             user_id,
             user_slug: None,
             event_ids: vec![],
-        }
-    }
-
-    #[test]
-    fn tournament_slug_normalization() {
-        for input in [
-            "french-bread-rumble-100",
-            "tournament/french-bread-rumble-100",
-            "https://www.start.gg/tournament/french-bread-rumble-100/details",
-            "https://www.start.gg/tournament/french-bread-rumble-100/",
-        ] {
-            assert_eq!(normalize_tournament_slug(input), "tournament/french-bread-rumble-100");
         }
     }
 
@@ -838,22 +800,6 @@ mod tests {
         assert_eq!(resolve_participant(&twins, "ken").unwrap().user_id, Some(601));
         // `ke` is a prefix of both — ambiguous.
         assert!(resolve_participant(&twins, "ke").is_err());
-    }
-
-    #[test]
-    fn series_stems() {
-        assert_eq!(series_stem("french-bread-rumble-100"), "french-bread-rumble");
-        assert_eq!(series_stem("fbr-9"), "fbr");
-        assert_eq!(series_stem("weekly"), "weekly");
-        assert_eq!(series_stem("smash-64-arena"), "smash-64-arena");
-        assert_eq!(series_stem("trailing-dash-"), "trailing-dash-");
-    }
-
-    #[test]
-    fn bare_slugs() {
-        assert_eq!(bare_slug("https://www.start.gg/tournament/fbr-100/details"), "fbr-100");
-        assert_eq!(bare_slug("tournament/fbr-100"), "fbr-100");
-        assert_eq!(bare_slug("fbr-100"), "fbr-100");
     }
 
     #[test]

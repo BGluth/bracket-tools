@@ -16,11 +16,12 @@ use bracket_tools_startgg_schema::{
     get_sets_for_event::{self, GetSetsForEvent, GetSetsForEventVariables},
     get_tournament_for_id::{GetTournamentForId, GetTournamentForIdVariables},
     get_tournament_header::{GetTournamentHeader, GetTournamentHeaderVariables},
-    get_tournaments_for_owner::{GetTournamentsForOwner, GetTournamentsForOwnerVariables},
+    list_tournaments::{ListTournaments, ListTournamentsVariables, TournamentLocationFilter, TournamentPageFilter},
     mark_set_called::{MarkSetCalled, MarkSetCalledVariables},
     mark_set_in_progress::{MarkSetInProgress, MarkSetInProgressVariables},
     register_for_tournament::{RegisterForTournament, RegisterForTournamentVariables},
     report_bracket_set::{BracketSetGameDataInput, BracketSetGameSelectionInput, ReportBracketSet, ReportBracketSetVariables},
+    scalars::Timestamp,
 };
 use cynic::{
     http::{CynicReqwestError, ReqwestExt},
@@ -51,6 +52,57 @@ use crate::{
 
 /// The start.gg GraphQL endpoint. Public so tools capturing raw responses can
 /// hit the same URL the provider does.
+/// A radius search centred on a coordinate; `distance` uses start.gg's
+/// notation (`"50mi"`, `"100km"`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocationRadius {
+    pub lat: f64,
+    pub lng: f64,
+    pub distance: String,
+}
+
+/// Server-side filters for [`GGProvider::fetch_tournaments`]. Every field is
+/// optional and unset fields are omitted from the request; combine them
+/// freely (a region plus a date window is the usual sweep).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TournamentFilter {
+    /// Tournaments created by this user.
+    pub owner_id: Option<StartGgId>,
+    /// Tournaments the token's user administers.
+    pub admin_only: bool,
+    /// ISO 3166-1 alpha-2, e.g. `"CA"`.
+    pub country_code: Option<String>,
+    /// Province / state code as start.gg stores it, e.g. `"AB"`.
+    pub addr_state: Option<String>,
+    pub radius: Option<LocationRadius>,
+    /// Only tournaments starting at or after this unix time.
+    pub after: Option<i64>,
+    /// Only tournaments starting before this unix time.
+    pub before: Option<i64>,
+    pub published: Option<bool>,
+    /// Only tournaments with an event in one of these games.
+    pub videogame_ids: Vec<StartGgId>,
+}
+
+impl TournamentFilter {
+    fn to_page_filter(&self) -> TournamentPageFilter {
+        TournamentPageFilter {
+            owner_id: self.owner_id.map(gg_id),
+            is_current_user_admin: self.admin_only.then_some(true),
+            country_code: self.country_code.clone(),
+            addr_state: self.addr_state.clone(),
+            location: self.radius.as_ref().map(|r| TournamentLocationFilter {
+                distance_from: Some(format!("{},{}", r.lat, r.lng)),
+                distance: Some(r.distance.clone()),
+            }),
+            after_date: self.after.map(Timestamp),
+            before_date: self.before.map(Timestamp),
+            published: self.published,
+            videogame_ids: (!self.videogame_ids.is_empty()).then(|| self.videogame_ids.iter().copied().map(gg_id).map(Some).collect()),
+        }
+    }
+}
+
 pub const STARTGG_API_URL: &str = "https://api.start.gg/gql/alpha";
 const DEFAULT_REQUESTS_PER_MINUTE: u32 = 80;
 const DEFAULT_PAGE_SIZE: i32 = 25;
@@ -479,30 +531,15 @@ impl<S: Storage> GGProvider<S> {
         Ok(extract_tournament_header(data)?)
     }
 
-    /// Lists every tournament owned by `owner_id` (all pages) — series
-    /// discovery material. Bypasses the cache entirely.
-    pub async fn fetch_tournaments_by_owner(&self, owner_id: StartGgId) -> Result<Vec<TournamentSummary>, GGProviderError> {
-        self.fetch_tournaments_filtered(Some(owner_id), false).await
-    }
-
-    /// Lists every tournament the token's user administers (start.gg's
-    /// `isCurrentUserAdmin` filter; all pages). Bypasses the cache entirely.
-    pub async fn fetch_my_admin_tournaments(&self) -> Result<Vec<TournamentSummary>, GGProviderError> {
-        self.fetch_tournaments_filtered(None, true).await
-    }
-
-    async fn fetch_tournaments_filtered(
-        &self,
-        owner_id: Option<StartGgId>,
-        admin_only: bool,
-    ) -> Result<Vec<TournamentSummary>, GGProviderError> {
-        let owner = owner_id.map(gg_id);
+    /// Lists every tournament matching `filter` (all pages, earliest start
+    /// first). Bypasses the cache entirely.
+    pub async fn fetch_tournaments(&self, filter: &TournamentFilter) -> Result<Vec<TournamentSummary>, GGProviderError> {
+        let page_filter = filter.to_page_filter();
         let (tournaments, _first_page) = self
             .fetch_all_pages(
                 |page| {
-                    GetTournamentsForOwner::build(GetTournamentsForOwnerVariables {
-                        owner_id: owner.clone(),
-                        admin_only: admin_only.then_some(true),
+                    ListTournaments::build(ListTournamentsVariables {
+                        filter: page_filter.clone(),
                         page,
                         per_page: self.page_size,
                     })
@@ -512,6 +549,25 @@ impl<S: Storage> GGProvider<S> {
             .await?;
 
         Ok(tournaments)
+    }
+
+    /// Lists every tournament created by `owner_id` (series discovery seed).
+    pub async fn fetch_tournaments_by_owner(&self, owner_id: StartGgId) -> Result<Vec<TournamentSummary>, GGProviderError> {
+        self.fetch_tournaments(&TournamentFilter {
+            owner_id: Some(owner_id),
+            ..TournamentFilter::default()
+        })
+        .await
+    }
+
+    /// Lists every tournament the token's user administers (start.gg's
+    /// `isCurrentUserAdmin` filter).
+    pub async fn fetch_my_admin_tournaments(&self) -> Result<Vec<TournamentSummary>, GGProviderError> {
+        self.fetch_tournaments(&TournamentFilter {
+            admin_only: true,
+            ..TournamentFilter::default()
+        })
+        .await
     }
 
     /// Mints a registration token on behalf of `user_id` for the given events

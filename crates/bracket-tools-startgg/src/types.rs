@@ -1,9 +1,17 @@
-use std::str::FromStr;
+use std::{fs, io, path::Path, str::FromStr};
 
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
 pub struct GGRestToken(String);
+
+#[derive(Debug, Error)]
+pub enum GGRestTokenFileError {
+    #[error("reading token file {path}: {source}")]
+    Read { path: String, source: io::Error },
+    #[error("invalid token in {path}: {source}")]
+    Parse { path: String, source: GGRestTokenParseError },
+}
 
 #[derive(Debug, Error)]
 pub enum GGRestTokenParseError {
@@ -35,6 +43,17 @@ impl FromStr for GGRestToken {
 }
 
 impl GGRestToken {
+    /// Reads a token from a file (surrounding whitespace ignored).
+    pub fn from_file(path: &Path) -> Result<Self, GGRestTokenFileError> {
+        let display = path.display().to_string();
+        let raw = fs::read_to_string(path).map_err(|source| GGRestTokenFileError::Read {
+            path: display.clone(),
+            source,
+        })?;
+
+        Self::from_str(&raw).map_err(|source| GGRestTokenFileError::Parse { path: display, source })
+    }
+
     /// Returns the token as a `"Bearer <token>"` string for use in HTTP Authorization headers.
     pub fn as_bearer_value(&self) -> String {
         format!("Bearer {}", self.0)

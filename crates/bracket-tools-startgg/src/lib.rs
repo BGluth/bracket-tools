@@ -5,13 +5,14 @@ mod limit_journal;
 pub mod normalize;
 pub mod provider;
 pub mod session;
+pub mod slug;
 pub mod types;
 
 pub use conversions::{
-    AdminEvent, AdminParticipant, AdminProbeResult, AdminTournament, CharacterInfo, EventInfo, RegisteredParticipant, SetMutationResult,
-    TournamentHeader, TournamentSummary,
+    AdminEvent, AdminParticipant, AdminProbeResult, AdminTournament, CharacterInfo, EventInfo, EventSummary, RegisteredParticipant,
+    SetMutationResult, TournamentHeader, TournamentSummary,
 };
 pub use gg_data_types::StartGgId;
 pub use lazy::{LazyPlayer, LazySet, LazyTournament};
-pub use provider::{GGProvider, GGProviderError, GameReport, GameSelection, STARTGG_API_URL};
+pub use provider::{GGProvider, GGProviderError, GameReport, GameSelection, LocationRadius, TournamentFilter, STARTGG_API_URL};
 pub use session::GgSession;
