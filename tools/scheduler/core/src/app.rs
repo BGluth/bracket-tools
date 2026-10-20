@@ -37,6 +37,8 @@ pub(crate) const SELECT_CALLED_SETUP_FIRST: &str = "select a Called setup first 
 /// How long `z` parks a queue entry.
 pub const SNOOZE_SECS: i64 = 300;
 const NOTICE_CAP: usize = 200;
+/// Ceiling on stations per type: matches the TUI's three-digit count chord.
+const MAX_STATIONS_PER_TYPE: u32 = 999;
 /// How long a buffered setup digit waits for a second keystroke before the
 /// next tick commits it as-is.
 const SETUP_ENTRY_GRACE_MS: i64 = 800;
@@ -903,6 +905,11 @@ impl AppState {
         for notice in doc.notices {
             self.notices.push_back(notice);
         }
+        // Launch warnings were posted before the overlay loaded; `notice()`
+        // evicts one per push, so without this the ring grows every restart.
+        while self.notices.len() > NOTICE_CAP {
+            self.notices.pop_front();
+        }
         self.no_show_alerted = doc.no_show_alerted.into_iter().collect();
         self.world = recompute_world(self, now_millis);
     }
@@ -1596,6 +1603,7 @@ fn free(state: &mut AppState, setup: SetupId, now: UnixMillis, effects: &mut Upd
     // We believe the match finished; suppress our own stale evidence until
     // the server confirms, and poll that event now.
     state.tombstones.awaiting_remote_completion.insert((bracket.clone(), set.clone()));
+    stamp_desk_finish(state, &(bracket.clone(), set.clone()), now);
     state.no_show_alerted.remove(&(bracket.clone(), set.clone()));
     effects.force_poll.push(bracket.clone());
     // Decision-point exemption: evaluate the post-free world immediately.
@@ -1916,6 +1924,14 @@ fn set_setup_count(state: &mut AppState, setup_type: String, target: u32, now: U
         state.notice(now, NoticeLevel::Info, format!("{setup_type}: already {target} stations"));
         return;
     }
+    // The web shell's count box accepts any u32 (the TUI chord stops at three
+    // digits). Past this the add loop and every recompute go quadratic and the
+    // bloated roster persists to the overlay — a typo would freeze the desk.
+    if target > MAX_STATIONS_PER_TYPE {
+        let text = format!("{setup_type}: {target} stations refused — at most {MAX_STATIONS_PER_TYPE} per type");
+        state.notice(now, NoticeLevel::Warn, text);
+        return;
+    }
 
     push_undo(state, format!("set {setup_type} stations to {target}"));
     let mut kept_occupied = 0u32;
@@ -2228,6 +2244,7 @@ fn submit_report(state: &mut AppState, mut draft: ReportDraft, dq: Option<Side>,
         state.board.set_status(draft.setup, SetupStatus::Free);
     }
     state.tombstones.awaiting_remote_completion.insert(pair.clone());
+    stamp_desk_finish(state, &pair, now);
     state.called_at.remove(&pair);
     state.no_show_alerted.remove(&pair);
     effects.force_poll.push(draft.bracket.clone());
@@ -2592,6 +2609,20 @@ fn apply_tearing_guard(runtime: &mut BracketRuntime, sets: &mut Vec<LiveSet>) ->
     dropped
 }
 
+/// The desk said this set is over (f / g): its players' rest windows start
+/// now, not when the score reaches the server. The server's completedAt folds
+/// in later with max, so an earlier remote time never shortens the rest.
+fn stamp_desk_finish(state: &mut AppState, pair: &(BracketId, SetKey), now: UnixMillis) {
+    let keys: Vec<ConflictKey> = state
+        .find_set(&pair.0, &pair.1)
+        .map(|set| set.occupants().flat_map(|o| occupant_keys(o, &state.aliases)).collect())
+        .unwrap_or_default();
+    for key in keys {
+        let entry = state.last_completed.entry(key).or_insert(now);
+        *entry = (*entry).max(now);
+    }
+}
+
 /// The server confirmed this set finished: drop every local note about it
 /// (desk tombstones, snooze, call stamps) and release any station holding it.
 /// Returns how many setups freed (a freed setup is a decision point).
@@ -2740,7 +2771,11 @@ fn learn_state_int(state: &mut AppState, kind: &WriteKind, new_int: i32, now: Un
 }
 
 /// Fold the mutation payload into the local snapshot so the set doesn't look
-/// deviant until the next poll confirms it.
+/// deviant until the next poll confirms it. Completion is deliberately NOT
+/// merged: `diff_snapshots` decides "newly completed" against this table, so
+/// a report's completedAt written here would make the next poll's result
+/// look old — no duration sample, no rest window, tombstones never cleared.
+/// The station is already free (g freed it), so nothing waits on it.
 fn merge_remote_set(state: &mut AppState, intent: &WriteIntent, remote: &SetMutationResult) {
     let Some(ix) = state.bracket_ix(&intent.bracket) else { return };
     let Some(set) = state.brackets[ix].state.sets.iter_mut().find(|s| s.key == intent.key) else {
@@ -2751,9 +2786,6 @@ fn merge_remote_set(state: &mut AppState, intent: &WriteIntent, remote: &SetMuta
     }
     if let Some(started) = remote.started_at {
         set.started_at = Some(started.0);
-    }
-    if let Some(completed) = remote.completed_at {
-        set.completed_at = Some(completed.0);
     }
 }
 
@@ -3421,17 +3453,22 @@ mod tests {
         assert!(!state.world.queue.iter().any(|e| e.key == intent.key && e.bracket == intent.bracket));
     }
 
-    #[test]
-    fn snapshot_repeating_a_held_sets_result_frees_the_station() {
-        let mut state = se4_app(false);
+    /// A station holds a set whose completion reached the local table without
+    /// passing through the snapshot diff (a restart that saved the snapshot
+    /// after the overlay, say), so the next poll's diff sees nothing new — the
+    /// station must free regardless, whichever status the call left it in.
+    fn wedge_guard_frees_the_station(call_action: CallAction) {
+        let mut config = test_config(&[1, 2], &["ultimate"]);
+        config.call_action = call_action;
+        let mut state = AppState::new(config, false, bootstrap(vec![("ultimate", &se4())]), NOW);
         call_top_candidate(&mut state, '1');
-        let Some(SetupStatus::Called { bracket, set: held }) = state.board.setups().first().map(|s| s.status.clone()) else {
-            panic!("setup 1 should be Called");
+        let (bracket, held) = match state.board.setups().first().map(|s| s.status.clone()) {
+            Some(SetupStatus::Called { bracket, set }) if call_action == CallAction::Called => (bracket, set),
+            Some(SetupStatus::InProgress { bracket, set }) if call_action == CallAction::InProgress => (bracket, set),
+            other => panic!("setup 1 should hold the call as {call_action:?}, got {other:?}"),
         };
-        // The completion reached the local table without passing through the
-        // snapshot diff (a restart that saved the snapshot after the overlay,
-        // say), so the next poll's diff sees nothing new — the station must
-        // free regardless.
+        // A stale desk note that only a result arrival clears.
+        state.tombstones.suppress_remote_active.insert((bracket.clone(), held.clone()));
         let mut sets = state.brackets[0].state.sets.clone();
         let ix = sets.iter().position(|s| s.key == held).unwrap();
         complete(&mut sets[ix], 0, NOW / 1000 + 300);
@@ -3454,7 +3491,174 @@ mod tests {
         );
         assert_eq!(state.board.setups()[0].status, SetupStatus::Free, "wedged station");
         assert!(state.notices.iter().any(|n| n.text.contains("result arrived")));
-        assert!(!state.tombstones.awaiting_remote_completion.contains(&(bracket, held)));
+        assert!(!state.tombstones.suppress_remote_active.contains(&(bracket, held)));
+    }
+
+    #[test]
+    fn snapshot_repeating_a_held_sets_result_frees_a_called_station() {
+        wedge_guard_frees_the_station(CallAction::Called);
+    }
+
+    #[test]
+    fn snapshot_repeating_a_held_sets_result_frees_an_in_progress_station() {
+        wedge_guard_frees_the_station(CallAction::InProgress);
+    }
+
+    #[test]
+    fn free_starts_the_rest_window_at_the_desk() {
+        let mut config = test_config(&[1, 2], &["ultimate"]);
+        config.rest_window_secs = 300;
+        let mut state = AppState::new(config, false, bootstrap(vec![("ultimate", &se4())]), NOW);
+        call_top_candidate(&mut state, '1');
+        let Some(SetupStatus::Called { bracket, set }) = state.board.setups().first().map(|s| s.status.clone()) else {
+            panic!("setup 1 should be Called");
+        };
+        let keys: Vec<ConflictKey> = state
+            .find_set(&bracket, &set)
+            .unwrap()
+            .occupants()
+            .flat_map(|o| super::occupant_keys(o, &state.aliases))
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert!(state.last_completed.is_empty());
+
+        // f: the desk says it is over now — the rest window starts now, not
+        // when someone enters the score on the site.
+        update(&mut state, key(Key::Char('f')), NOW + 1000);
+        for k in &keys {
+            assert_eq!(state.last_completed.get(k), Some(&(NOW + 1000)), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn desk_report_result_still_arrives_through_the_poll() {
+        let mut state = reporting_app();
+        let (bracket, held) = {
+            let d = draft(&state);
+            (d.bracket.clone(), d.key.clone())
+        };
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Char('2')), NOW);
+        update(&mut state, key(Key::Char('1')), NOW);
+        update(&mut state, key(Key::Enter), NOW);
+        let effects = update(&mut state, key(Key::Char('y')), NOW);
+        let intent = effects
+            .writes
+            .iter()
+            .find(|w| matches!(w.kind, WriteKind::Report(_)))
+            .cloned()
+            .expect("report intent");
+
+        // The server confirms the report, completion timestamp and all. The
+        // local table must NOT turn the set completed here, or the poll that
+        // follows would see nothing new.
+        update(
+            &mut state,
+            Msg::Write(WriteResult {
+                intent: intent.clone(),
+                outcome: WriteOutcome::Success {
+                    payload: SetMutationResult {
+                        id: Some(intent.id),
+                        state: Some(3),
+                        started_at: Some(Timestamp(NOW / 1000)),
+                        completed_at: Some(Timestamp(NOW / 1000 + 420)),
+                    },
+                    offset: None,
+                },
+            }),
+            NOW + 1000,
+        );
+        assert!(
+            !state.find_set(&bracket, &held).unwrap().is_completed(),
+            "completion arrives through the poll, not the write"
+        );
+        assert!(state.tombstones.awaiting_remote_completion.contains(&(bracket.clone(), held.clone())));
+
+        let mut sets = state.brackets[0].state.sets.clone();
+        let ix = sets.iter().position(|s| s.key == held).unwrap();
+        sets[ix].started_at = Some(NOW / 1000);
+        complete(&mut sets[ix], 0, NOW / 1000 + 420);
+        update(
+            &mut state,
+            Msg::Poll(PollResult {
+                bracket: bracket.clone(),
+                seq: 1,
+                captured_at: NOW + 2000,
+                outcome: PollOutcome::Snapshot {
+                    structure: None,
+                    sets,
+                    warnings: Vec::new(),
+                    skipped: Vec::new(),
+                },
+            }),
+            NOW + 2000,
+        );
+        assert!(!state.tombstones.awaiting_remote_completion.contains(&(bracket.clone(), held)));
+        assert_eq!(state.durations.sample_count(&bracket), 1, "the desk-reported set taught the duration model");
+    }
+
+    #[test]
+    fn typed_board_warns_about_brackets_left_on_the_default_pool() {
+        let b = se4();
+        let boot = |id: &str, types: &[&str]| BracketBootstrap {
+            id: BracketId(id.to_owned()),
+            sets: b.sets.clone(),
+            groups: vec![b.info.clone()],
+            mode: BracketMode::Full,
+            start_at: None,
+            setup_types: types.iter().map(|t| (*t).to_owned()).collect(),
+            duration_prior_secs: 480,
+            prior_weight: 4.0,
+            characters: Vec::new(),
+        };
+        let config = |counts: &[(&str, u32)]| SchedulerConfig {
+            setups: Some(SetupCounts::ByType(counts.iter().map(|(t, n)| ((*t).to_owned(), *n)).collect())),
+            brackets: vec![
+                BracketConfig {
+                    setup_type: Some(OneOrMany::One("pc".to_owned())),
+                    ..BracketConfig::new("rivals")
+                },
+                BracketConfig::new("2xko"),
+            ],
+            ..SchedulerConfig::default()
+        };
+        let boots = || vec![boot("rivals", &["pc"]), boot("2xko", &[DEFAULT_SETUP_TYPE])];
+
+        let state = AppState::new(config(&[("pc", 5), (DEFAULT_SETUP_TYPE, 1)]), false, boots(), NOW);
+        let warned: Vec<&str> = state
+            .notices
+            .iter()
+            .filter(|n| n.text.contains("no setup_type configured"))
+            .map(|n| n.text.as_str())
+            .collect();
+        assert_eq!(warned.len(), 1, "{:?}", state.notices);
+        assert!(warned[0].starts_with("2xko:") && warned[0].contains("1 \"default\" station(s)"), "{}", warned[0]);
+
+        // No default station at all: still warned, now with a zero count.
+        let state = AppState::new(config(&[("pc", 5)]), false, boots(), NOW);
+        assert!(state
+            .notices
+            .iter()
+            .any(|n| n.text.starts_with("2xko:") && n.text.contains("0 \"default\" station(s)")));
+
+        // An untyped (uniform) board is the normal single-pool case: silent.
+        assert!(!se4_app(false).notices.iter().any(|n| n.text.contains("no setup_type configured")));
+    }
+
+    #[test]
+    fn set_setup_count_refuses_absurd_targets() {
+        let mut state = se4_app(false);
+        let before = state.board.setups().len();
+        update(
+            &mut state,
+            Msg::Action(UiAction::SetSetupCount {
+                setup_type: DEFAULT_SETUP_TYPE.to_owned(),
+                target: 40_000,
+            }),
+            NOW,
+        );
+        assert_eq!(state.board.setups().len(), before);
+        assert!(state.notices.iter().any(|n| n.text.contains("refused")), "{:?}", state.notices);
     }
 
     #[test]
