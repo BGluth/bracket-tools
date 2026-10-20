@@ -28,6 +28,9 @@ setup_types = ["switch", "pokemon"]
 [game.rivals]
 setup_types = ["pc"]
 
+[game.2xko]
+setup_types = ["pc"]
+
 [game."m.u.g.e.n"]
 setup_types = ["pc"]
 
@@ -353,6 +356,7 @@ mod tests {
             ("Super Smash Bros. Ultimate", vec!["switch", "pokemon"]),
             ("Super Smash Bros. Melee", vec!["switch", "pokemon"]),
             ("Rivals of Aether II", vec!["pc"]),
+            ("2XKO", vec!["pc"]),
             ("M.U.G.E.N", vec!["pc"]),
             ("Pokémon Champions", vec!["pokemon"]),
         ] {

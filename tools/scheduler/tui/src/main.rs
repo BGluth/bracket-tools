@@ -222,7 +222,7 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
         }
         fs::write(&mapping_path, game_setups_template()).with_context(|| format!("writing {}", mapping_path.display()))?;
         println!(
-            "wrote the standard game mapping to {} (smash / rivals / mugen / pokémon)\n\
+            "wrote the standard game mapping to {} (smash / rivals / 2xko / mugen / pokémon)\n\
              — edit it if your venue runs different setups\n",
             mapping_path.display()
         );
@@ -234,7 +234,7 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
     match mapping.game.len() {
         0 => println!(
             "game mapping: {} has no [game.*] entries — events fall back to the\n\
-             built-in standards (smash / rivals / mugen / pokémon), other games get the shared default pool\n",
+             built-in standards (smash / rivals / 2xko / mugen / pokémon), other games get the shared default pool\n",
             mapping_path.display()
         ),
         n => println!("game mapping: {} ({n} game entries + built-in standards)\n", mapping_path.display()),
@@ -264,7 +264,11 @@ async fn init_tournament(cli: &Cli, input: &str) -> anyhow::Result<()> {
         match types {
             Some((types, MatchSource::UserFile)) => println!("  {} — {game} → [{types}]", event.slug),
             Some((types, MatchSource::Builtin)) => println!("  {} — {game} → [{types}] (built-in standard)", event.slug),
-            None => println!("  {} — {game} → default pool (no game-setups.toml or built-in match)", event.slug),
+            None => println!(
+                "  {} — {game} → WARNING: no game-setups.toml or built-in match — shared default pool only; \
+                 add a [game.<key>] entry and re-init, or set setup_type by hand",
+                event.slug
+            ),
         }
     }
     println!(

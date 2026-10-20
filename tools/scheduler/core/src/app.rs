@@ -16,7 +16,7 @@ use bracket_tools_startgg::{CharacterInfo, GameReport, GameSelection, SetMutatio
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{referenced_types, resolve_roster, BracketMode, CallAction, SchedulerConfig, SetupId, FALLBACK_SETUPS_PER_TYPE},
+    config::{referenced_types, resolve_roster, BracketMode, CallAction, SchedulerConfig, SetupId, DEFAULT_SETUP_TYPE, FALLBACK_SETUPS_PER_TYPE},
     conflict::{
         callable, effective_pool, occupant_keys, state_deviation, AliasMap, BlockReason, BracketView, CallableSet, ConflictIndex,
         ConflictInputs, ConflictKey, PlayerFlags, PoolOverride, SetupBoard, SetupStatus, Tombstones, UnixMillis,
@@ -740,6 +740,25 @@ impl AppState {
         for setup_type in &roster.zero_station_types {
             let text = format!("setup type {setup_type:?} has no stations — add some with 's'");
             state.notice(now_millis, NoticeLevel::Warn, text);
+        }
+        // On a typed board a bracket with no setup_type lands on the shared
+        // "default" pool alone — at Colchester 26 that pool was one station
+        // while five free PCs sat on the floor, and the game ran off-tool.
+        let counts = state.board.counts_by_type();
+        if counts.len() > 1 || (counts.len() == 1 && !counts.contains_key(DEFAULT_SETUP_TYPE)) {
+            let default_stations = counts.get(DEFAULT_SETUP_TYPE).copied().unwrap_or(0);
+            let unmapped: Vec<String> = state
+                .brackets
+                .iter()
+                .filter(|b| b.state.mode == BracketMode::Full && b.state.setup_types == [DEFAULT_SETUP_TYPE])
+                .map(|b| b.state.id.0.clone())
+                .collect();
+            for id in unmapped {
+                let text = format!(
+                    "{id}: no setup_type configured — it can only use the {default_stations} \"{DEFAULT_SETUP_TYPE}\" station(s); set setup_type in the config (or map its game in game-setups.toml and re-init)"
+                );
+                state.notice(now_millis, NoticeLevel::Warn, text);
+            }
         }
         for ix in 0..state.brackets.len() {
             stamp_ready(&mut state, ix, now_millis);
@@ -2484,14 +2503,28 @@ fn apply_snapshot(
     }
     for key in &diff.results_arrived {
         let pair = (bracket_id.clone(), key.clone());
-        state.tombstones.awaiting_remote_completion.remove(&pair);
-        state.tombstones.suppress_remote_active.remove(&pair);
-        state.tombstones.suppress_remote_called.remove(&pair);
-        state.callable_since.remove(key);
-        state.snoozes.remove(&pair);
-        state.called_at.remove(&pair);
-        state.no_show_alerted.remove(&pair);
-        if free_setups_holding(state, &pair, now) > 0 {
+        if release_finished_set(state, &pair, now) > 0 {
+            effects.want_sim(SimUrgency::Immediate);
+        }
+    }
+    // Wedge guard: a station holding a set this snapshot already reports
+    // finished, but whose completion was not news to the diff (the previous
+    // snapshot carried it too — a restart between the snapshot save and the
+    // overlay save, a write merge). Without this the station, and its
+    // players, stay held until someone presses f.
+    let wedged: Vec<(BracketId, SetKey)> = state
+        .board
+        .setups()
+        .iter()
+        .filter_map(|s| match &s.status {
+            SetupStatus::Called { bracket, set } | SetupStatus::InProgress { bracket, set } if *bracket == bracket_id => Some(set.clone()),
+            _ => None,
+        })
+        .filter(|key| state.brackets[ix].state.sets.iter().any(|s| s.key == *key && s.is_completed()))
+        .map(|key| (bracket_id.clone(), key))
+        .collect();
+    for pair in wedged {
+        if release_finished_set(state, &pair, now) > 0 {
             effects.want_sim(SimUrgency::Immediate);
         }
     }
@@ -2557,6 +2590,20 @@ fn apply_tearing_guard(runtime: &mut BracketRuntime, sets: &mut Vec<LiveSet>) ->
     runtime.suspects = retained.iter().map(|s| s.key.clone()).collect();
     sets.extend(retained);
     dropped
+}
+
+/// The server confirmed this set finished: drop every local note about it
+/// (desk tombstones, snooze, call stamps) and release any station holding it.
+/// Returns how many setups freed (a freed setup is a decision point).
+fn release_finished_set(state: &mut AppState, pair: &(BracketId, SetKey), now: UnixMillis) -> usize {
+    state.tombstones.awaiting_remote_completion.remove(pair);
+    state.tombstones.suppress_remote_active.remove(pair);
+    state.tombstones.suppress_remote_called.remove(pair);
+    state.callable_since.remove(&pair.1);
+    state.snoozes.remove(pair);
+    state.called_at.remove(pair);
+    state.no_show_alerted.remove(pair);
+    free_setups_holding(state, pair, now)
 }
 
 /// A set the server reports finished releases its station automatically.
@@ -2779,6 +2826,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use bracket_tools_startgg::SetMutationResult;
+    use bracket_tools_startgg_schema::scalars::Timestamp;
 
     use super::{
         find_set_rows, recompute_world, setups_rows, update, AppState, BracketBootstrap, Modal, Msg, NoticeLevel, PendingStatus,
@@ -3293,6 +3341,120 @@ mod tests {
             .blocked
             .values()
             .any(|reasons| reasons.iter().any(|r| matches!(r, BlockReason::PlayerBusy { .. }))));
+    }
+
+    #[test]
+    fn free_releases_players_into_other_brackets_before_the_result_lands() {
+        // Same 8 players in both brackets; calls seat players (the live
+        // default), and the confirmed write stamps startedAt into the local
+        // set exactly as a poll would.
+        let players: Vec<SynthPlayer> = (1..=8)
+            .map(|i| SynthPlayer {
+                player_id: format!("P{i}"),
+                name: format!("Player {i}"),
+            })
+            .collect();
+        let mut ultimate = make_de_bracket_with(1001, &players);
+        let mut rivals = make_de_bracket_with(2001, &players);
+        // Numeric ids: preview-id calls never enqueue writes.
+        ultimate.sets = materialize_ids(&ultimate.sets, 9000);
+        rivals.sets = materialize_ids(&rivals.sets, 9500);
+        let mut config = test_config(&[1, 2, 3], &["ultimate", "rivals"]);
+        config.call_action = CallAction::InProgress;
+        let boots = bootstrap(vec![("ultimate", &ultimate), ("rivals", &rivals)]);
+        let mut state = AppState::new(config, true, boots, NOW);
+
+        let effects = call_top_candidate(&mut state, '1');
+        let intent = effects.writes[0].clone();
+        assert_eq!(intent.kind, WriteKind::InProgress);
+        let (seated, seated_ids): (Vec<String>, Vec<PlayerId>) = {
+            let set = state.find_set(&intent.bracket, &intent.key).unwrap();
+            (
+                set.occupants().map(|o| o.display_name.clone()).collect(),
+                set.occupants().flat_map(|o| o.player_ids.iter().cloned()).collect(),
+            )
+        };
+        update(
+            &mut state,
+            Msg::Write(WriteResult {
+                intent: intent.clone(),
+                outcome: WriteOutcome::Success {
+                    payload: SetMutationResult {
+                        id: Some(intent.id),
+                        state: Some(2),
+                        started_at: Some(Timestamp(NOW / 1000)),
+                        completed_at: None,
+                    },
+                    offset: None,
+                },
+            }),
+            NOW + 1000,
+        );
+        assert!(
+            state.find_set(&intent.bracket, &intent.key).unwrap().is_remotely_active(),
+            "the confirmed write is remote-active evidence now"
+        );
+        let other = if intent.bracket.0 == "ultimate" { "rivals" } else { "ultimate" };
+        let mirrored_blocked = |state: &AppState| {
+            state.world.blocked.iter().any(|((bracket, _), reasons)| {
+                bracket.0 == other
+                    && reasons
+                        .iter()
+                        .any(|r| matches!(r, BlockReason::PlayerBusy { key: ConflictKey::Player(p), .. } if seated_ids.contains(p)))
+            })
+        };
+        assert!(mirrored_blocked(&state), "while seated, their {other} set waits: {:?}", state.world.blocked);
+
+        // f: the set is over at the desk. Nobody has entered the score on the
+        // site yet, so startedAt still stands remotely — the players must be
+        // callable in the other bracket anyway.
+        update(&mut state, key(Key::Char('f')), NOW + 2000);
+        assert_eq!(state.board.setups()[0].status, SetupStatus::Free);
+        assert!(!mirrored_blocked(&state), "freed players still held: {:?}", state.world.blocked);
+        let offered = state
+            .world
+            .queue
+            .iter()
+            .any(|e| e.bracket.0 == other && e.players.split(" vs ").all(|n| seated.iter().any(|s| s == n)));
+        assert!(offered, "the {other} mirror of the freed set should rank: {:?}", state.world.queue);
+        // The freed set itself stays out until the server confirms.
+        assert!(!state.world.queue.iter().any(|e| e.key == intent.key && e.bracket == intent.bracket));
+    }
+
+    #[test]
+    fn snapshot_repeating_a_held_sets_result_frees_the_station() {
+        let mut state = se4_app(false);
+        call_top_candidate(&mut state, '1');
+        let Some(SetupStatus::Called { bracket, set: held }) = state.board.setups().first().map(|s| s.status.clone()) else {
+            panic!("setup 1 should be Called");
+        };
+        // The completion reached the local table without passing through the
+        // snapshot diff (a restart that saved the snapshot after the overlay,
+        // say), so the next poll's diff sees nothing new — the station must
+        // free regardless.
+        let mut sets = state.brackets[0].state.sets.clone();
+        let ix = sets.iter().position(|s| s.key == held).unwrap();
+        complete(&mut sets[ix], 0, NOW / 1000 + 300);
+        state.brackets[0].state.sets = sets.clone();
+
+        update(
+            &mut state,
+            Msg::Poll(PollResult {
+                bracket: bracket.clone(),
+                seq: 1,
+                captured_at: NOW + 1000,
+                outcome: PollOutcome::Snapshot {
+                    structure: None,
+                    sets,
+                    warnings: Vec::new(),
+                    skipped: Vec::new(),
+                },
+            }),
+            NOW + 1000,
+        );
+        assert_eq!(state.board.setups()[0].status, SetupStatus::Free, "wedged station");
+        assert!(state.notices.iter().any(|n| n.text.contains("result arrived")));
+        assert!(!state.tombstones.awaiting_remote_completion.contains(&(bracket, held)));
     }
 
     #[test]

@@ -349,6 +349,13 @@ impl ConflictIndex {
             let Some(set) = set_lookup.get(&(bracket, key)) else {
                 continue;
             };
+            // A station still holding a set the server reports finished is a
+            // wedge (the result landed in a window the snapshot diff missed —
+            // a restart, a rejected poll). Its players are free; the board
+            // itself frees on the next poll.
+            if set.is_completed() {
+                continue;
+            }
             let source = BusySource::LocalSetup {
                 setup: setup.id,
                 bracket: bracket.clone(),
@@ -368,6 +375,14 @@ impl ConflictIndex {
                     continue;
                 }
                 let at = (view.id.clone(), set.key.clone());
+                // The desk freed this set (f / g): the match is over and its
+                // players are free now. The server's startedAt / CALLED int
+                // only lag until the result lands, so they are not evidence
+                // — otherwise a player finishing in one bracket stays
+                // uncallable in every other until someone enters the score.
+                if inputs.tombstones.awaiting_remote_completion.contains(&at) {
+                    continue;
+                }
                 if set.is_remotely_active() && !inputs.tombstones.suppress_remote_active.contains(&at) {
                     index.claim_remote(set, view.id, inputs, |bracket, key| BusySource::RemoteActive { bracket, set: key });
                 }
@@ -1277,5 +1292,53 @@ mod tests {
             vec![SetupId(1), SetupId(2), SetupId(3)],
             "AllowAny opens a foreign-type station to everyone"
         );
+    }
+
+    #[test]
+    fn desk_freed_set_releases_its_players_before_the_result_lands() {
+        // Set A was called (our markSetInProgress stamped startedAt and the
+        // in-progress int remotely), then the desk pressed f: station free,
+        // awaiting the result. Player 10's next set B must be callable now,
+        // not once someone enters A's score on the site.
+        let mut world = World::new();
+        let mut sets = [simple_set("77", "A", ["10", "11"]), simple_set("77", "B", ["10", "12"])];
+        sets[0].started_at = Some(NOW / 1000 - 600);
+        sets[0].state_int = Some(6);
+        world.tombstones.awaiting_remote_completion.insert((world.bracket.clone(), sets[0].key.clone()));
+
+        let callable = world.check(&sets, 1).expect("A's stale remote evidence must not hold player 10");
+        assert_eq!(callable.key, sets[1].key);
+        // A itself stays out of the queue until the server confirms.
+        let reasons = world.check(&sets, 0).unwrap_err();
+        assert!(reasons.contains(&BlockReason::AwaitingRemoteCompletion), "{reasons:?}");
+
+        // Without the desk's f, the same evidence holds player 10 as before.
+        world.tombstones.awaiting_remote_completion.clear();
+        let reasons = world.check(&sets, 1).unwrap_err();
+        assert!(
+            reasons.iter().any(|r| matches!(r, BlockReason::PlayerBusy { key, .. } if *key == key_of("10"))),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn wedged_station_on_a_completed_set_claims_nobody() {
+        // The board still says station 1 runs set A, but the snapshot says A
+        // finished (the result landed in a window the diff missed). Player
+        // 10's next set B is callable; station 2 is the candidate.
+        let mut world = World::new();
+        let mut sets = [simple_set("77", "A", ["10", "11"]), simple_set("77", "B", ["10", "12"])];
+        sets[0].completed_at = Some(NOW / 1000 - 30);
+        sets[0].winner_id = Some(EntrantId("77-e-10".to_owned()));
+        world.board.set_status(
+            SetupId(1),
+            SetupStatus::InProgress {
+                bracket: world.bracket.clone(),
+                set: sets[0].key.clone(),
+            },
+        );
+
+        let callable = world.check(&sets, 1).expect("a finished set holds nobody");
+        assert_eq!(callable.candidate_setups, vec![SetupId(2)]);
     }
 }
