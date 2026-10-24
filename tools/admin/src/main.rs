@@ -3,19 +3,23 @@
 //! What the public API allows (and what it doesn't):
 //! - `roster`: list a tournament's registered participants; `--unpaid` applies start.gg's server-side unpaid filter. The API exposes no way
 //!   to *change* payment state — marking paid stays in the start.gg admin UI.
-//! - `add`: register a start.gg user into events of a tournament (e.g. a redemption bracket) via the on-behalf-of token flow. Needs a
-//!   tournament-admin token.
+//! - `add`: register a start.gg user into events of a tournament via the registration-token flow. The public API completes this only for
+//!   the token's OWN account (the invite token it mints for another user can't be redeemed by the admin — live-verified 2026-10-24); other
+//!   players are printed as an Add-Attendee list for the admin UI.
 //! - `find`: fuzzy-search a player across a saved pool of tournaments (there is no global player search in the public API), ranked by match
 //!   quality, then recency, then attendance. The pool lives in `~/.config/bracket-tools/find-pool.toml`, grows automatically with every
 //!   tournament the tool touches, and `pool scan` adds a whole series (same owner, same slug stem) in one go. Past tournaments' rosters are
 //!   cached on disk so repeated `find` runs stay off the network.
+//! - `phases` / `phase` / `seed` / `standings` / `redemption`: bracket structure, seeding and the redemption-bracket fill (see
+//!   `bracket.rs`). Events themselves cannot be created through the API.
 
+mod bracket;
 mod fuzzy;
 mod store;
 
 use std::{
     cmp::Reverse,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -25,11 +29,14 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use bracket_tools_cache::null_storage::NullStorage;
-use bracket_tools_startgg::{types::GGRestToken, AdminEvent, AdminParticipant, AdminTournament, GGProvider, StartGgId, TournamentSummary};
+use bracket_tools_startgg::{
+    types::GGRestToken, AdminEvent, AdminParticipant, AdminTournament, GGProvider, StartGgId, TournamentSummary, UserProfile,
+};
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
 
 use crate::{
+    bracket::{run_phase_create, run_phase_delete, run_phase_set, run_phases, run_redemption, run_seed, run_standings, BracketKind},
     fuzzy::{best_tier, MatchTier},
     store::CachedRoster,
 };
@@ -71,19 +78,85 @@ enum Command {
         #[arg(long)]
         event: Option<String>,
     },
-    /// Add a player to events of a tournament (e.g. a redemption bracket)
+    /// Add players to events of a tournament (e.g. a redemption bracket)
     Add {
         /// Tournament: slug, `tournament/slug`, or a start.gg URL
         tournament: String,
-        /// Who to add — fuzzy tag/prefix search over the tournament's own
-        /// participants (or a numeric user/participant id)
-        query: Option<String>,
+        /// Who to add — fuzzy tag/prefix searches over the tournament's own
+        /// participants (or numeric user/participant ids)
+        queries: Vec<String>,
         /// Target event (repeatable; name, slug, or numeric id)
         #[arg(long, required = true)]
         event: Vec<String>,
-        /// Skip the search and use this start.gg user id directly (e.g. from `find`)
+        /// Skip the search and use these start.gg user ids directly
+        /// (repeatable; e.g. from `find`)
         #[arg(long)]
-        user_id: Option<u64>,
+        user_id: Vec<u64>,
+        /// Show the plan and stop
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show an event's bracket structure (phases and their groups)
+    Phases {
+        /// Tournament: slug, `tournament/slug`, or a start.gg URL
+        tournament: String,
+        /// Only this event (name, slug, or numeric id); default: all events
+        #[arg(long)]
+        event: Option<String>,
+    },
+    /// Create, reshape, or delete a phase of an event
+    Phase {
+        #[command(subcommand)]
+        action: PhaseAction,
+    },
+    /// Rewrite a phase's seeding from an ordered player list (best first)
+    Seed {
+        /// Tournament: slug, `tournament/slug`, or a start.gg URL
+        tournament: String,
+        /// Players best-first: tags, entrant names, or user ids. Entrants
+        /// left out keep their relative order behind the listed ones.
+        order: Vec<String>,
+        /// Event (name, slug, or numeric id)
+        #[arg(long)]
+        event: String,
+        /// Phase (name or numeric id); default: the first phase
+        #[arg(long)]
+        phase: Option<String>,
+        /// Show the plan and stop
+        #[arg(long)]
+        dry_run: bool,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show an event's standings
+    Standings {
+        /// Tournament: slug, `tournament/slug`, or a start.gg URL
+        tournament: String,
+        /// Event (name, slug, or numeric id)
+        #[arg(long)]
+        event: String,
+    },
+    /// Register everyone who placed at or below a cutoff in one event into
+    /// another (the redemption bracket, created beforehand in the start.gg UI)
+    Redemption {
+        /// Tournament: slug, `tournament/slug`, or a start.gg URL
+        tournament: String,
+        /// The finished event whose standings decide eligibility
+        #[arg(long)]
+        from: String,
+        /// The redemption event to register into
+        #[arg(long)]
+        to: String,
+        /// Everyone who placed here or lower is eligible (e.g. 5 = 5th and below)
+        #[arg(long)]
+        place: i32,
+        /// Show the plan and stop
+        #[arg(long)]
+        dry_run: bool,
         /// Don't ask for confirmation
         #[arg(long)]
         yes: bool,
@@ -133,6 +206,61 @@ enum PoolAction {
     },
 }
 
+#[derive(Subcommand)]
+enum PhaseAction {
+    /// Add a phase to an event
+    Create {
+        /// Tournament: slug, `tournament/slug`, or a start.gg URL
+        tournament: String,
+        /// Event (name, slug, or numeric id)
+        #[arg(long)]
+        event: String,
+        /// Phase name, e.g. "Bracket" or "Top 8"
+        #[arg(long)]
+        name: String,
+        /// Bracket format
+        #[arg(long, value_enum)]
+        bracket: BracketKind,
+        /// Pool count (formats that support pools)
+        #[arg(long)]
+        groups: Option<i32>,
+    },
+    /// Change a phase's name, bracket format and/or pool count
+    Set {
+        /// Tournament: slug, `tournament/slug`, or a start.gg URL
+        tournament: String,
+        /// Event (name, slug, or numeric id)
+        #[arg(long)]
+        event: String,
+        /// Phase (name or numeric id)
+        #[arg(long)]
+        phase: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_enum)]
+        bracket: Option<BracketKind>,
+        #[arg(long)]
+        groups: Option<i32>,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Delete a phase
+    Delete {
+        /// Tournament: slug, `tournament/slug`, or a start.gg URL
+        tournament: String,
+        /// Event (name, slug, or numeric id)
+        #[arg(long)]
+        event: String,
+        /// Phase (name or numeric id)
+        #[arg(long)]
+        phase: String,
+        /// Don't ask for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -143,11 +271,12 @@ async fn main() -> Result<()> {
         Command::Roster { tournament, unpaid, event } => run_roster(&provider, &tournament, unpaid, event.as_deref()).await,
         Command::Add {
             tournament,
-            query,
+            queries,
             event,
             user_id,
+            dry_run,
             yes,
-        } => run_add(&provider, &tournament, query.as_deref(), &event, user_id, yes).await,
+        } => run_add(&provider, &tournament, &queries, &event, &user_id, dry_run, yes).await,
         Command::Find {
             query,
             tournaments,
@@ -159,6 +288,48 @@ async fn main() -> Result<()> {
             PoolAction::Remove { tournaments } => run_pool_remove(&tournaments),
             PoolAction::Scan { tournament, all, mine } => run_pool_scan(&provider, tournament.as_deref(), all, mine).await,
         },
+        Command::Phases { tournament, event } => run_phases(&provider, &tournament, event.as_deref()).await,
+        Command::Phase { action } => match action {
+            PhaseAction::Create {
+                tournament,
+                event,
+                name,
+                bracket,
+                groups,
+            } => run_phase_create(&provider, &tournament, &event, &name, bracket, groups).await,
+            PhaseAction::Set {
+                tournament,
+                event,
+                phase,
+                name,
+                bracket,
+                groups,
+                yes,
+            } => run_phase_set(&provider, &tournament, &event, &phase, name.as_deref(), bracket, groups, yes).await,
+            PhaseAction::Delete {
+                tournament,
+                event,
+                phase,
+                yes,
+            } => run_phase_delete(&provider, &tournament, &event, &phase, yes).await,
+        },
+        Command::Seed {
+            tournament,
+            order,
+            event,
+            phase,
+            dry_run,
+            yes,
+        } => run_seed(&provider, &tournament, &event, phase.as_deref(), &order, dry_run, yes).await,
+        Command::Standings { tournament, event } => run_standings(&provider, &tournament, &event).await,
+        Command::Redemption {
+            tournament,
+            from,
+            to,
+            place,
+            dry_run,
+            yes,
+        } => run_redemption(&provider, &tournament, &from, &to, place, dry_run, yes).await,
     }
 }
 
@@ -206,92 +377,226 @@ async fn run_roster(provider: &Provider, tournament: &str, unpaid: bool, event_f
     Ok(())
 }
 
-async fn run_add(
-    provider: &Provider,
-    tournament: &str,
-    query: Option<&str>,
-    events: &[String],
-    user_id_flag: Option<u64>,
-    yes: bool,
-) -> Result<()> {
+/// A tournament fetched live: pinned slug, header, full roster. Every fetch
+/// also remembers the tournament in the find pool and refreshes its roster
+/// cache.
+async fn fetch_tournament(provider: &Provider, tournament: &str) -> Result<(String, AdminTournament, Vec<AdminParticipant>)> {
     let slug = normalize_tournament_slug(tournament);
     let (header, participants) = provider.fetch_tournament_admin(&slug, false).await?;
     remember_in_pool(&bare_slug(tournament));
     cache_roster(&bare_slug(tournament), &header, &participants);
 
+    Ok((slug, header, participants))
+}
+
+/// One player to register: the user id the mutation takes and how to show them.
+struct AddCandidate {
+    user_id: StartGgId,
+    label: String,
+}
+
+/// One registration to perform: the candidate and the target events they are
+/// not in yet.
+type Registration = (AddCandidate, Vec<StartGgId>);
+
+async fn run_add(
+    provider: &Provider,
+    tournament: &str,
+    queries: &[String],
+    events: &[String],
+    user_ids: &[u64],
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    if queries.is_empty() && user_ids.is_empty() {
+        bail!("give tags to search for and/or --user-id values (see `gg-admin find`)");
+    }
+    let (slug, header, participants) = fetch_tournament(provider, tournament).await?;
     let targets = events
         .iter()
         .map(|needle| resolve_event(&header.events, needle))
         .collect::<Result<Vec<_>>>()?;
 
-    let (user_id, label, existing) = match user_id_flag {
-        Some(id) => {
-            let known = participants.iter().find(|p| p.user_id == Some(id));
-            let label = known.map_or_else(|| format!("user {id} (not yet in this tournament)"), display_tag);
-            (id, label, known.map(|p| p.event_ids.clone()).unwrap_or_default())
-        }
-        None => {
-            let query = query.ok_or_else(|| anyhow!("give a tag to search for, or pass --user-id"))?;
-            let found = resolve_participant(&participants, query)?;
-            let user_id = found.user_id.ok_or_else(|| {
-                anyhow!(
-                    "{} has no start.gg user account; the API can only register real accounts",
-                    display_tag(found)
-                )
-            })?;
-            (user_id, display_tag(found), found.event_ids.clone())
-        }
-    };
-
-    let (already, to_add): (Vec<&AdminEvent>, Vec<&AdminEvent>) = targets.into_iter().partition(|e| existing.contains(&e.id));
-    for event in &already {
-        println!("already registered in {} — skipping", event_label(event));
+    let mut candidates = Vec::new();
+    for id in user_ids {
+        // An outsider's tag comes from their profile, so the operator can
+        // recognise who is about to be added (or find them in the admin UI).
+        let label = match participants.iter().find(|p| p.user_id == Some(*id)) {
+            Some(known) => display_tag(known),
+            None => provider
+                .fetch_user_profile(*id)
+                .await?
+                .map_or_else(|| format!("user {id} (no such start.gg user)"), |profile| profile_label(&profile)),
+        };
+        candidates.push(AddCandidate { user_id: *id, label });
     }
-    if to_add.is_empty() {
+    for query in queries {
+        let found = resolve_participant(&participants, query)?;
+        let user_id = found.user_id.ok_or_else(|| {
+            anyhow!(
+                "{} has no start.gg user account; the API can only register real accounts",
+                display_tag(found)
+            )
+        })?;
+        candidates.push(AddCandidate {
+            user_id,
+            label: display_tag(found),
+        });
+    }
+
+    register_candidates(provider, &slug, &header, candidates, &targets, yes, dry_run).await
+}
+
+/// The shared write path of `add` and `redemption`: skips candidates already
+/// entered, shows the plan, confirms once, registers, then re-reads each
+/// event's entrants so the operator sees what landed.
+///
+/// The public API completes a registration only for the token's own account.
+/// `generateRegistrationToken` mints an invite for another user, but
+/// `registerForTournament` looks that token up under the *calling* user, so
+/// redeeming someone else's answers "RegistrationToken not found" (live-
+/// verified 2026-10-24). Other players are therefore listed for the admin
+/// UI's Add Attendee rather than attempted.
+async fn register_candidates(
+    provider: &Provider,
+    slug: &str,
+    header: &AdminTournament,
+    candidates: Vec<AddCandidate>,
+    targets: &[&AdminEvent],
+    yes: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let entered = entered_user_ids(provider, targets.iter().map(|e| e.id)).await?;
+    let mut plan: Vec<Registration> = Vec::new();
+    for candidate in candidates {
+        let to_add: Vec<StartGgId> = targets
+            .iter()
+            .filter(|e| !entered[&e.id].contains(&candidate.user_id))
+            .map(|e| e.id)
+            .collect();
+        if to_add.is_empty() {
+            println!("already registered: {} — skipping", candidate.label);
+        } else {
+            plan.push((candidate, to_add));
+        }
+    }
+    if plan.is_empty() {
         println!("nothing to do.");
         return Ok(());
     }
 
-    println!("plan: add {label} (user {user_id}) on {}:", header.name.as_deref().unwrap_or(&slug));
-    for event in &to_add {
-        println!("  + {}", event_label(event));
+    let me = current_user(provider, header).await?;
+    let (mine, others): (Vec<Registration>, Vec<Registration>) = plan.into_iter().partition(|(c, _)| Some(c.user_id) == me);
+    if !others.is_empty() {
+        println!("needs the start.gg admin UI (Attendees -> Add attendee) — the public API only registers the token's own account:");
+        for (candidate, to_add) in &others {
+            println!(
+                "  * {} (user {}) -> {}",
+                candidate.label,
+                candidate.user_id,
+                event_names(header, to_add)
+            );
+        }
     }
-    if !yes && !confirm("proceed?")? {
+    if mine.is_empty() {
+        return Ok(());
+    }
+
+    println!("plan: on {}:", header.name.as_deref().unwrap_or(slug));
+    for (candidate, to_add) in &mine {
+        println!(
+            "  + {} (user {}) -> {}",
+            candidate.label,
+            candidate.user_id,
+            event_names(header, to_add)
+        );
+    }
+    if dry_run {
+        println!("dry run: nothing written.");
+        return Ok(());
+    }
+    if !yes && !confirm(&format!("register {} player(s)?", mine.len()))? {
         println!("aborted.");
         return Ok(());
     }
 
-    let ids: Vec<StartGgId> = to_add.iter().map(|e| e.id).collect();
-    let registered = provider.admin_register_user(user_id, &ids).await?;
-    println!(
-        "mutation accepted: participant {} ({})",
-        registered.id.map_or_else(|| "?".to_string(), |id| id.to_string()),
-        registered.gamer_tag.as_deref().unwrap_or("?"),
-    );
-
-    verify_registration(provider, &slug, user_id, &ids).await
-}
-
-/// Re-fetches the roster so the operator sees the write actually landed.
-async fn verify_registration(provider: &Provider, slug: &str, user_id: StartGgId, expected: &[StartGgId]) -> Result<()> {
-    let (header, after) = provider.fetch_tournament_admin(slug, false).await?;
-    cache_roster(slug.trim_start_matches("tournament/"), &header, &after);
-
-    match after.iter().find(|p| p.user_id == Some(user_id)) {
-        Some(p) if expected.iter().all(|id| p.event_ids.contains(id)) => {
-            let events = p
-                .event_ids
-                .iter()
-                .map(|id| event_name_by_id(&header, *id))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!("confirmed: {} is now in: {events}", display_tag(p));
+    let mut failures = 0;
+    for (candidate, to_add) in &mine {
+        match provider.admin_register_user(candidate.user_id, to_add).await {
+            Ok(registered) => println!(
+                "  ok    {} -> participant {} ({})",
+                candidate.label,
+                registered.id.map_or_else(|| "?".to_string(), |id| id.to_string()),
+                registered.gamer_tag.as_deref().unwrap_or("?"),
+            ),
+            Err(err) => {
+                failures += 1;
+                println!("  FAIL  {}: {err}", candidate.label);
+            }
         }
-        Some(_) => println!("warning: re-fetch does not yet show all target events (start.gg may lag) — check the attendee page"),
-        None => println!("warning: re-fetch does not show the participant yet — check the attendee page"),
+    }
+
+    verify_registrations(provider, header, &mine).await?;
+    if failures > 0 {
+        bail!("{failures} registration(s) failed — see above");
     }
 
     Ok(())
+}
+
+/// Re-reads the target events' entrants so the operator sees which writes
+/// landed (entrants are immediate; the participant roster lags by minutes).
+async fn verify_registrations(provider: &Provider, header: &AdminTournament, plan: &[Registration]) -> Result<()> {
+    let event_ids: HashSet<StartGgId> = plan.iter().flat_map(|(_, ids)| ids.iter().copied()).collect();
+    let entered = entered_user_ids(provider, event_ids.into_iter()).await?;
+
+    for (candidate, expected) in plan {
+        let (landed, missing): (Vec<StartGgId>, Vec<StartGgId>) = expected.iter().partition(|id| entered[id].contains(&candidate.user_id));
+        if missing.is_empty() {
+            println!("confirmed: {} is in: {}", candidate.label, event_names(header, &landed));
+        } else {
+            println!(
+                "warning: {} — not yet listed in: {}; check the attendee page",
+                candidate.label,
+                event_names(header, &missing)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// The user ids currently entered in each event, keyed by event id.
+async fn entered_user_ids(
+    provider: &Provider,
+    event_ids: impl Iterator<Item = StartGgId>,
+) -> Result<HashMap<StartGgId, HashSet<StartGgId>>> {
+    let mut entered = HashMap::new();
+    for event_id in event_ids {
+        let users = provider
+            .fetch_event_entrants(event_id)
+            .await?
+            .into_iter()
+            .flat_map(|e| e.user_ids)
+            .collect();
+        entered.insert(event_id, users);
+    }
+
+    Ok(entered)
+}
+
+/// The token's own user id (the one account the API can register), via the
+/// admin probe; `None` when the tournament id is unknown.
+async fn current_user(provider: &Provider, header: &AdminTournament) -> Result<Option<StartGgId>> {
+    let Some(tournament_id) = header.id else {
+        return Ok(None);
+    };
+
+    Ok(provider.fetch_admin_probe(tournament_id).await?.current_user)
+}
+
+fn event_names(header: &AdminTournament, ids: &[StartGgId]) -> String {
+    ids.iter().map(|id| event_name_by_id(header, *id)).collect::<Vec<_>>().join(", ")
 }
 
 /// One person across the whole search pool, merged by user id.
@@ -659,6 +964,20 @@ fn display_tag(p: &AdminParticipant) -> String {
     match &p.prefix {
         Some(prefix) => format!("{prefix} | {}", p.gamer_tag),
         None => p.gamer_tag.clone(),
+    }
+}
+
+/// `Prefix | Tag (start.gg/user/slug)` — the tag to search for in the admin
+/// UI plus the profile link that confirms it is the right person.
+fn profile_label(profile: &UserProfile) -> String {
+    let tag = profile.gamer_tag.as_deref().unwrap_or("?");
+    let tagged = match &profile.prefix {
+        Some(prefix) => format!("{prefix} | {tag}"),
+        None => tag.to_string(),
+    };
+    match &profile.slug {
+        Some(slug) => format!("{tagged} (start.gg/{slug})"),
+        None => tagged,
     }
 }
 

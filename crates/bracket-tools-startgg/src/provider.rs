@@ -6,21 +6,30 @@ use bracket_tools_cache::{
 };
 use bracket_tools_startgg_schema::{
     admin_probe::{AdminProbe, AdminProbeVariables},
+    delete_phase::{DeletePhase, DeletePhaseVariables},
+    enums::BracketType,
     generate_registration_token::{GenerateRegistrationToken, GenerateRegistrationTokenVariables, TournamentRegistrationInput},
+    get_event_bracket::{GetEventBracket, GetEventBracketVariables},
     get_event_characters::{GetEventCharacters, GetEventCharactersVariables},
+    get_event_entrants::{GetEventEntrants, GetEventEntrantsVariables},
+    get_event_standings::{GetEventStandings, GetEventStandingsVariables},
     get_event_structure::{self, GetEventStructure, GetEventStructureVariables},
     get_events_for_tournament::{GetEventsForTournament, GetEventsForTournamentVariables},
     get_games_for_set::{GetGamesOfSet, GetGamesOfSetVariables},
     get_participants_for_tournament::{GetParticipantsForTournament, GetParticipantsForTournamentVariables},
+    get_phase_seeds::{GetPhaseSeeds, GetPhaseSeedsVariables},
     get_player_for_player_id::{GetPlayerForPlayerId, GetPlayerForPlayerIdVariables},
     get_sets_for_event::{self, GetSetsForEvent, GetSetsForEventVariables},
     get_tournament_for_id::{GetTournamentForId, GetTournamentForIdVariables},
     get_tournament_header::{GetTournamentHeader, GetTournamentHeaderVariables},
     get_tournaments_for_owner::{GetTournamentsForOwner, GetTournamentsForOwnerVariables},
+    get_user_profile::{GetUserProfile, GetUserProfileVariables},
     mark_set_called::{MarkSetCalled, MarkSetCalledVariables},
     mark_set_in_progress::{MarkSetInProgress, MarkSetInProgressVariables},
     register_for_tournament::{RegisterForTournament, RegisterForTournamentVariables},
     report_bracket_set::{BracketSetGameDataInput, BracketSetGameSelectionInput, ReportBracketSet, ReportBracketSetVariables},
+    update_phase_seeding::{UpdatePhaseSeedInfo, UpdatePhaseSeeding, UpdatePhaseSeedingOptions, UpdatePhaseSeedingVariables},
+    upsert_phase::{PhaseUpsertInput, UpsertPhase, UpsertPhaseVariables},
 };
 use cynic::{
     http::{CynicReqwestError, ReqwestExt},
@@ -37,12 +46,14 @@ use web_time::SystemTime;
 
 use crate::{
     conversions::{
-        extract_admin_participants_page, extract_admin_probe, extract_admin_tournament, extract_event_characters, extract_event_sets_page,
-        extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress, extract_register_for_tournament,
-        extract_registration_token, extract_report_bracket_set, extract_tournament_events, extract_tournament_header,
-        extract_tournament_participants_page, extract_tournaments_page, tournament_name, AdminParticipant, AdminProbeResult,
-        AdminTournament, CharacterInfo, EventInfo, GgConversionError, Page, PlayerQueryResult, RegisteredParticipant, SetMutationResult,
-        SetQueryResult, TournamentHeader, TournamentSummary,
+        extract_admin_participants_page, extract_admin_probe, extract_admin_tournament, extract_delete_phase, extract_event_bracket,
+        extract_event_characters, extract_event_entrants_page, extract_event_sets_page, extract_event_standings_page,
+        extract_event_structure, extract_mark_set_called, extract_mark_set_in_progress, extract_phase_seeds_page,
+        extract_register_for_tournament, extract_registration_token, extract_report_bracket_set, extract_tournament_events,
+        extract_tournament_header, extract_tournament_participants_page, extract_tournaments_page, extract_update_phase_seeding,
+        extract_upsert_phase, extract_user_profile, tournament_name, AdminParticipant, AdminProbeResult, AdminTournament, CharacterInfo,
+        EntrantRef, EventBracket, EventInfo, EventStanding, GgConversionError, Page, PhaseInfo, PhaseSeed, PlayerQueryResult,
+        RegisteredParticipant, SetMutationResult, SetQueryResult, TournamentHeader, TournamentSummary, UserProfile,
     },
     gg_data_types::{HydratedGgPlayer, HydratedGgSet, HydratedGgTournament, StartGgId},
     limit_journal::{LimitJournal, JOURNAL_CAPACITY_MARGIN},
@@ -553,6 +564,166 @@ impl<S: Storage> GGProvider<S> {
         self.register_for_tournament(event_ids, &token).await
     }
 
+    /// Fetches an event's bracket structure: its phases (in play order) with
+    /// bracket type, pool count, seed count and existing groups. Bypasses the
+    /// cache entirely: admin views must never serve stale structure.
+    pub async fn fetch_event_bracket(&self, event_id: StartGgId) -> Result<EventBracket, GGProviderError> {
+        let gg_event = gg_id(event_id);
+        let data = self
+            .run_query(GetEventBracket::build(GetEventBracketVariables { event_id: &gg_event }))
+            .await?;
+
+        Ok(extract_event_bracket(data)?)
+    }
+
+    /// Fetches every seed of a phase (all pages) with the entrant behind each
+    /// — the read half of the seeding flow. Bypasses the cache entirely.
+    pub async fn fetch_phase_seeds(&self, phase_id: StartGgId) -> Result<Vec<PhaseSeed>, GGProviderError> {
+        let gg_phase = gg_id(phase_id);
+        let (seeds, _first_page) = self
+            .fetch_all_pages(
+                |page| {
+                    GetPhaseSeeds::build(GetPhaseSeedsVariables {
+                        phase_id: &gg_phase,
+                        page,
+                        per_page: self.page_size,
+                    })
+                },
+                extract_phase_seeds_page,
+            )
+            .await?;
+
+        Ok(seeds)
+    }
+
+    /// Fetches an event's standings (all pages), ordered by placement as
+    /// start.gg returns them. Empty until the bracket has produced results.
+    /// Bypasses the cache entirely.
+    pub async fn fetch_event_standings(&self, event_id: StartGgId) -> Result<Vec<EventStanding>, GGProviderError> {
+        let gg_event = gg_id(event_id);
+        let (standings, _first_page) = self
+            .fetch_all_pages(
+                |page| {
+                    GetEventStandings::build(GetEventStandingsVariables {
+                        event_id: &gg_event,
+                        page,
+                        per_page: self.page_size,
+                    })
+                },
+                extract_event_standings_page,
+            )
+            .await?;
+
+        Ok(standings)
+    }
+
+    /// Fetches a user's public profile (slug and current tag) by numeric id;
+    /// `None` when no such user exists. Bypasses the cache entirely.
+    pub async fn fetch_user_profile(&self, user_id: StartGgId) -> Result<Option<UserProfile>, GGProviderError> {
+        let gg_user = gg_id(user_id);
+        let data = self
+            .run_query(GetUserProfile::build(GetUserProfileVariables { user_id: &gg_user }))
+            .await?;
+
+        Ok(extract_user_profile(data))
+    }
+
+    /// Fetches an event's entrants (all pages). Entrants read straight from
+    /// the event, unlike the tournament participant roster, which is served
+    /// from a search index that lags writes by minutes — so this is the
+    /// read-your-writes check after a registration. Bypasses the cache
+    /// entirely.
+    pub async fn fetch_event_entrants(&self, event_id: StartGgId) -> Result<Vec<EntrantRef>, GGProviderError> {
+        let gg_event = gg_id(event_id);
+        let (entrants, _first_page) = self
+            .fetch_all_pages(
+                |page| {
+                    GetEventEntrants::build(GetEventEntrantsVariables {
+                        event_id: &gg_event,
+                        page,
+                        per_page: self.page_size,
+                    })
+                },
+                extract_event_entrants_page,
+            )
+            .await?;
+
+        Ok(entrants)
+    }
+
+    /// Creates a phase in `event_id` (requires a tournament-admin token).
+    pub async fn create_phase(&self, event_id: StartGgId, spec: PhaseSpec) -> Result<PhaseInfo, GGProviderError> {
+        self.upsert_phase(None, Some(event_id), spec).await
+    }
+
+    /// Reshapes an existing phase: only the fields set in `spec` change
+    /// (requires a tournament-admin token).
+    pub async fn update_phase(&self, phase_id: StartGgId, spec: PhaseSpec) -> Result<PhaseInfo, GGProviderError> {
+        self.upsert_phase(Some(phase_id), None, spec).await
+    }
+
+    async fn upsert_phase(
+        &self,
+        phase_id: Option<StartGgId>,
+        event_id: Option<StartGgId>,
+        spec: PhaseSpec,
+    ) -> Result<PhaseInfo, GGProviderError> {
+        let operation = UpsertPhase::build(UpsertPhaseVariables {
+            phase_id: phase_id.map(gg_id),
+            event_id: event_id.map(gg_id),
+            payload: PhaseUpsertInput {
+                name: spec.name,
+                group_count: spec.group_count,
+                bracket_type: spec.bracket_type,
+            },
+        });
+        let data = self.run_query(operation).await?;
+
+        Ok(extract_upsert_phase(data)?)
+    }
+
+    /// Deletes a phase (requires a tournament-admin token). Returns start.gg's
+    /// success flag.
+    pub async fn delete_phase(&self, phase_id: StartGgId) -> Result<bool, GGProviderError> {
+        let gg_phase = gg_id(phase_id);
+        let data = self
+            .run_query(DeletePhase::build(DeletePhaseVariables { phase_id: &gg_phase }))
+            .await?;
+
+        Ok(extract_delete_phase(data))
+    }
+
+    /// Rewrites a phase's seeding from `seed_ids_in_order` (first id becomes
+    /// seed 1). With `strict`, start.gg rejects a list that doesn't cover
+    /// every seed in the phase. Returns the phase's seed count afterwards.
+    pub async fn update_phase_seeding(
+        &self,
+        phase_id: StartGgId,
+        seed_ids_in_order: &[StartGgId],
+        strict: bool,
+    ) -> Result<Option<i32>, GGProviderError> {
+        let gg_phase = gg_id(phase_id);
+        let seed_mapping = seed_ids_in_order
+            .iter()
+            .enumerate()
+            .map(|(ix, seed_id)| {
+                Some(UpdatePhaseSeedInfo {
+                    seed_id: gg_id(*seed_id),
+                    seed_num: cynic::Id::new((ix + 1).to_string()),
+                    phase_group_id: None,
+                })
+            })
+            .collect();
+        let operation = UpdatePhaseSeeding::build(UpdatePhaseSeedingVariables {
+            phase_id: &gg_phase,
+            seed_mapping,
+            options: Some(UpdatePhaseSeedingOptions { strict_mode: Some(strict) }),
+        });
+        let data = self.run_query(operation).await?;
+
+        Ok(extract_update_phase_seeding(data)?)
+    }
+
     /// Fetches an event's videogame character roster (the vocabulary for
     /// reporting character selections). Bypasses the cache entirely; an event
     /// without character data yields an empty roster.
@@ -641,6 +812,15 @@ pub struct GameReport {
 pub struct GameSelection {
     pub entrant_id: String,
     pub character_id: Option<i32>,
+}
+
+/// The fields a phase create/update may set; `None` leaves a field as is
+/// (for an update) or at start.gg's default (for a create).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PhaseSpec {
+    pub name: Option<String>,
+    pub bracket_type: Option<BracketType>,
+    pub group_count: Option<i32>,
 }
 
 fn registration_input(event_ids: &[StartGgId]) -> TournamentRegistrationInput {

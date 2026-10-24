@@ -1,21 +1,31 @@
 use bracket_tools_startgg_schema::{
     admin_probe::{self, AdminProbe},
+    delete_phase::DeletePhase,
+    entrant,
+    enums::{ActivityState, BracketType},
     generate_registration_token::GenerateRegistrationToken,
+    get_event_bracket::{self, GetEventBracket},
     get_event_characters::GetEventCharacters,
+    get_event_entrants::GetEventEntrants,
+    get_event_standings::{self, GetEventStandings},
     get_event_structure::{self, GetEventStructure},
     get_events_for_tournament::GetEventsForTournament,
     get_games_for_set::{self, GetGamesOfSet},
     get_participants_for_tournament::{self, GetParticipantsForTournament},
+    get_phase_seeds::{self, GetPhaseSeeds},
     get_player_for_player_id::GetPlayerForPlayerId,
     get_sets_for_event::{self, GetSetsForEvent},
     get_tournament_for_id::{self, GetTournamentForId},
     get_tournament_header::GetTournamentHeader,
     get_tournaments_for_owner::{self, GetTournamentsForOwner},
+    get_user_profile::GetUserProfile,
     mark_set_called::MarkSetCalled,
     mark_set_in_progress::MarkSetInProgress,
     register_for_tournament::RegisterForTournament,
     report_bracket_set::ReportBracketSet,
     scalars::{Id as ScalarId, Timestamp},
+    update_phase_seeding::UpdatePhaseSeeding,
+    upsert_phase::UpsertPhase,
 };
 use thiserror::Error;
 
@@ -561,6 +571,262 @@ fn slot_player_id(entrant: &get_games_for_set::Entrant) -> Option<StartGgId> {
 
 fn slot_score(standing: &get_games_for_set::Standing) -> Option<f64> {
     standing.stats.as_ref()?.score.as_ref()?.value
+}
+
+/// One phase of an event's bracket through the admin lens. `group_count` is
+/// the pool count start.gg was configured with; `groups` lists the groups
+/// that currently exist (empty on a mutation response, which doesn't return
+/// them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseInfo {
+    pub id: StartGgId,
+    pub name: Option<String>,
+    pub bracket_type: Option<BracketType>,
+    pub group_count: Option<i32>,
+    pub num_seeds: Option<i32>,
+    pub phase_order: Option<i32>,
+    pub state: Option<ActivityState>,
+    pub groups: Vec<PhaseGroupInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseGroupInfo {
+    pub id: StartGgId,
+    pub display_identifier: Option<String>,
+}
+
+/// An event's bracket structure: identity plus its phases in play order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventBracket {
+    pub id: StartGgId,
+    pub name: Option<String>,
+    pub slug: Option<String>,
+    pub state: Option<ActivityState>,
+    pub num_entrants: i32,
+    pub phases: Vec<PhaseInfo>,
+}
+
+/// Unwraps an event-bracket response. Errors when the event is missing
+/// entirely (bad id). Phases come back sorted by `phase_order`.
+pub fn extract_event_bracket(response: GetEventBracket) -> Result<EventBracket, GgConversionError> {
+    let event = response.event.required("GetEventBracket", "event")?;
+    let mut phases: Vec<PhaseInfo> = event.phases.into_iter().flatten().flatten().filter_map(phase_info).collect();
+    phases.sort_by_key(|p| p.phase_order);
+
+    Ok(EventBracket {
+        id: event
+            .id
+            .as_ref()
+            .and_then(parse_scalar_id)
+            .required("GetEventBracket", "event.id")?,
+        name: event.name,
+        slug: event.slug,
+        state: event.state,
+        num_entrants: event.num_entrants.unwrap_or(0),
+        phases,
+    })
+}
+
+fn phase_info(p: get_event_bracket::Phase) -> Option<PhaseInfo> {
+    let groups = p
+        .phase_groups
+        .and_then(|c| c.nodes)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|g| {
+            Some(PhaseGroupInfo {
+                id: g.id.as_ref().and_then(parse_scalar_id)?,
+                display_identifier: g.display_identifier,
+            })
+        })
+        .collect();
+
+    Some(PhaseInfo {
+        id: p.id.as_ref().and_then(parse_scalar_id)?,
+        name: p.name,
+        bracket_type: p.bracket_type,
+        group_count: p.group_count,
+        num_seeds: p.num_seeds,
+        phase_order: p.phase_order,
+        state: p.state,
+        groups,
+    })
+}
+
+/// Unwraps an `upsertPhase` mutation response into the phase it created or
+/// edited (groups are not part of the payload).
+pub fn extract_upsert_phase(response: UpsertPhase) -> Result<PhaseInfo, GgConversionError> {
+    let p = response.upsert_phase.required("UpsertPhase", "upsertPhase")?;
+
+    Ok(PhaseInfo {
+        id: p.id.as_ref().and_then(parse_scalar_id).required("UpsertPhase", "upsertPhase.id")?,
+        name: p.name,
+        bracket_type: p.bracket_type,
+        group_count: p.group_count,
+        num_seeds: p.num_seeds,
+        phase_order: p.phase_order,
+        state: None,
+        groups: Vec::new(),
+    })
+}
+
+/// Unwraps a `deletePhase` response; a null flag counts as "not deleted".
+pub fn extract_delete_phase(response: DeletePhase) -> bool {
+    response.delete_phase.unwrap_or(false)
+}
+
+/// Unwraps an `updatePhaseSeeding` response into the phase's seed count
+/// (the only field the mutation echoes back that is worth reporting).
+pub fn extract_update_phase_seeding(response: UpdatePhaseSeeding) -> Result<Option<i32>, GgConversionError> {
+    let phase = response.update_phase_seeding.required("UpdatePhaseSeeding", "updatePhaseSeeding")?;
+
+    Ok(phase.num_seeds)
+}
+
+/// An entrant as seen from a seed or a standing: identity plus the tags and
+/// user ids of the people behind it (one for singles, several for teams).
+/// `user_ids` are the handles the registration mutations take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntrantRef {
+    pub id: StartGgId,
+    pub name: String,
+    pub tags: Vec<String>,
+    pub user_ids: Vec<StartGgId>,
+}
+
+fn entrant_ref(e: &entrant::Entrant) -> Option<EntrantRef> {
+    let participants: Vec<&entrant::Participant> = e.participants.iter().flatten().flatten().collect();
+    let tags = participants
+        .iter()
+        .filter_map(|p| {
+            let tag = p.gamer_tag.clone()?;
+            Some(match p.prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
+                Some(prefix) => format!("{prefix} | {tag}"),
+                None => tag,
+            })
+        })
+        .collect();
+    let user_ids = participants
+        .iter()
+        .filter_map(|p| p.user.as_ref()?.id.as_ref())
+        .filter_map(parse_scalar_id)
+        .collect();
+
+    Some(EntrantRef {
+        id: e.id.as_ref().and_then(parse_scalar_id)?,
+        name: e.name.clone()?,
+        tags,
+        user_ids,
+    })
+}
+
+/// One seed of a phase. `entrant` is `None` for a bye or a placeholder seed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhaseSeed {
+    pub id: StartGgId,
+    pub seed_num: Option<i32>,
+    pub is_bye: bool,
+    pub entrant: Option<EntrantRef>,
+}
+
+/// Extracts one page of a phase's seeds plus the connection's total page
+/// count. Errors when the phase is missing entirely (bad id). Suitable as the
+/// `extract_page` argument to [`GGProvider::fetch_all_pages`](crate::provider).
+pub fn extract_phase_seeds_page(response: &GetPhaseSeeds) -> Result<Page<PhaseSeed>, GgConversionError> {
+    let seeds = response.phase.as_ref().required("GetPhaseSeeds", "phase")?.seeds.as_ref();
+
+    let total_pages = seeds.and_then(|c| c.page_info.as_ref()).and_then(|pi| pi.total_pages).unwrap_or(1);
+    let items = seeds
+        .and_then(|c| c.nodes.as_ref())
+        .map(|nodes| nodes.iter().flatten().filter_map(phase_seed).collect())
+        .unwrap_or_default();
+
+    Ok(Page { items, total_pages })
+}
+
+fn phase_seed(s: &get_phase_seeds::Seed) -> Option<PhaseSeed> {
+    Some(PhaseSeed {
+        id: s.id.as_ref().and_then(parse_scalar_id)?,
+        seed_num: s.seed_num,
+        is_bye: s.is_bye.unwrap_or(false),
+        entrant: s.entrant.as_ref().and_then(entrant_ref),
+    })
+}
+
+/// One row of an event's standings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventStanding {
+    pub placement: i32,
+    pub is_final: bool,
+    pub entrant: EntrantRef,
+}
+
+/// Extracts one page of an event's standings plus the connection's total page
+/// count. Errors when the event is missing entirely (bad id). Suitable as the
+/// `extract_page` argument to [`GGProvider::fetch_all_pages`](crate::provider).
+pub fn extract_event_standings_page(response: &GetEventStandings) -> Result<Page<EventStanding>, GgConversionError> {
+    let standings = response.event.as_ref().required("GetEventStandings", "event")?.standings.as_ref();
+
+    let total_pages = standings
+        .and_then(|c| c.page_info.as_ref())
+        .and_then(|pi| pi.total_pages)
+        .unwrap_or(1);
+    let items = standings
+        .and_then(|c| c.nodes.as_ref())
+        .map(|nodes| nodes.iter().flatten().filter_map(event_standing).collect())
+        .unwrap_or_default();
+
+    Ok(Page { items, total_pages })
+}
+
+fn event_standing(s: &get_event_standings::Standing) -> Option<EventStanding> {
+    Some(EventStanding {
+        placement: s.placement?,
+        is_final: s.is_final.unwrap_or(false),
+        entrant: s.entrant.as_ref().and_then(entrant_ref)?,
+    })
+}
+
+/// Extracts one page of an event's entrants plus the connection's total page
+/// count. Errors when the event is missing entirely (bad id). Suitable as the
+/// `extract_page` argument to [`GGProvider::fetch_all_pages`](crate::provider).
+pub fn extract_event_entrants_page(response: &GetEventEntrants) -> Result<Page<EntrantRef>, GgConversionError> {
+    let entrants = response.event.as_ref().required("GetEventEntrants", "event")?.entrants.as_ref();
+
+    let total_pages = entrants
+        .and_then(|c| c.page_info.as_ref())
+        .and_then(|pi| pi.total_pages)
+        .unwrap_or(1);
+    let items = entrants
+        .and_then(|c| c.nodes.as_ref())
+        .map(|nodes| nodes.iter().flatten().filter_map(entrant_ref).collect())
+        .unwrap_or_default();
+
+    Ok(Page { items, total_pages })
+}
+
+/// A user's public profile: the slug behind `start.gg/<slug>` and the tag
+/// they currently play under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserProfile {
+    pub id: StartGgId,
+    pub slug: Option<String>,
+    pub gamer_tag: Option<String>,
+    pub prefix: Option<String>,
+}
+
+/// Unwraps a user-profile response; `None` when no such user exists.
+pub fn extract_user_profile(response: GetUserProfile) -> Option<UserProfile> {
+    let user = response.user?;
+    let player = user.player;
+
+    Some(UserProfile {
+        id: user.id.as_ref().and_then(parse_scalar_id)?,
+        slug: user.slug,
+        gamer_tag: player.as_ref().and_then(|p| p.gamer_tag.clone()),
+        prefix: player.and_then(|p| p.prefix).filter(|prefix| !prefix.is_empty()),
+    })
 }
 
 #[cfg(test)]
